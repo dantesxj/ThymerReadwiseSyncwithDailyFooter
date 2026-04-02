@@ -1,0 +1,247 @@
+{
+	"ver": 1,
+	"name": "Highlights",
+	"icon": "ti-quote",
+	"color": null,
+	"home": false,
+	"page_field_ids": [
+		"text",
+		"source_title",
+		"source_author",
+		"highlighted_at",
+		"note",
+		"location"
+	],
+	"item_name": "Highlight",
+	"description": "Individual highlights from Readwise Reader",
+	"show_sidebar_items": true,
+	"show_cmdpal_items": true,
+	"fields": [
+		{
+			"icon": "ti-quote",
+			"id": "text",
+			"label": "Highlight",
+			"many": false,
+			"read_only": true,
+			"active": true,
+			"type": "text"
+		},
+		{
+			"icon": "ti-book",
+			"id": "source_title",
+			"label": "Source Title",
+			"many": false,
+			"read_only": true,
+			"active": true,
+			"type": "text"
+		},
+		{
+			"icon": "ti-user",
+			"id": "source_author",
+			"label": "Author",
+			"many": false,
+			"read_only": true,
+			"active": true,
+			"type": "text"
+		},
+		{
+			"icon": "ti-calendar-event",
+			"id": "highlighted_at",
+			"label": "Highlighted",
+			"many": false,
+			"read_only": true,
+			"active": true,
+			"type": "datetime"
+		},
+		{
+			"icon": "ti-message-2",
+			"id": "note",
+			"label": "Note",
+			"many": false,
+			"read_only": true,
+			"active": true,
+			"type": "text"
+		},
+		{
+			"icon": "ti-map-pin",
+			"id": "location",
+			"label": "Location",
+			"many": false,
+			"read_only": true,
+			"active": true,
+			"type": "text"
+		},
+		{
+			"icon": "ti-id",
+			"id": "external_id",
+			"label": "External ID",
+			"many": false,
+			"read_only": true,
+			"active": true,
+			"type": "text"
+		},
+		{
+			"icon": "ti-link",
+			"id": "source_url",
+			"label": "Source URL",
+			"many": false,
+			"read_only": true,
+			"active": true,
+			"type": "url"
+		},
+		{
+			"icon": "ti-tag",
+			"id": "category",
+			"label": "Category",
+			"many": false,
+			"read_only": true,
+			"active": true,
+			"type": "choice",
+			"choices": [
+				{
+					"id": "article",
+					"label": "Article",
+					"color": "2",
+					"active": true
+				},
+				{
+					"id": "book",
+					"label": "Book",
+					"color": "4",
+					"active": true
+				},
+				{
+					"id": "podcast",
+					"label": "Podcast",
+					"color": "6",
+					"active": true
+				},
+				{
+					"id": "tweet",
+					"label": "Tweet",
+					"color": "3",
+					"active": true
+				},
+				{
+					"id": "video",
+					"label": "Video",
+					"color": "5",
+					"active": true
+				},
+				{
+					"id": "supplemental",
+					"label": "Supplemental",
+					"color": "9",
+					"active": true
+				}
+			]
+		},
+		{
+			"icon": "ti-clock-plus",
+			"id": "synced_at",
+			"label": "Synced",
+			"many": false,
+			"read_only": true,
+			"active": true,
+			"type": "datetime"
+		},
+		{
+			"icon": "ti-abc",
+			"id": "title",
+			"label": "Title",
+			"many": false,
+			"read_only": false,
+			"active": true,
+			"type": "text"
+		},
+		{
+			"icon": "ti-clock-edit",
+			"id": "updated_at",
+			"label": "Modified",
+			"many": false,
+			"read_only": true,
+			"active": true,
+			"type": "datetime"
+		},
+		{
+			"icon": "ti-clock-plus",
+			"id": "created_at",
+			"label": "Created",
+			"many": false,
+			"read_only": true,
+			"active": true,
+			"type": "datetime"
+		},
+		{
+			"icon": "ti-photo",
+			"id": "banner",
+			"label": "Banner",
+			"many": false,
+			"read_only": false,
+			"active": true,
+			"type": "banner"
+		},
+		{
+			"icon": "ti-align-left",
+			"id": "icon",
+			"label": "Icon",
+			"many": false,
+			"read_only": false,
+			"active": true,
+			"type": "text"
+		}
+	],
+	"sidebar_record_sort_dir": "desc",
+	"sidebar_record_sort_field_id": "highlighted_at",
+	"managed": {
+		"fields": false,
+		"views": false,
+		"sidebar": false
+	},
+	"custom": {},
+	"views": [
+		{
+			"id": "VHL000",
+			"shown": true,
+			"icon": "ti-calendar-stats",
+			"label": "By Date",
+			"description": "Highlights grouped by when you highlighted them",
+			"field_ids": [
+				"text",
+				"source_title",
+				"source_author",
+				"category",
+				"highlighted_at",
+				"notes",
+				"location",
+				"note"
+			],
+			"type": "table",
+			"read_only": false,
+			"group_by_field_id": null,
+			"sort_dir": "desc",
+			"sort_field_id": "highlighted_at",
+			"opts": {}
+		},
+		{
+			"id": "VHL001",
+			"shown": true,
+			"icon": "ti-books",
+			"label": "By Source",
+			"description": "Highlights grouped by book or article",
+			"field_ids": [
+				"text",
+				"source_author",
+				"category",
+				"highlighted_at",
+				"location"
+			],
+			"type": "board",
+			"read_only": false,
+			"group_by_field_id": "category",
+			"sort_dir": "desc",
+			"sort_field_id": "highlighted_at",
+			"opts": {}
+		}
+	]
+}

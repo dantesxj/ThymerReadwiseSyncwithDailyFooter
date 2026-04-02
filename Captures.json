@@ -1,0 +1,150 @@
+{
+	"ver": 1,
+	"name": "Captures",
+	"icon": "ti-books",
+	"color": null,
+	"home": false,
+	"page_field_ids": [
+		"external_id",
+		"source_title",
+		"source_author",
+		"source_url",
+		"highlight_count",
+		"captured_at",
+		"synced_at",
+		"banner"
+	],
+	"item_name": "Capture",
+	"description": "Books, articles, and other sources from Readwise",
+	"show_sidebar_items": true,
+	"show_cmdpal_items": true,
+	"fields": [
+		{
+			"icon": "ti-id",
+			"id": "external_id",
+			"label": "External ID",
+			"type": "text",
+			"read_only": true
+		},
+		{
+			"icon": "ti-book",
+			"id": "source_title",
+			"label": "Title",
+			"type": "text",
+			"read_only": true
+		},
+		{
+			"icon": "ti-user",
+			"id": "source_author",
+			"label": "Author",
+			"type": "text",
+			"read_only": true
+		},
+		{
+			"icon": "ti-link",
+			"id": "source_url",
+			"label": "URL",
+			"type": "url",
+			"read_only": true
+		},
+		{
+			"icon": "ti-quote",
+			"id": "highlight_count",
+			"label": "Highlight Count",
+			"type": "number",
+			"read_only": true
+		},
+		{
+			"icon": "ti-calendar-event",
+			"id": "captured_at",
+			"label": "Captured",
+			"type": "datetime",
+			"read_only": true
+		},
+		{
+			"icon": "ti-clock-plus",
+			"id": "synced_at",
+			"label": "Synced",
+			"type": "datetime",
+			"read_only": true
+		},
+		{
+			"icon": "ti-abc",
+			"id": "title",
+			"label": "Title",
+			"many": false,
+			"read_only": false,
+			"active": true,
+			"type": "text"
+		},
+		{
+			"icon": "ti-clock-edit",
+			"id": "updated_at",
+			"label": "Modified",
+			"many": false,
+			"read_only": true,
+			"active": true,
+			"type": "datetime"
+		},
+		{
+			"icon": "ti-clock-plus",
+			"id": "created_at",
+			"label": "Created",
+			"many": false,
+			"read_only": true,
+			"active": true,
+			"type": "datetime"
+		},
+		{
+			"icon": "ti-photo",
+			"id": "banner",
+			"label": "Banner",
+			"many": false,
+			"read_only": false,
+			"active": true,
+			"type": "banner"
+		},
+		{
+			"icon": "ti-align-left",
+			"id": "icon",
+			"label": "Icon",
+			"many": false,
+			"read_only": false,
+			"active": true,
+			"type": "text"
+		}
+	],
+	"sidebar_record_sort_dir": "desc",
+	"sidebar_record_sort_field_id": "updated_at",
+	"managed": {
+		"fields": false,
+		"views": false,
+		"sidebar": false
+	},
+	"custom": {},
+	"views": [
+		{
+			"id": "table",
+			"type": "table",
+			"icon": "",
+			"label": "Table",
+			"description": "",
+			"read_only": false,
+			"shown": true,
+			"field_ids": [
+				"title",
+				"external_id",
+				"source_title",
+				"source_author",
+				"source_url",
+				"highlight_count",
+				"captured_at",
+				"synced_at",
+				"banner"
+			],
+			"sort_dir": "asc",
+			"sort_field_id": "title",
+			"group_by_field_id": null
+		}
+	]
+}
