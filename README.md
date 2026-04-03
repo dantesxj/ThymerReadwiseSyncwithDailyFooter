@@ -1,6 +1,8 @@
 # Thymer Readwise Sync with Daily Footer
 Thymer Plugin to Sync Readwise Highlights &amp; Insert Footer on journal entries showing Readwise highlights made on that day
 
+‼️ _In progress. Created by Claude and someone who knows nothing about coding! Suggestions and support very welcome!_ ‼️
+
 ### FEATURES
 
 - Writes to two collections:
