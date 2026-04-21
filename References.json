@@ -1,6 +1,6 @@
 {
 	"ver": 1,
-	"name": "Captures",
+	"name": "References",
 	"icon": "ti-books",
 	"color": null,
 	"home": false,
@@ -14,8 +14,8 @@
 		"synced_at",
 		"banner"
 	],
-	"item_name": "Capture",
-	"description": "Books, articles, and other sources from Readwise",
+	"item_name": "Reference",
+	"description": "Books, articles, and other sources from Readwise (Option B: highlights in body)",
 	"show_sidebar_items": true,
 	"show_cmdpal_items": true,
 	"fields": [
@@ -37,8 +37,12 @@
 			"icon": "ti-user",
 			"id": "source_author",
 			"label": "Author",
-			"type": "text",
-			"read_only": true
+			"many": false,
+			"read_only": true,
+			"active": true,
+			"type": "record",
+			"target_collection_id": "People",
+			"filter_colguid": "1N43C4Q8S7AEERKH1R9GQVHBVQ"
 		},
 		{
 			"icon": "ti-link",
