@@ -2031,27 +2031,22 @@ class Plugin extends AppPlugin {
 
     _renderShufflerQuoteCard(state, bodyEl, picked, journalDate) {
         bodyEl.innerHTML = '';
-        const card = document.createElement('div');
-        card.className = 'th-shuffler-card';
-
-        const reshuffle = document.createElement('button');
-        reshuffle.type = 'button';
-        reshuffle.className = 'th-shuffler-card-reshuffle button-none button-small button-minimal-hover';
-        reshuffle.title = 'Another random quote for this day';
-        this._rwrAppendSvgIcon(reshuffle, 'shuffle', 14);
-        reshuffle.addEventListener('click', (e) => {
-            e.stopPropagation();
-            void this._drawRandomQuoteForDay(state, bodyEl, journalDate, true);
-        });
-        card.appendChild(reshuffle);
+        const view = document.createElement('div');
+        view.className = 'th-shuffler-quote-view';
 
         const body = document.createElement('div');
-        body.className = 'th-shuffler-card-body';
+        body.className = 'th-shuffler-quote-body';
+
+        const markWrap = document.createElement('div');
+        markWrap.className = 'th-shuffler-quote-mark';
+        markWrap.setAttribute('aria-hidden', 'true');
+        this._rwrAppendSvgIcon(markWrap, 'quote', 22);
 
         const quoteEl = document.createElement('div');
         quoteEl.className = 'th-shuffler-quote-display';
         quoteEl.textContent = picked.text || '';
 
+        body.appendChild(markWrap);
         body.appendChild(quoteEl);
 
         const hasMeta = (picked.source_title && String(picked.source_title).trim())
@@ -2101,6 +2096,20 @@ class Plugin extends AppPlugin {
             body.appendChild(loc);
         }
 
+        const reshuffleWrap = document.createElement('div');
+        reshuffleWrap.className = 'th-shuffler-quote-reshuffle-wrap';
+        const reshuffle = document.createElement('button');
+        reshuffle.type = 'button';
+        reshuffle.className = 'th-shuffler-quote-reshuffle button-none button-small button-minimal-hover';
+        reshuffle.title = 'Another random quote for this day';
+        this._rwrAppendSvgIcon(reshuffle, 'shuffle', 14);
+        reshuffle.addEventListener('click', (e) => {
+            e.stopPropagation();
+            void this._drawRandomQuoteForDay(state, bodyEl, journalDate, true);
+        });
+        reshuffleWrap.appendChild(reshuffle);
+        body.appendChild(reshuffleWrap);
+
         body.addEventListener('click', () => {
             const wsGuid = this.getWorkspaceGuid?.() || this.data?.getActiveUsers?.()[0]?.workspaceGuid;
             if (!wsGuid || !picked.guid) return;
@@ -2112,8 +2121,8 @@ class Plugin extends AppPlugin {
             });
         });
 
-        card.appendChild(body);
-        bodyEl.appendChild(card);
+        view.appendChild(body);
+        bodyEl.appendChild(view);
     }
 
     _shuffleSignatureFromParts(guid, text) {
@@ -3017,41 +3026,54 @@ class Plugin extends AppPlugin {
                 opacity: 0.92;
             }
 
-            /* Quote card — Daily Ritual–inspired: centered, breathable type (still a small footer card) */
-            .th-shuffler-card {
+            /* Drawn quote: same surface as idle — no inner bordered card */
+            .th-shuffler-quote-view {
                 position: relative;
-                margin: 4px auto 0;
-                padding: 20px 20px 22px;
+                margin: 2px auto 0;
+                padding: 8px 6px 6px;
                 max-width: 36em;
-                border-radius: 10px;
-                background: rgba(255,255,255,0.04);
-                border: 1px solid rgba(255,255,255,0.09);
+                border: none;
+                background: none;
+                border-radius: 0;
             }
-            .th-shuffler-card-reshuffle {
-                position: absolute;
-                top: 6px;
-                right: 6px;
-                z-index: 3;
-                padding: 2px 4px;
+            .th-shuffler-quote-reshuffle-wrap {
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                margin-top: 18px;
+                padding-top: 2px;
+            }
+            .th-shuffler-quote-reshuffle {
+                padding: 4px 6px;
                 line-height: 0;
                 border: none;
                 background: none;
                 border-radius: 0;
-                opacity: 0.42;
+                opacity: 0.48;
                 cursor: pointer;
                 color: var(--color-text-100, #eceff4);
                 transition: opacity 0.12s;
             }
-            .th-shuffler-card-reshuffle:hover {
-                opacity: 0.88;
+            .th-shuffler-quote-reshuffle:hover {
+                opacity: 0.9;
             }
-            .th-shuffler-card-body {
+            .th-shuffler-quote-body {
                 cursor: pointer;
-                padding: 4px 28px 0 8px;
+                padding: 4px 8px 0 8px;
                 text-align: center;
             }
-            .th-shuffler-card-body:hover {
+            .th-shuffler-quote-body:hover {
                 opacity: 0.97;
+            }
+            .th-shuffler-quote-mark {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                margin: 0 auto 12px;
+                line-height: 0;
+                color: var(--color-text-100, #eceff4);
+                opacity: 0.48;
+                pointer-events: none;
             }
             .th-shuffler-quote-display {
                 font-family: var(--font-sans, system-ui, sans-serif);
@@ -3059,7 +3081,7 @@ class Plugin extends AppPlugin {
                 line-height: 1.82;
                 color: var(--color-text-100, #eceff4);
                 opacity: 0.88;
-                font-style: italic;
+                font-style: normal;
                 letter-spacing: 0.01em;
                 text-align: center;
                 margin: 0 auto;

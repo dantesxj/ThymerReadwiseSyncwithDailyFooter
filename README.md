@@ -1,6 +1,6 @@
 # Thymer Readwise References + Daily Footer
 
-Sync Readwise into a single `References` collection and show built-in **journal footers**: **Today's Highlights** (per journal day) and **Quote Shuffler** (draw a random highlight from your whole `References` library, shown as a calm “daily card”; each journal day remembers its quote until you reshuffle).
+Sync Readwise into a single `References` collection and show built-in **journal footers**: **Today's Highlights** (per journal day) and **Quote Shuffler** (draw a random highlight from your whole `References` library, centered ritual-style type on the panel surface—no inner box; each journal day remembers its quote until you reshuffle).
 
 ‼️ In progress. Created by AI, vibes, and someone who knows nothing about coding! Suggestions and support very welcome! ‼️
 
@@ -31,7 +31,7 @@ If you are upgrading from the old setup:
 - Highlights grouped by date inside each Reference record body
 - Journal footers built into this plugin:
   - **Today's Highlights** — lists highlights for the open journal day (same References body parsing as sync)
-  - **Quote Shuffler** — expanded: floating collapse control + centered **ti-quote**-style draw icon (no inner box until you draw); after draw, small corner **shuffle** reshuffle. Collapsed: header matches other panels (**Quote Shuffler** + **ti-quotes**-style icon). Per-day sticky quote + inline SVG icons.
+  - **Quote Shuffler** — expanded: floating collapse control + centered **ti-quote**-style draw icon; after draw, same flat panel surface + small corner **shuffle** reshuffle. Collapsed: header matches other panels (**Quote Shuffler** + **ti-quotes**-style icon). Per-day sticky quote + inline SVG icons.
 - Footer source preference:
   - uses `References` body parse when available
   - falls back to legacy `Highlights` records if needed
