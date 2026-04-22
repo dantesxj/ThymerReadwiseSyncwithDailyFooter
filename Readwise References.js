@@ -1926,6 +1926,7 @@ class Plugin extends AppPlugin {
             localStorage.setItem(TH_KEY_SHUFFLER_QUOTES_BY_DAY, JSON.stringify(map));
         } catch (_) {}
         globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => this._pathBMirrorKeys());
+        this._flushPathBNowBestEffort();
     }
 
     _loadDayShufflePick(yyyymmdd) {
@@ -2752,6 +2753,14 @@ class Plugin extends AppPlugin {
     _saveBool(key, val) {
         try { localStorage.setItem(key, val ? 'true' : 'false'); } catch (_) {}
         globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => this._pathBMirrorKeys());
+    }
+
+    /** Persist quickly when storage mode is synced (in addition to debounced flush). */
+    _flushPathBNowBestEffort() {
+        if (this._pathBMode !== 'synced') return;
+        const pathB = globalThis.ThymerExtPathB;
+        if (!pathB?.flushNow || !this.data || !this._pathBPluginId) return;
+        pathB.flushNow(this.data, this._pathBPluginId, this._pathBMirrorKeys()).catch(() => {});
     }
 
     // =========================================================================
