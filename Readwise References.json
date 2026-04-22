@@ -3,7 +3,7 @@
 	"name": "Readwise References",
 	"icon": "ti-book-2",
 	"item_name": "Reference",
-	"description": "Sync Readwise into References (highlights by date in the body) plus Today's Highlights footer on journal pages",
+	"description": "Sync Readwise into References (highlights by date in the body) plus journal footers: Today's Highlights and Quote Shuffler (toggle via Command Palette)",
 	"show_sidebar_items": true,
 	"show_cmdpal_items": true,
 	"views": [],

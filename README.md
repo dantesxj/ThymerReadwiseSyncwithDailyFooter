@@ -1,6 +1,6 @@
 # Thymer Readwise References + Daily Footer
 
-Sync Readwise into a single `References` collection and show a built-in "Today's Highlights" footer on journal pages.
+Sync Readwise into a single `References` collection and show built-in **journal footers**: **Today's Highlights** (per journal day) and **Quote Shuffler** (draw a random highlight from your whole `References` library, shown as a calm “daily card”; each journal day remembers its quote until you reshuffle).
 
 ‼️ In progress. Created by AI, vibes, and someone who knows nothing about coding! Suggestions and support very welcome! ‼️
 
@@ -23,13 +23,15 @@ If you are upgrading from the old setup:
 - Merged sync + journal footer behavior into one plugin:
   - `Readwise References.js` + `Readwise References.json`
 - Added Path B storage-mode support (`Plugin Settings` collection mirror):
-  - token, last-run timestamp, and footer collapse state can be synced
+  - token, last-run timestamp, panel visibility, shuffler collapse, per-day shuffler picks map, and Today's Highlights collapse can be synced
 
 ## Features
 
 - One reference record per Readwise source/document in `References`
 - Highlights grouped by date inside each Reference record body
-- Journal footer "Today's Highlights" built into this plugin
+- Journal footers built into this plugin:
+  - **Today's Highlights** — lists highlights for the open journal day (same References body parsing as sync)
+  - **Quote Shuffler** — expanded: floating collapse control + centered **ti-quote**-style draw icon (no inner box until you draw); after draw, small corner **shuffle** reshuffle. Collapsed: header matches other panels (**Quote Shuffler** + **ti-quotes**-style icon). Per-day sticky quote + inline SVG icons.
 - Footer source preference:
   - uses `References` body parse when available
   - falls back to legacy `Highlights` records if needed
@@ -38,6 +40,9 @@ If you are upgrading from the old setup:
   - `Readwise Ref: Sync`
   - `Readwise Ref: Full Sync`
   - `Readwise Ref: Storage location…`
+  - `Readwise Ref: Toggle Today's Highlights panel`
+  - `Readwise Ref: Toggle Quote Shuffler panel`
+  - `Readwise Ref: Shuffle Quote` (journal page with Quote Shuffler visible — works even if the panel body is collapsed)
 
 ## Setup
 

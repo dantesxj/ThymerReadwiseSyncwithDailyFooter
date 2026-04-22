@@ -316,14 +316,24 @@
  * All highlights live under `❣️ Highlights...` in the body, grouped by calendar day (see
  * `formatReadwiseRefDateHeading`). Notes and Readwise URLs are child blocks under each quote.
  *
- * **Today's Highlights:** This plugin also mounts the journal footer that lists highlights for the
- * open journal day (References body parse, or legacy Highlights collection fallback).
+ * **Today's Highlights:** Journal footer listing highlights for the open journal day (References
+ * body parse, or legacy Highlights collection fallback).
+ *
+ * **Quote Shuffler:** Second journal footer card; draw a random highlight per journal day (quote icon
+ * when expanded; collapsed header matches Today’s Highlights). Sticky per day until reshuffle. Path B.
  *
  * Coexists with `plugins/readwise/` (per-highlight records). Uses separate localStorage keys.
  */
 
 const RWR_TOKEN_KEY    = 'readwise_references_token';
 const RWR_LAST_RUN_KEY = 'readwise_references_last_run';
+
+/** Journal footer panels — persisted (localStorage + Path B when synced). */
+const TH_KEY_SHOW_HIGHLIGHTS   = 'th_panel_show_highlights';
+const TH_KEY_SHOW_SHUFFLER     = 'th_panel_show_shuffler';
+const TH_KEY_SHUFFLER_COLLAPSED = 'th_shuffler_collapsed';
+/** JSON object: { [YYYYMMDD]: { sig, guid, text, note, location, source_title, source_author } } */
+const TH_KEY_SHUFFLER_QUOTES_BY_DAY = 'th_shuffler_quotes_by_day';
 
 /** Must match Today's Highlights parser. */
 const READWISE_REF_HIGHLIGHTS_HEADER = '❣️ Highlights...';
@@ -363,7 +373,7 @@ class Plugin extends AppPlugin {
             plugin: this,
             pluginId: 'readwise-references',
             modeKey: 'thymerext_ps_mode_readwise_references',
-            mirrorKeys: () => [RWR_TOKEN_KEY, RWR_LAST_RUN_KEY, 'th_footer_collapsed'],
+            mirrorKeys: () => this._pathBMirrorKeys(),
             label: 'Readwise References',
             data: this.data,
             ui: this.ui,
@@ -392,25 +402,42 @@ class Plugin extends AppPlugin {
                     plugin: this,
                     pluginId: 'readwise-references',
                     modeKey: 'thymerext_ps_mode_readwise_references',
-                    mirrorKeys: () => [RWR_TOKEN_KEY, RWR_LAST_RUN_KEY, 'th_footer_collapsed'],
+                    mirrorKeys: () => this._pathBMirrorKeys(),
                     label: 'Readwise References',
                     data: this.data,
                     ui: this.ui,
                 });
             },
         });
+        this._cmdToggleHighlights = this.ui.addCommandPaletteCommand({
+            label: "Readwise Ref: Toggle Today's Highlights panel",
+            icon: 'ti-layout-list',
+            onSelected: () => this._toggleShowHighlightsPanel(),
+        });
+        this._cmdToggleShuffler = this.ui.addCommandPaletteCommand({
+            label: 'Readwise Ref: Toggle Quote Shuffler panel',
+            icon: 'ti-arrows-shuffle',
+            onSelected: () => this._toggleShowShufflerPanel(),
+        });
+        this._cmdShuffleQuote = this.ui.addCommandPaletteCommand({
+            label: 'Readwise Ref: Shuffle Quote',
+            icon: 'ti-arrows-shuffle',
+            onSelected: () => { void this._shuffleQuoteFromCommand(); },
+        });
 
         this._panelStates = new Map();
         this._eventHandlerIds = [];
         this._navDeferTimers = new Map();
         this._collapsed = this._loadBool('th_footer_collapsed', false);
+        this._shufflerCollapsed = this._loadBool(TH_KEY_SHUFFLER_COLLAPSED, false);
         this._thRefQueryCache = new Map();
+        this._quotePoolCache = null;
         this._injectCSS();
         this._eventHandlerIds.push(this.events.on('panel.navigated', ev => this._deferHandlePanel(ev.panel)));
         this._eventHandlerIds.push(this.events.on('panel.focused',   ev => this._handlePanel(ev.panel)));
         this._eventHandlerIds.push(this.events.on('panel.closed',    ev => this._disposePanel(ev.panel?.getId?.())));
         this._eventHandlerIds.push(this.events.on('record.created',  () => {
-            try { this._thRefQueryCache?.clear(); } catch (_) {}
+            this._clearFooterDataCaches();
             this._refreshAll();
         }));
         setTimeout(() => {
@@ -432,13 +459,131 @@ class Plugin extends AppPlugin {
             this._disposePanel(id);
         }
         this._panelStates?.clear();
-        try { this._thRefQueryCache?.clear(); } catch (_) {}
+        this._clearFooterDataCaches();
 
         this._cmdSetToken?.remove();
         this._cmdSync?.remove();
         this._cmdFullSync?.remove();
         this._cmdStorage?.remove();
+        this._cmdToggleHighlights?.remove();
+        this._cmdToggleShuffler?.remove();
+        this._cmdShuffleQuote?.remove();
         document.getElementById('rwr-token-dialog')?.remove();
+    }
+
+    /** Keys mirrored to Plugin Settings when storage mode is synced. */
+    _pathBMirrorKeys() {
+        return [
+            RWR_TOKEN_KEY,
+            RWR_LAST_RUN_KEY,
+            'th_footer_collapsed',
+            TH_KEY_SHOW_HIGHLIGHTS,
+            TH_KEY_SHOW_SHUFFLER,
+            TH_KEY_SHUFFLER_COLLAPSED,
+            TH_KEY_SHUFFLER_QUOTES_BY_DAY,
+        ];
+    }
+
+    _showHighlightsPanel() {
+        return this._loadBool(TH_KEY_SHOW_HIGHLIGHTS, true);
+    }
+
+    _showShufflerPanel() {
+        return this._loadBool(TH_KEY_SHOW_SHUFFLER, true);
+    }
+
+    /**
+     * Stroke SVGs — `ui.createIcon` often renders empty in journal-injected footers
+     * (no Tabler font / sizing context). Same visual language as line icons elsewhere.
+     */
+    _rwrSvgIcon(kind, sizePx) {
+        const n = sizePx || 18;
+        if (kind === 'shuffle') {
+            return '<svg xmlns="http://www.w3.org/2000/svg" width="' + n + '" height="' + n + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/></svg>';
+        }
+        /* ti-quote–style draw control (single block, filled) */
+        if (kind === 'quote') {
+            return '<svg xmlns="http://www.w3.org/2000/svg" width="' + n + '" height="' + n + '" viewBox="0 0 14 24" fill="currentColor" aria-hidden="true"><path d="M6 17h3l2-4V7H5v6h3z"/></svg>';
+        }
+        /* ti-quotes–style collapsed header (pair of blocks, filled) */
+        if (kind === 'quotes') {
+            return '<svg xmlns="http://www.w3.org/2000/svg" width="' + n + '" height="' + n + '" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 17h3l2-4V7H5v6h3zm8 0h3l2-4V7h-6v6h3z"/></svg>';
+        }
+        /* “books” intent: open book silhouette, reads clearly at 16px */
+        return '<svg xmlns="http://www.w3.org/2000/svg" width="' + n + '" height="' + n + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>';
+    }
+
+    _rwrAppendSvgIcon(parent, kind, sizePx) {
+        const wrap = document.createElement('span');
+        wrap.className = 'th-inline-svg-icon';
+        wrap.innerHTML = this._rwrSvgIcon(kind, sizePx);
+        parent.appendChild(wrap);
+        return wrap;
+    }
+
+    /** Hide `source_author` when the field resolved to an opaque record id instead of a human name. */
+    _rwrLooksLikeOpaqueId(s) {
+        const t = String(s || '').trim();
+        if (t.length < 18) return false;
+        if (/^[0-9A-Fa-f]{32}$/.test(t)) return true;
+        if (/^[0-9A-Z]{24,}$/.test(t) && !/\s/.test(t)) return true;
+        return false;
+    }
+
+    _clearFooterDataCaches() {
+        try { this._thRefQueryCache?.clear(); } catch (_) {}
+        this._quotePoolCache = null;
+    }
+
+    _toggleShowHighlightsPanel() {
+        const next = !this._showHighlightsPanel();
+        this._saveBool(TH_KEY_SHOW_HIGHLIGHTS, next);
+        this._toast(next ? "Today's Highlights panel: on" : "Today's Highlights panel: off");
+        this._rebuildAllJournalFooters();
+    }
+
+    _toggleShowShufflerPanel() {
+        const next = !this._showShufflerPanel();
+        this._saveBool(TH_KEY_SHOW_SHUFFLER, next);
+        this._toast(next ? 'Quote Shuffler panel: on' : 'Quote Shuffler panel: off');
+        this._rebuildAllJournalFooters();
+    }
+
+    async _shuffleQuoteFromCommand() {
+        let n = 0;
+        for (const [, s] of (this._panelStates || new Map())) {
+            const sec = s.rootEl?.querySelector('[data-panel-section="shuffler"]');
+            if (!sec) continue;
+            const body = sec.querySelector('[data-role="body"]');
+            if (!body || !s.journalDate) continue;
+            await this._drawRandomQuoteForDay(s, body, s.journalDate, true);
+            n++;
+        }
+        if (!n) this._toast('Open a journal page with the Quote Shuffler panel visible.');
+    }
+
+    _rebuildAllJournalFooters() {
+        const snapshots = Array.from((this._panelStates || new Map()).values());
+        for (const s of snapshots) {
+            if (!this._panelStates?.get(s.panelId)) continue;
+            const panel = s.panel;
+            const panelEl = panel?.getElement?.();
+            if (!panelEl) continue;
+            const record = panel?.getActiveRecord?.();
+            const journalDate = this._journalDateFromRecord(record);
+            if (!this._showHighlightsPanel() && !this._showShufflerPanel()) {
+                this._disposePanel(s.panelId);
+                continue;
+            }
+            if (!journalDate) continue;
+            const container = this._findContainer(panelEl);
+            if (!container) continue;
+            s.loaded = false;
+            s.expandedSources = new Map();
+            const rebuilt = this._mountFooter(s, container, panelEl);
+            if (rebuilt) s.loading = false;
+            this._populate(s);
+        }
     }
 
     _showTokenDialog() {
@@ -537,7 +682,7 @@ class Plugin extends AppPlugin {
                 localStorage.setItem(RWR_TOKEN_KEY, token);
                 this._toast('Token saved! Run "Readwise Ref: Full Sync".');
             }
-            globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => [RWR_TOKEN_KEY, RWR_LAST_RUN_KEY, 'th_footer_collapsed']);
+            globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => this._pathBMirrorKeys());
         };
         saveBtn.addEventListener('click', () => done(true));
         cancelBtn.addEventListener('click', () => done(false));
@@ -570,7 +715,8 @@ class Plugin extends AppPlugin {
             const result = await this._sync(token, forceFullSync);
             this._toast('Done: ' + result.summary);
             localStorage.setItem(RWR_LAST_RUN_KEY, new Date().toISOString());
-            globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => [RWR_TOKEN_KEY, RWR_LAST_RUN_KEY, 'th_footer_collapsed']);
+            this._clearFooterDataCaches();
+            globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => this._pathBMirrorKeys());
         } catch (e) {
             console.error('[ReadwiseRef]', e);
             this._toast('Sync failed: ' + e.message);
@@ -847,6 +993,7 @@ class Plugin extends AppPlugin {
         }
 
         await this._tryHostCollectionRefresh(refsColl);
+        this._clearFooterDataCaches();
 
         const parts = [
             createdRef > 0 ? createdRef + ' references added' : null,
@@ -1421,6 +1568,11 @@ class Plugin extends AppPlugin {
         const journalDate = this._journalDateFromRecord(record);
         if (!journalDate) { this._disposePanel(panelId); return; }
 
+        if (!this._showHighlightsPanel() && !this._showShufflerPanel()) {
+            this._disposePanel(panelId);
+            return;
+        }
+
         let state = this._panelStates.get(panelId);
         const wasPlaceholder =
             state && (state.journalDate == null || state.recordGuid == null);
@@ -1511,12 +1663,12 @@ class Plugin extends AppPlugin {
         }
         try { clearTimeout(state._navTimer); } catch (_) {}
 
-        for (const el of container.querySelectorAll(':scope > .th-footer')) {
+        for (const el of container.querySelectorAll(':scope > .th-journal-footer')) {
             if (el.dataset?.panelId === state.panelId) { try { el.remove(); } catch (_) {} }
         }
 
         state.rootEl = this._buildShell(state);
-        container.appendChild(state.rootEl);
+        if (state.rootEl) container.appendChild(state.rootEl);
 
         state.observer = this._createFooterObserver(state, panelEl);
         return true;
@@ -1548,13 +1700,27 @@ class Plugin extends AppPlugin {
         return null;
     }
 
-    // Build the outer shell (header + body placeholder)
+    /** Wrapper for one or more journal footer cards (highlights + quote shuffler). */
     _buildShell(state) {
         const root = document.createElement('div');
-        root.className       = 'th-footer';
+        root.className       = 'th-journal-footer';
         root.dataset.panelId = state.panelId;
 
-        // ── Header ───────────────────────────────────────────────────────────
+        if (this._showHighlightsPanel()) {
+            root.appendChild(this._buildHighlightsPanel(state));
+        }
+        if (this._showShufflerPanel()) {
+            root.appendChild(this._buildShufflerPanel(state));
+        }
+        if (!root.childElementCount) return null;
+        return root;
+    }
+
+    _buildHighlightsPanel(state) {
+        const root = document.createElement('div');
+        root.className              = 'th-footer th-footer--highlights';
+        root.dataset.panelSection   = 'highlights';
+
         const header = document.createElement('div');
         header.className = 'th-header';
 
@@ -1566,8 +1732,7 @@ class Plugin extends AppPlugin {
 
         const icon = document.createElement('span');
         icon.className = 'th-title-icon';
-        try { icon.appendChild(this.ui.createIcon('ti-quote')); }
-        catch (_) { icon.textContent = '❝'; }
+        this._rwrAppendSvgIcon(icon, 'books', 16);
 
         const titleEl = document.createElement('div');
         titleEl.className   = 'th-title';
@@ -1582,7 +1747,6 @@ class Plugin extends AppPlugin {
         header.appendChild(titleEl);
         header.appendChild(countEl);
 
-        // ── Body ─────────────────────────────────────────────────────────────
         const body = document.createElement('div');
         body.dataset.role  = 'body';
         body.className     = 'th-body';
@@ -1600,6 +1764,57 @@ class Plugin extends AppPlugin {
         return root;
     }
 
+    _buildShufflerPanel(state) {
+        const root = document.createElement('div');
+        root.className            = 'th-footer th-footer--shuffler th-shuffler-shell';
+        root.dataset.panelSection = 'shuffler';
+
+        const chrome = document.createElement('div');
+        chrome.className = 'th-shuffler-chrome';
+        chrome.dataset.role = 'sh-chrome';
+
+        const toggle = document.createElement('button');
+        toggle.className = 'th-toggle button-none button-small button-minimal-hover';
+        toggle.type = 'button';
+        toggle.title = 'Collapse / expand';
+        toggle.textContent = this._shufflerCollapsed ? '+' : '−';
+
+        const titleIcon = document.createElement('span');
+        titleIcon.className = 'th-title-icon th-shuffler-title-icon';
+        this._rwrAppendSvgIcon(titleIcon, 'quotes', 15);
+
+        const titleEl = document.createElement('div');
+        titleEl.className = 'th-title th-shuffler-panel-title';
+        titleEl.textContent = 'Quote Shuffler';
+
+        chrome.appendChild(toggle);
+        chrome.appendChild(titleIcon);
+        chrome.appendChild(titleEl);
+
+        const body = document.createElement('div');
+        body.dataset.role = 'body';
+        body.className = 'th-body th-shuffler-body';
+        body.style.display = this._shufflerCollapsed ? 'none' : 'block';
+
+        const syncLayout = () => {
+            const c = !!this._shufflerCollapsed;
+            root.classList.toggle('th-shuffler-is-collapsed', c);
+            toggle.textContent = c ? '+' : '−';
+            body.style.display = c ? 'none' : 'block';
+        };
+
+        toggle.addEventListener('click', () => {
+            this._shufflerCollapsed = !this._shufflerCollapsed;
+            this._saveBool(TH_KEY_SHUFFLER_COLLAPSED, this._shufflerCollapsed);
+            syncLayout();
+        });
+        syncLayout();
+
+        root.appendChild(chrome);
+        root.appendChild(body);
+        return root;
+    }
+
     // =========================================================================
     // Data & rendering
     // =========================================================================
@@ -1612,14 +1827,30 @@ class Plugin extends AppPlugin {
         const targetRoot    = state.rootEl;
         const targetGuid    = state.recordGuid;
 
-        const bodyEl  = state.rootEl?.querySelector('[data-role="body"]');
-        const countEl = state.rootEl?.querySelector('[data-role="count"]');
-        if (!bodyEl) { state.loading = false; this._flushPendingPopulate(state); return; }
+        const hiBody  = state.rootEl?.querySelector('[data-panel-section="highlights"] [data-role="body"]');
+        const hiCount = state.rootEl?.querySelector('[data-panel-section="highlights"] [data-role="count"]');
+        const shBody  = state.rootEl?.querySelector('[data-panel-section="shuffler"] [data-role="body"]');
 
-        bodyEl.innerHTML = '<div class="th-loading">Loading…</div>';
+        if (!hiBody && !shBody) {
+            state.loaded = true;
+            state.loading = false;
+            this._flushPendingPopulate(state);
+            return;
+        }
+
+        if (hiBody) hiBody.innerHTML = '<div class="th-loading">Loading…</div>';
+        if (shBody) shBody.innerHTML = '';
 
         try {
-            const highlights = await this._getHighlightsForDate(targetJournal);
+            const jobs = [];
+            if (hiBody) {
+                jobs.push(this._populateHighlightsSection(state, hiBody, hiCount, targetJournal, targetRoot, targetGuid));
+            }
+            if (shBody) {
+                jobs.push(this._populateShufflerSection(state, shBody, targetJournal, targetRoot, targetGuid));
+            }
+            await Promise.all(jobs);
+
             if (state.journalDate !== targetJournal || state.rootEl !== targetRoot || state.recordGuid !== targetGuid) {
                 state.loading = false;
                 this._flushPendingPopulate(state);
@@ -1627,37 +1858,373 @@ class Plugin extends AppPlugin {
             }
             if (!state.rootEl?.isConnected) { state.loading = false; this._flushPendingPopulate(state); return; }
 
-            bodyEl.innerHTML = '';
-
-            if (highlights.length === 0) {
-                bodyEl.innerHTML = '<div class="th-empty">No highlights for this day.</div>';
-                if (countEl) countEl.textContent = '';
-            } else {
-                if (countEl) countEl.textContent = String(highlights.length);
-
-                // Group by source_title
-                const groups = new Map();
-                for (const h of highlights) {
-                    const key = h.source_title || 'Unknown source';
-                    if (!groups.has(key)) groups.set(key, []);
-                    groups.get(key).push(h);
-                }
-
-                for (const [sourceTitle, items] of groups) {
-                    bodyEl.appendChild(this._buildGroup(sourceTitle, items, state));
-                }
-            }
-
             state.loaded = true;
         } catch (e) {
             console.error('[ReadwiseRef|TH]', e);
-            if (bodyEl && state.rootEl === targetRoot && state.journalDate === targetJournal) {
-                bodyEl.innerHTML = '<div class="th-empty">Error loading highlights.</div>';
+            if (hiBody && state.rootEl === targetRoot && state.journalDate === targetJournal) {
+                hiBody.innerHTML = '<div class="th-empty">Error loading highlights.</div>';
+            }
+            if (shBody && state.rootEl === targetRoot && state.journalDate === targetJournal) {
+                shBody.innerHTML = '<div class="th-empty">Error loading quote.</div>';
             }
         }
 
         state.loading = false;
         this._flushPendingPopulate(state);
+    }
+
+    async _populateHighlightsSection(state, bodyEl, countEl, targetJournal, targetRoot, targetGuid) {
+        const highlights = await this._getHighlightsForDate(targetJournal);
+        if (state.journalDate !== targetJournal || state.rootEl !== targetRoot || state.recordGuid !== targetGuid) return;
+        if (!state.rootEl?.isConnected) return;
+
+        bodyEl.innerHTML = '';
+
+        if (highlights.length === 0) {
+            bodyEl.innerHTML = '<div class="th-empty">No highlights for this day.</div>';
+            if (countEl) countEl.textContent = '';
+        } else {
+            if (countEl) countEl.textContent = String(highlights.length);
+
+            const groups = new Map();
+            for (const h of highlights) {
+                const key = h.source_title || 'Unknown source';
+                if (!groups.has(key)) groups.set(key, []);
+                groups.get(key).push(h);
+            }
+
+            for (const [sourceTitle, items] of groups) {
+                bodyEl.appendChild(this._buildGroup(sourceTitle, items, state));
+            }
+        }
+    }
+
+    async _populateShufflerSection(state, shBody, targetJournal, targetRoot, targetGuid) {
+        const saved = this._loadDayShufflePick(targetJournal);
+        if (saved && saved.guid && String(saved.text || '').trim()) {
+            this._renderShufflerQuoteCard(state, shBody, this._pickFromStored(saved), targetJournal);
+        } else {
+            this._renderShufflerIdle(state, shBody, targetJournal);
+        }
+        if (state.journalDate !== targetJournal || state.rootEl !== targetRoot || state.recordGuid !== targetGuid) return;
+        if (!state.rootEl?.isConnected) return;
+    }
+
+    _getShufflerDayMap() {
+        try {
+            const raw = localStorage.getItem(TH_KEY_SHUFFLER_QUOTES_BY_DAY);
+            if (!raw || !String(raw).trim()) return {};
+            const o = JSON.parse(raw);
+            return o && typeof o === 'object' && !Array.isArray(o) ? o : {};
+        } catch (_) {
+            return {};
+        }
+    }
+
+    _saveShufflerDayMap(map) {
+        try {
+            localStorage.setItem(TH_KEY_SHUFFLER_QUOTES_BY_DAY, JSON.stringify(map));
+        } catch (_) {}
+        globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => this._pathBMirrorKeys());
+    }
+
+    _loadDayShufflePick(yyyymmdd) {
+        if (!yyyymmdd) return null;
+        const m = this._getShufflerDayMap();
+        const v = m[yyyymmdd];
+        if (!v || typeof v !== 'object') return null;
+        return v;
+    }
+
+    _persistDayShufflePick(yyyymmdd, pick) {
+        if (!yyyymmdd || !pick) return;
+        const map = this._getShufflerDayMap();
+        map[yyyymmdd] = {
+            sig:            pick._sig || this._shuffleSignature(pick),
+            guid:           pick.guid,
+            text:           pick.text || '',
+            note:           pick.note || '',
+            location:       pick.location || '',
+            source_title:   pick.source_title || '',
+            source_author:  pick.source_author || '',
+        };
+        const keys = Object.keys(map).sort();
+        if (keys.length > 420) {
+            for (const k of keys.slice(0, keys.length - 400)) {
+                try { delete map[k]; } catch (_) {}
+            }
+        }
+        this._saveShufflerDayMap(map);
+    }
+
+    _pickFromStored(stored) {
+        return {
+            guid:          stored.guid,
+            text:          stored.text || '',
+            note:          stored.note || '',
+            location:      stored.location || '',
+            source_title:  stored.source_title || '',
+            source_author: stored.source_author || '',
+            _sig:          stored.sig || this._shuffleSignatureFromParts(stored.guid, stored.text),
+        };
+    }
+
+    _renderShufflerIdle(state, bodyEl, journalDate) {
+        bodyEl.innerHTML = '';
+        const idle = document.createElement('div');
+        idle.className = 'th-shuffler-idle th-shuffler-idle--bare';
+
+        const iconBtn = document.createElement('button');
+        iconBtn.type = 'button';
+        iconBtn.className = 'th-shuffler-draw-btn button-none button-small button-minimal-hover';
+        iconBtn.title = 'Draw a random quote for this day';
+        this._rwrAppendSvgIcon(iconBtn, 'quote', 28);
+        iconBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            void this._drawRandomQuoteForDay(state, bodyEl, journalDate, true);
+        });
+
+        const cap = document.createElement('div');
+        cap.className = 'th-shuffler-idle-caption';
+        cap.textContent = 'Draw a quote for this day';
+
+        idle.appendChild(iconBtn);
+        idle.appendChild(cap);
+        bodyEl.appendChild(idle);
+    }
+
+    /**
+     * @param {boolean} forceNew — true: new random (first draw or reshuffle). Avoids repeating the same quote for that day when possible.
+     */
+    async _drawRandomQuoteForDay(state, bodyEl, journalDate, forceNew) {
+        let pool;
+        try {
+            pool = await this._getQuoteShufflePoolFromReferences();
+        } catch (e) {
+            console.error('[ReadwiseRef|Shuffle]', e);
+            bodyEl.innerHTML = '<div class="th-empty">Could not load quotes.</div>';
+            return;
+        }
+
+        if (!state.rootEl?.isConnected) return;
+
+        if (!pool.length) {
+            bodyEl.innerHTML = '<div class="th-empty">No highlights in References yet.</div>';
+            return;
+        }
+
+        let avoidSig = '';
+        if (forceNew) {
+            const cur = this._loadDayShufflePick(journalDate);
+            if (cur && cur.sig) avoidSig = cur.sig;
+        }
+
+        const picked = this._pickRandomShuffleCandidate(pool, avoidSig);
+        if (!picked) {
+            bodyEl.innerHTML = '<div class="th-empty">No quote available.</div>';
+            return;
+        }
+
+        this._persistDayShufflePick(journalDate, picked);
+        this._renderShufflerQuoteCard(state, bodyEl, picked, journalDate);
+    }
+
+    _renderShufflerQuoteCard(state, bodyEl, picked, journalDate) {
+        bodyEl.innerHTML = '';
+        const card = document.createElement('div');
+        card.className = 'th-shuffler-card';
+
+        const reshuffle = document.createElement('button');
+        reshuffle.type = 'button';
+        reshuffle.className = 'th-shuffler-card-reshuffle button-none button-small button-minimal-hover';
+        reshuffle.title = 'Another random quote for this day';
+        this._rwrAppendSvgIcon(reshuffle, 'shuffle', 14);
+        reshuffle.addEventListener('click', (e) => {
+            e.stopPropagation();
+            void this._drawRandomQuoteForDay(state, bodyEl, journalDate, true);
+        });
+        card.appendChild(reshuffle);
+
+        const body = document.createElement('div');
+        body.className = 'th-shuffler-card-body';
+
+        const quoteEl = document.createElement('div');
+        quoteEl.className = 'th-shuffler-quote-display';
+        quoteEl.textContent = picked.text || '';
+
+        body.appendChild(quoteEl);
+
+        const hasMeta = (picked.source_title && String(picked.source_title).trim())
+            || (picked.source_author && String(picked.source_author).trim() && !this._rwrLooksLikeOpaqueId(picked.source_author))
+            || (picked.note && String(picked.note).trim())
+            || (picked.location && String(picked.location).trim());
+        if (hasMeta) {
+            const divider = document.createElement('div');
+            divider.className = 'th-shuffler-ritual-divider';
+            body.appendChild(divider);
+        }
+
+        if (picked.source_title && String(picked.source_title).trim()) {
+            const src = document.createElement('div');
+            src.className = 'th-shuffler-source';
+            src.textContent = picked.source_title;
+            body.appendChild(src);
+        }
+        if (picked.source_author && String(picked.source_author).trim() && !this._rwrLooksLikeOpaqueId(picked.source_author)) {
+            const auth = document.createElement('div');
+            auth.className = 'th-shuffler-author';
+            auth.textContent = picked.source_author;
+            body.appendChild(auth);
+        }
+        if (picked.note && String(picked.note).trim()) {
+            const noteEl = document.createElement('div');
+            noteEl.className = 'th-shuffler-note';
+            noteEl.textContent = picked.note;
+            body.appendChild(noteEl);
+        }
+        if (picked.location && String(picked.location).trim()) {
+            const loc = document.createElement('div');
+            loc.className = 'th-shuffler-loc';
+            const locStr = String(picked.location).trim();
+            if (/^https?:\/\//i.test(locStr)) {
+                const a = document.createElement('a');
+                a.href = locStr;
+                a.textContent = locStr;
+                a.rel = 'noopener noreferrer';
+                a.target = '_blank';
+                a.className = 'th-shuffler-loc-link';
+                a.addEventListener('click', (e) => e.stopPropagation());
+                loc.appendChild(a);
+            } else {
+                loc.textContent = locStr;
+            }
+            body.appendChild(loc);
+        }
+
+        body.addEventListener('click', () => {
+            const wsGuid = this.getWorkspaceGuid?.() || this.data?.getActiveUsers?.()[0]?.workspaceGuid;
+            if (!wsGuid || !picked.guid) return;
+            state.panel?.navigateTo({
+                workspaceGuid: wsGuid,
+                type:   'edit_panel',
+                rootId: picked.guid,
+                subId:  picked.guid,
+            });
+        });
+
+        card.appendChild(body);
+        bodyEl.appendChild(card);
+    }
+
+    _shuffleSignatureFromParts(guid, text) {
+        return (guid || '') + '\0' + String(text || '').slice(0, 280);
+    }
+
+    _shuffleSignature(h) {
+        return this._shuffleSignatureFromParts(h.guid, h.text);
+    }
+
+    /**
+     * All highlight quotes under a Reference body (every day under ❣️ Highlights), for shuffle pool.
+     */
+    async _extractAllHighlightsFromReferenceBody(record) {
+        let items;
+        try { items = await record.getLineItems(); } catch (_) { return []; }
+        if (!items || !items.length) return [];
+
+        const ordered = this._buildRecordDocumentOrder(record, items);
+        const recId = record.guid;
+
+        const roots = this._childrenInDocOrder(ordered, recId, recId);
+        let sectionLine = null;
+        for (const line of roots) {
+            const plain = await this._linePlainText(line);
+            if (this._isHighlightsSectionHeader(plain)) {
+                sectionLine = line;
+                break;
+            }
+        }
+        if (!sectionLine) return [];
+
+        const out = [];
+        const dateBlocks = this._childrenInDocOrder(ordered, recId, sectionLine.guid);
+        for (const dateLine of dateBlocks) {
+            if (dateLine?.type === 'br') continue;
+            const plainLo = (await this._linePlainText(dateLine)).trim();
+            if (!plainLo) continue;
+            if (plainLo === READWISE_REF_BETWEEN_DATE_DIVIDER_TEXT) continue;
+
+            const underDay = this._childrenInDocOrder(ordered, recId, dateLine.guid);
+            for (const line of underDay) {
+                if (line?.type === 'br') continue;
+                const t = (await this._linePlainText(line)).trim();
+                if (!t || t === '---' || this._isReadwiseRefSeparatorLine(t)) continue;
+
+                const { note, loc } = await this._parseNoteLocUnderQuote(record, ordered, line);
+                out.push({ text: t, note, loc });
+            }
+        }
+        return out;
+    }
+
+    async _getQuoteShufflePoolFromReferences() {
+        if (this._quotePoolCache !== null && this._quotePoolCache !== undefined) return this._quotePoolCache;
+
+        const collections = await this.data.getAllCollections();
+        const refsColl = collections.find(c => c.getName() === 'References');
+        if (!refsColl) {
+            this._quotePoolCache = [];
+            return this._quotePoolCache;
+        }
+
+        let records;
+        try { records = await refsColl.getAllRecords(); }
+        catch (_) {
+            this._quotePoolCache = [];
+            return this._quotePoolCache;
+        }
+
+        const results = [];
+        const CONCURRENCY = 24;
+        for (let i = 0; i < records.length; i += CONCURRENCY) {
+            const chunk = records.slice(i, i + CONCURRENCY);
+            const parsed = await Promise.all(chunk.map((record) =>
+                this._extractAllHighlightsFromReferenceBody(record)));
+            for (let j = 0; j < chunk.length; j++) {
+                const record = chunk[j];
+                for (const row of parsed[j]) {
+                    let category = '';
+                    try { category = record.prop('category')?.choice?.() || ''; } catch (_) {}
+                    const guid = record.guid;
+                    results.push({
+                        guid,
+                        record,
+                        text:          row.text,
+                        note:          row.note || '',
+                        source_title:  this._sourceTitleLabel(record),
+                        source_author: this._authorLabel(record),
+                        location:      row.loc || '',
+                        category,
+                        _sig: this._shuffleSignatureFromParts(guid, row.text),
+                    });
+                }
+            }
+        }
+
+        this._quotePoolCache = results;
+        return results;
+    }
+
+    _pickRandomShuffleCandidate(pool, avoidSig) {
+        if (!pool || pool.length === 0) return null;
+        if (pool.length === 1) return pool[0];
+        const avoid = (avoidSig && String(avoidSig).trim()) ? String(avoidSig) : '';
+        for (let tries = 0; tries < 12; tries++) {
+            const idx = Math.floor(Math.random() * pool.length);
+            const c = pool[idx];
+            if (!avoid || c._sig !== avoid) return c;
+        }
+        return pool[Math.floor(Math.random() * pool.length)];
     }
 
     _flushPendingPopulate(state) {
@@ -2175,7 +2742,7 @@ class Plugin extends AppPlugin {
     }
     _saveBool(key, val) {
         try { localStorage.setItem(key, val ? 'true' : 'false'); } catch (_) {}
-        globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => [RWR_TOKEN_KEY, RWR_LAST_RUN_KEY, 'th_footer_collapsed']);
+        globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => this._pathBMirrorKeys());
     }
 
     // =========================================================================
@@ -2184,6 +2751,17 @@ class Plugin extends AppPlugin {
 
     _injectCSS() {
         this.ui.injectCSS(`
+            /* ── Journal footer wrapper (one or two cards) ── */
+            .th-journal-footer {
+                margin-top: 16px;
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+            }
+            .th-journal-footer > .th-footer {
+                margin-top: 0;
+            }
+
             /* ── Outer card — matches Backreferences / Today's Notes ── */
             .th-footer {
                 margin-top: 16px;
@@ -2216,6 +2794,19 @@ class Plugin extends AppPlugin {
                 color: #8a7e6a;
                 font-size: 14px;
                 flex-shrink: 0;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+            }
+            .th-inline-svg-icon {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                line-height: 0;
+                color: inherit;
+            }
+            .th-inline-svg-icon svg {
+                display: block;
             }
             .th-title {
                 font-weight: 600;
@@ -2337,6 +2928,194 @@ class Plugin extends AppPlugin {
                 font-size: 11px;
                 color: #6a5f52;
                 margin-top: 2px;
+            }
+
+            /* Quote shuffler: collapsed = same header pattern as Today’s Highlights; expanded = float toggle only */
+            .th-footer.th-footer--shuffler {
+                position: relative;
+                padding: 10px 14px 12px;
+            }
+            .th-shuffler-chrome {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                min-height: 30px;
+                margin-bottom: 6px;
+            }
+            .th-shuffler-shell:not(.th-shuffler-is-collapsed) .th-shuffler-chrome {
+                position: relative;
+                min-height: 0;
+                height: 0;
+                margin: 0;
+                padding: 0;
+                overflow: visible;
+            }
+            .th-shuffler-shell:not(.th-shuffler-is-collapsed) .th-shuffler-chrome .th-shuffler-title-icon,
+            .th-shuffler-shell:not(.th-shuffler-is-collapsed) .th-shuffler-chrome .th-shuffler-panel-title {
+                display: none !important;
+            }
+            .th-shuffler-shell:not(.th-shuffler-is-collapsed) .th-shuffler-chrome .th-toggle {
+                position: absolute;
+                left: 10px;
+                top: 8px;
+                z-index: 4;
+                margin: 0;
+            }
+            .th-shuffler-shell.th-shuffler-is-collapsed .th-shuffler-chrome .th-toggle {
+                position: static;
+            }
+            .th-shuffler-shell.th-shuffler-is-collapsed {
+                min-height: 34px;
+            }
+            .th-shuffler-body {
+                text-align: center;
+                padding: 28px 8px 6px;
+            }
+            .th-shuffler-shell.th-shuffler-is-collapsed .th-shuffler-body {
+                padding-top: 0;
+            }
+
+            /* Idle: no inner card — only panel background + centered prompt */
+            .th-shuffler-idle {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                gap: 14px;
+                max-width: 36em;
+                margin: 0 auto;
+            }
+            .th-shuffler-idle--bare {
+                border: none;
+                background: none;
+                padding: 10px 8px 8px;
+                border-radius: 0;
+            }
+            .th-shuffler-idle-caption {
+                font-family: var(--font-sans, system-ui, sans-serif);
+                font-size: 13px;
+                line-height: 1.65;
+                color: var(--color-text-100, #eceff4);
+                opacity: 0.42;
+                text-align: center;
+                max-width: 22em;
+            }
+            .th-shuffler-draw-btn {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                line-height: 0;
+                border: none;
+                background: none;
+                padding: 6px 8px;
+                color: var(--color-text-100, #eceff4);
+                opacity: 0.52;
+                cursor: pointer;
+                transition: opacity 0.12s;
+            }
+            .th-shuffler-draw-btn:hover {
+                opacity: 0.92;
+            }
+
+            /* Quote card — Daily Ritual–inspired: centered, breathable type (still a small footer card) */
+            .th-shuffler-card {
+                position: relative;
+                margin: 4px auto 0;
+                padding: 20px 20px 22px;
+                max-width: 36em;
+                border-radius: 10px;
+                background: rgba(255,255,255,0.04);
+                border: 1px solid rgba(255,255,255,0.09);
+            }
+            .th-shuffler-card-reshuffle {
+                position: absolute;
+                top: 6px;
+                right: 6px;
+                z-index: 3;
+                padding: 2px 4px;
+                line-height: 0;
+                border: none;
+                background: none;
+                border-radius: 0;
+                opacity: 0.42;
+                cursor: pointer;
+                color: var(--color-text-100, #eceff4);
+                transition: opacity 0.12s;
+            }
+            .th-shuffler-card-reshuffle:hover {
+                opacity: 0.88;
+            }
+            .th-shuffler-card-body {
+                cursor: pointer;
+                padding: 4px 28px 0 8px;
+                text-align: center;
+            }
+            .th-shuffler-card-body:hover {
+                opacity: 0.97;
+            }
+            .th-shuffler-quote-display {
+                font-family: var(--font-sans, system-ui, sans-serif);
+                font-size: 15px;
+                line-height: 1.82;
+                color: var(--color-text-100, #eceff4);
+                opacity: 0.88;
+                font-style: italic;
+                letter-spacing: 0.01em;
+                text-align: center;
+                margin: 0 auto;
+            }
+            .th-shuffler-ritual-divider {
+                width: 32px;
+                height: 1px;
+                background: rgba(255,255,255,0.09);
+                margin: 20px auto 0;
+            }
+            .th-shuffler-source {
+                margin-top: 14px;
+                font-family: var(--font-sans, system-ui, sans-serif);
+                font-size: 14px;
+                font-weight: 600;
+                color: var(--color-text-100, #eceff4);
+                opacity: 0.78;
+                font-style: normal;
+                text-align: center;
+            }
+            .th-shuffler-author {
+                margin-top: 6px;
+                font-size: 12px;
+                color: var(--color-text-100, #eceff4);
+                opacity: 0.45;
+                font-style: normal;
+                text-align: center;
+            }
+            .th-shuffler-note {
+                margin-top: 14px;
+                font-size: 12px;
+                line-height: 1.55;
+                color: var(--color-text-100, #eceff4);
+                opacity: 0.48;
+                font-style: italic;
+                text-align: center;
+                max-width: 32em;
+                margin-left: auto;
+                margin-right: auto;
+            }
+            .th-shuffler-loc {
+                margin-top: 10px;
+                font-size: 11px;
+                color: var(--color-text-100, #eceff4);
+                opacity: 0.38;
+                word-break: break-all;
+                text-align: center;
+            }
+            .th-shuffler-loc-link {
+                color: var(--color-primary-400, #88c0d0);
+                opacity: 0.85;
+                text-decoration: none;
+            }
+            .th-shuffler-loc-link:hover {
+                text-decoration: underline;
+                opacity: 1;
             }
         `);
     }
