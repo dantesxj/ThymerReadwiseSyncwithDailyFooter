@@ -12,7 +12,7 @@ This repo now uses a consolidated References-based model and no longer ships the
 If you are upgrading from the old setup:
 
 1. Import/create `References` using `References.json`.
-2. Install only `Readwise References.js` + `Readwise References.json`.
+2. Install only `plugin.js` + `plugin.json`.
 3. Disable/remove legacy Readwise + Today's Highlights plugins to avoid duplicate behavior.
 4. Run `Readwise Ref: Full Sync` once to rebuild from the new model.
 
@@ -21,7 +21,7 @@ If you are upgrading from the old setup:
 - Replaced the old dual-collection model (`Captures` + `Highlights`) with:
   - one `References` collection (`References.json`)
 - Merged sync + journal footer behavior into one plugin:
-  - `Readwise References.js` + `Readwise References.json`
+- `plugin.js` + `plugin.json`
 - Added Path B storage-mode support (`Plugin Settings` collection mirror):
   - token, last-run timestamp, panel visibility, shuffler collapse, per-day shuffler picks map, and Today's Highlights collapse can be synced
 
@@ -48,8 +48,8 @@ If you are upgrading from the old setup:
 
 1. Create collection `References` using `References.json`.
 2. Create plugin `Readwise References`:
-   - Configuration: `Readwise References.json`
-   - Custom Code: `Readwise References.js`
+   - Configuration: `plugin.json`
+   - Custom Code: `plugin.js`
 3. Run `Readwise Ref: Set Token` (token from `https://readwise.io/access_token`).
 4. Run `Readwise Ref: Full Sync` for first import.
 5. Use `Readwise Ref: Sync` for subsequent updates.
@@ -61,6 +61,6 @@ If you are upgrading from the old setup:
 
 ## Files in this repo
 
-- `Readwise References.js`
-- `Readwise References.json`
+- `plugin.js`
+- `plugin.json`
 - `References.json`

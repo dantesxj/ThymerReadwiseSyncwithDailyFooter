@@ -334,6 +334,11 @@ const TH_KEY_SHOW_SHUFFLER     = 'th_panel_show_shuffler';
 const TH_KEY_SHUFFLER_COLLAPSED = 'th_shuffler_collapsed';
 /** JSON object: { [YYYYMMDD]: { sig, guid, text, note, location, source_title, source_author } } */
 const TH_KEY_SHUFFLER_QUOTES_BY_DAY = 'th_shuffler_quotes_by_day';
+const TH_KEY_SHUFFLER_POOL_CACHE = 'th_shuffler_pool_cache_v4';
+/** Debounced cross-device sync for per-day shuffle picks (avoid workspace-wide flashes on every click). */
+const TH_SHUFFLER_DAYMAP_SYNC_IDLE_MS = 15000;
+const TH_SHUFFLER_POOL_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const TH_SHUFFLER_POOL_CONCURRENCY = 10;
 
 /** Must match Today's Highlights parser. */
 const READWISE_REF_HIGHLIGHTS_HEADER = '❣️ Highlights...';
@@ -432,6 +437,9 @@ class Plugin extends AppPlugin {
         this._shufflerCollapsed = this._loadBool(TH_KEY_SHUFFLER_COLLAPSED, false);
         this._thRefQueryCache = new Map();
         this._quotePoolCache = null;
+        this._quotePoolCacheSavedAt = 0;
+        this._quotePoolBuildingPromise = null;
+        this._hydrateQuotePoolCacheFromStorage();
         this._injectCSS();
         this._eventHandlerIds.push(this.events.on('panel.navigated', ev => this._deferHandlePanel(ev.panel)));
         this._eventHandlerIds.push(this.events.on('panel.focused',   ev => this._handlePanel(ev.panel)));
@@ -444,6 +452,7 @@ class Plugin extends AppPlugin {
             const p = this.ui.getActivePanel();
             if (p) this._handlePanel(p);
         }, 400);
+        setTimeout(() => { void this._warmQuotePoolCache(); }, 1200);
     }
 
     onUnload() {
@@ -460,6 +469,10 @@ class Plugin extends AppPlugin {
         }
         this._panelStates?.clear();
         this._clearFooterDataCaches();
+        if (this._shufflerDayMapSyncTimer) {
+            try { clearTimeout(this._shufflerDayMapSyncTimer); } catch (_) {}
+            this._shufflerDayMapSyncTimer = null;
+        }
 
         this._cmdSetToken?.remove();
         this._cmdSync?.remove();
@@ -533,6 +546,57 @@ class Plugin extends AppPlugin {
     _clearFooterDataCaches() {
         try { this._thRefQueryCache?.clear(); } catch (_) {}
         this._quotePoolCache = null;
+        this._quotePoolCacheSavedAt = 0;
+        this._quotePoolBuildingPromise = null;
+        try { localStorage.removeItem(TH_KEY_SHUFFLER_POOL_CACHE); } catch (_) {}
+    }
+
+    _hydrateQuotePoolCacheFromStorage() {
+        try {
+            const raw = localStorage.getItem(TH_KEY_SHUFFLER_POOL_CACHE);
+            if (!raw) return;
+            const parsed = JSON.parse(raw);
+            const pool = Array.isArray(parsed?.pool) ? parsed.pool : [];
+            const savedAt = Number(parsed?.savedAt || 0);
+            if (!pool.length || !Number.isFinite(savedAt) || savedAt <= 0) return;
+            this._quotePoolCache = pool;
+            this._quotePoolCacheSavedAt = savedAt;
+        } catch (_) {
+            // ignore malformed cache
+        }
+    }
+
+    _persistQuotePoolCache(pool) {
+        const src = Array.isArray(pool) ? pool : [];
+        const compact = [];
+        for (const row of src.slice(0, 1500)) {
+            compact.push({
+                guid: String(row?.guid || ''),
+                text: String(row?.text || ''),
+                note: String(row?.note || '').slice(0, 240),
+                location: String(row?.location || '').slice(0, 180),
+                source_title: String(row?.source_title || '').slice(0, 140),
+                source_author: String(row?.source_author || '').slice(0, 80),
+                category: String(row?.category || '').slice(0, 80),
+                _sig: String(row?._sig || ''),
+            });
+        }
+        const payload = { savedAt: Date.now(), pool: compact };
+        try { localStorage.setItem(TH_KEY_SHUFFLER_POOL_CACHE, JSON.stringify(payload)); } catch (_) {}
+    }
+
+    _isQuotePoolCacheStale() {
+        if (!this._quotePoolCacheSavedAt) return true;
+        return (Date.now() - this._quotePoolCacheSavedAt) > TH_SHUFFLER_POOL_CACHE_MAX_AGE_MS;
+    }
+
+    async _warmQuotePoolCache() {
+        if (this._quotePoolBuildingPromise) return this._quotePoolBuildingPromise;
+        if (Array.isArray(this._quotePoolCache) && this._quotePoolCache.length && !this._isQuotePoolCacheStale()) return this._quotePoolCache;
+        this._quotePoolBuildingPromise = this._rebuildQuoteShufflePoolFromReferences({ persist: true })
+            .catch(() => [])
+            .finally(() => { this._quotePoolBuildingPromise = null; });
+        return this._quotePoolBuildingPromise;
     }
 
     _toggleShowHighlightsPanel() {
@@ -546,6 +610,7 @@ class Plugin extends AppPlugin {
         const next = !this._showShufflerPanel();
         this._saveBool(TH_KEY_SHOW_SHUFFLER, next);
         this._toast(next ? 'Quote Shuffler panel: on' : 'Quote Shuffler panel: off');
+        if (next) void this._warmQuotePoolCache();
         this._rebuildAllJournalFooters();
     }
 
@@ -1900,9 +1965,17 @@ class Plugin extends AppPlugin {
     }
 
     async _populateShufflerSection(state, shBody, targetJournal, targetRoot, targetGuid) {
+        await this._warmQuotePoolCache();
+        const pool = Array.isArray(this._quotePoolCache) ? this._quotePoolCache : [];
         const saved = this._loadDayShufflePick(targetJournal);
         if (saved && saved.guid && String(saved.text || '').trim()) {
-            this._renderShufflerQuoteCard(state, shBody, this._pickFromStored(saved), targetJournal);
+            let pick = this._pickFromStored(saved);
+            const merged = this._mergeShufflePickWithPool(pick, pool);
+            if (merged !== pick) {
+                pick = merged;
+                this._persistDayShufflePick(targetJournal, pick);
+            }
+            this._renderShufflerQuoteCard(state, shBody, pick, targetJournal);
         } else {
             this._renderShufflerIdle(state, shBody, targetJournal);
         }
@@ -1925,8 +1998,20 @@ class Plugin extends AppPlugin {
         try {
             localStorage.setItem(TH_KEY_SHUFFLER_QUOTES_BY_DAY, JSON.stringify(map));
         } catch (_) {}
-        globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => this._pathBMirrorKeys());
-        this._flushPathBNowBestEffort();
+        this._scheduleShufflerDayMapPathBSync();
+    }
+
+    _scheduleShufflerDayMapPathBSync() {
+        if (this._pathBMode !== 'synced') return;
+        if (this._shufflerDayMapSyncTimer) {
+            try { clearTimeout(this._shufflerDayMapSyncTimer); } catch (_) {}
+        }
+        this._shufflerDayMapSyncTimer = setTimeout(() => {
+            this._shufflerDayMapSyncTimer = null;
+            const pathB = globalThis.ThymerExtPathB;
+            if (!pathB?.flushNow || !this.data || !this._pathBPluginId) return;
+            pathB.flushNow(this.data, this._pathBPluginId, this._pathBMirrorKeys()).catch(() => {});
+        }, TH_SHUFFLER_DAYMAP_SYNC_IDLE_MS);
     }
 
     _loadDayShufflePick(yyyymmdd) {
@@ -1968,6 +2053,69 @@ class Plugin extends AppPlugin {
             source_author: stored.source_author || '',
             _sig:          stored.sig || this._shuffleSignatureFromParts(stored.guid, stored.text),
         };
+    }
+
+    /** How many leading characters of `a` and `b` match (byte-for-byte). */
+    _lcpPrefixMatchLen(a, b) {
+        const sa = String(a || '');
+        const sb = String(b || '');
+        const n = Math.min(sa.length, sb.length);
+        let i = 0;
+        while (i < n && sa.charCodeAt(i) === sb.charCodeAt(i)) i++;
+        return i;
+    }
+
+    /** Replace truncated per-day fields when the shuffle pool has a longer row (same guid + sig, prefix, or near-prefix). */
+    _mergeShufflePickWithPool(pick, pool) {
+        if (!pick?.guid || !Array.isArray(pool) || !pool.length) return pick;
+        const pt = String(pick.text || '');
+        let row = pool.find(c => c && c.guid === pick.guid && c._sig === pick._sig);
+        if (!row && pt) {
+            const strict = pool.filter(c => {
+                if (!c || c.guid !== pick.guid) return false;
+                const ct = String(c.text || '');
+                return ct.length > pt.length && ct.startsWith(pt);
+            });
+            if (strict.length) {
+                row = strict.reduce((a, b) =>
+                    (String(a.text || '').length >= String(b.text || '').length ? a : b));
+            }
+        }
+        if (!row && pt.length >= 32) {
+            const tailSlack = Math.max(36, Math.floor(pt.length * 0.06));
+            const minLcp = Math.max(32, pt.length - tailSlack);
+            let best = null;
+            let bestLen = 0;
+            for (const c of pool) {
+                if (!c || c.guid !== pick.guid) continue;
+                const ct = String(c.text || '');
+                if (ct.length <= pt.length + 3) continue;
+                const lcp = this._lcpPrefixMatchLen(pt, ct);
+                if (lcp >= minLcp) {
+                    if (ct.length > bestLen) {
+                        best = c;
+                        bestLen = ct.length;
+                    }
+                }
+            }
+            row = best;
+        }
+        if (!row) return pick;
+        let changed = false;
+        const out = { ...pick };
+        const takeLonger = (a, b) => {
+            const sa = String(a || '');
+            const sb = String(b || '');
+            if (sb.length > sa.length) { changed = true; return sb; }
+            return sa;
+        };
+        out.text = takeLonger(out.text, row.text);
+        out.note = takeLonger(out.note, row.note);
+        out.location = takeLonger(out.location, row.location);
+        out.source_title = takeLonger(out.source_title, row.source_title);
+        out.source_author = takeLonger(out.source_author, row.source_author);
+        if (changed) out._sig = row._sig || this._shuffleSignature(out);
+        return changed ? out : pick;
     }
 
     _renderShufflerIdle(state, bodyEl, journalDate) {
@@ -2164,26 +2312,32 @@ class Plugin extends AppPlugin {
             if (!plainLo) continue;
             if (plainLo === READWISE_REF_BETWEEN_DATE_DIVIDER_TEXT) continue;
 
-            const underDay = this._childrenInDocOrder(ordered, recId, dateLine.guid);
-            for (const line of underDay) {
-                if (line?.type === 'br') continue;
-                const t = (await this._linePlainText(line)).trim();
-                if (!t || t === '---' || this._isReadwiseRefSeparatorLine(t)) continue;
-
-                const { note, loc } = await this._parseNoteLocUnderQuote(record, ordered, line);
-                out.push({ text: t, note, loc });
+            const merged = await this._mergeQuoteLinesUnderDateGroup(record, ordered, recId, dateLine);
+            for (const row of merged) {
+                out.push({ text: row.text, note: row.note, loc: row.loc });
             }
         }
         return out;
     }
 
     async _getQuoteShufflePoolFromReferences() {
-        if (this._quotePoolCache !== null && this._quotePoolCache !== undefined) return this._quotePoolCache;
+        if (Array.isArray(this._quotePoolCache) && this._quotePoolCache.length) {
+            if (this._isQuotePoolCacheStale()) void this._warmQuotePoolCache();
+            return this._quotePoolCache;
+        }
+        if (this._quotePoolBuildingPromise) return this._quotePoolBuildingPromise;
 
+        this._quotePoolBuildingPromise = this._rebuildQuoteShufflePoolFromReferences({ persist: true })
+            .finally(() => { this._quotePoolBuildingPromise = null; });
+        return this._quotePoolBuildingPromise;
+    }
+
+    async _rebuildQuoteShufflePoolFromReferences({ persist }) {
         const collections = await this.data.getAllCollections();
         const refsColl = collections.find(c => c.getName() === 'References');
         if (!refsColl) {
             this._quotePoolCache = [];
+            this._quotePoolCacheSavedAt = Date.now();
             return this._quotePoolCache;
         }
 
@@ -2191,13 +2345,13 @@ class Plugin extends AppPlugin {
         try { records = await refsColl.getAllRecords(); }
         catch (_) {
             this._quotePoolCache = [];
+            this._quotePoolCacheSavedAt = Date.now();
             return this._quotePoolCache;
         }
 
         const results = [];
-        const CONCURRENCY = 24;
-        for (let i = 0; i < records.length; i += CONCURRENCY) {
-            const chunk = records.slice(i, i + CONCURRENCY);
+        for (let i = 0; i < records.length; i += TH_SHUFFLER_POOL_CONCURRENCY) {
+            const chunk = records.slice(i, i + TH_SHUFFLER_POOL_CONCURRENCY);
             const parsed = await Promise.all(chunk.map((record) =>
                 this._extractAllHighlightsFromReferenceBody(record)));
             for (let j = 0; j < chunk.length; j++) {
@@ -2219,9 +2373,12 @@ class Plugin extends AppPlugin {
                     });
                 }
             }
+            await this._sleep(0);
         }
 
         this._quotePoolCache = results;
+        this._quotePoolCacheSavedAt = Date.now();
+        if (persist) this._persistQuotePoolCache(results);
         return results;
     }
 
@@ -2337,15 +2494,10 @@ class Plugin extends AppPlugin {
         }
         if (!targetDateLine) return [];
 
+        const merged = await this._mergeQuoteLinesUnderDateGroup(record, ordered, recId, targetDateLine);
         const out = [];
-        const underDay = this._childrenInDocOrder(ordered, recId, targetDateLine.guid);
-        for (const line of underDay) {
-            if (line?.type === 'br') continue;
-            const t = (await this._linePlainText(line)).trim();
-            if (!t || t === '---' || this._isReadwiseRefSeparatorLine(t)) continue;
-
-            const { note, loc } = await this._parseNoteLocUnderQuote(record, ordered, line);
-            out.push({ text: t, note, loc });
+        for (const row of merged) {
+            out.push({ text: row.text, note: row.note, loc: row.loc });
         }
         return out;
     }
@@ -2403,6 +2555,46 @@ class Plugin extends AppPlugin {
             }
         }
         return { note, loc };
+    }
+
+    /**
+     * Join consecutive sibling lines under one calendar heading until a quote-separator line.
+     * Thymer may split a long highlight across several top-level lines; the sync format inserts
+     * `READWISE_REF_QUOTE_SEPARATOR_TEXT` only between distinct highlights, not between fragments.
+     */
+    async _mergeQuoteLinesUnderDateGroup(record, ordered, recId, dateLine) {
+        const underDay = this._childrenInDocOrder(ordered, recId, dateLine.guid);
+        const out = [];
+        const group = [];
+
+        const emitGroup = () => {
+            if (!group.length) return;
+            const text = group.map(g => g.t).join('\n\n');
+            let note = '';
+            let loc = '';
+            for (const g of group) {
+                if (g.note && String(g.note).trim()) note = String(g.note).trim();
+                if (g.loc && String(g.loc).trim()) loc = String(g.loc).trim();
+            }
+            out.push({ text, note, loc });
+            group.length = 0;
+        };
+
+        for (const line of underDay) {
+            if (line?.type === 'br') continue;
+            const t = (await this._linePlainText(line)).trim();
+            if (!t || t === '---') continue;
+
+            if (this._isReadwiseRefSeparatorLine(t)) {
+                emitGroup();
+                continue;
+            }
+
+            const { note, loc } = await this._parseNoteLocUnderQuote(record, ordered, line);
+            group.push({ t, note, loc });
+        }
+        emitGroup();
+        return out;
     }
 
     _childrenInDocOrder(ordered, recId, parentGuid) {
