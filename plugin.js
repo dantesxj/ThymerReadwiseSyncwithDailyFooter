@@ -1719,6 +1719,7 @@ class Plugin extends AppPlugin {
             if (!state.observer) {
                 state.observer = this._createFooterObserver(state, panelEl);
             }
+            this._ensureFooterBottom(state, container);
             return false;
         }
 
@@ -1734,9 +1735,17 @@ class Plugin extends AppPlugin {
 
         state.rootEl = this._buildShell(state);
         if (state.rootEl) container.appendChild(state.rootEl);
+        this._ensureFooterBottom(state, container);
 
         state.observer = this._createFooterObserver(state, panelEl);
         return true;
+    }
+
+    _ensureFooterBottom(state, container) {
+        if (!state?.rootEl || !container) return;
+        if (state.rootEl.parentElement !== container) return;
+        if (container.lastElementChild === state.rootEl) return;
+        container.appendChild(state.rootEl);
     }
 
     _createFooterObserver(state, panelEl) {
@@ -1749,6 +1758,8 @@ class Plugin extends AppPlugin {
                     }
                 }, 300);
             }
+            const container = this._findContainer(panelEl);
+            if (container) this._ensureFooterBottom(state, container);
         });
         obs.observe(panelEl, { childList: true, subtree: true });
         return obs;
