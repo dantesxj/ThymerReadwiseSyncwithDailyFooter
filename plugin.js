@@ -1,25 +1,77 @@
-// @generated BEGIN thymer-ext-path-b (source: plugins/plugin-settings/ThymerExtPathBRuntime.js — edit that file, then npm run embed-path-b)
+// @generated BEGIN thymer-plugin-settings (source: plugins/plugin-settings/ThymerPluginSettingsRuntime.js — run: npm run embed-plugin-settings)
 /**
- * ThymerExtPathB — shared path-B storage (Plugin Settings collection + localStorage mirror).
- * Edit this file in the repo, then run `npm run embed-path-b` to refresh embedded copies inside each Path B plugin.
+ * ThymerPluginSettings — workspace “Plugin Settings” collection + optional localStorage mirror
+ * for global plugins that do not own a collection.
  *
- * API: ThymerExtPathB.init({ plugin, pluginId, modeKey, mirrorKeys, label, data, ui })
- *      ThymerExtPathB.scheduleFlush(plugin, mirrorKeys)
- *      ThymerExtPathB.openStorageDialog(plugin, { pluginId, modeKey, mirrorKeys, label, data, ui })
+ * Edit this file, then from repo root: npm run embed-plugin-settings
+ *
+ * API: ThymerPluginSettings.init({ plugin, pluginId, modeKey, mirrorKeys, label, data, ui })
+ *      ThymerPluginSettings.scheduleFlush(plugin, mirrorKeys)
+ *      ThymerPluginSettings.openStorageDialog({ plugin, pluginId, modeKey, mirrorKeys, label, data, ui })
  */
-(function pathBRuntime(g) {
-  if (g.ThymerExtPathB) return;
+(function pluginSettingsRuntime(g) {
+  if (g.ThymerPluginSettings) return;
 
   const COL_NAME = 'Plugin Settings';
   const q = [];
   let busy = false;
+
+  /** Serialized ensures so concurrent plugin loads do not double-create the collection. */
+  let _ensureChain = Promise.resolve();
+
+  const PLUGIN_SETTINGS_SHAPE = {
+    ver: 1,
+    name: COL_NAME,
+    icon: 'ti-adjustments',
+    item_name: 'Setting',
+    description:
+      'Workspace storage for plugin preferences (cross-device when you choose synced settings). One row per plugin.',
+    show_sidebar_items: true,
+    show_cmdpal_items: false,
+    views: [],
+    fields: [
+      {
+        icon: 'ti-id',
+        id: 'plugin_id',
+        label: 'Plugin ID',
+        type: 'text',
+        read_only: false,
+        active: true,
+        many: false,
+      },
+      {
+        icon: 'ti-code',
+        id: 'settings_json',
+        label: 'Settings JSON',
+        type: 'text',
+        read_only: false,
+        active: true,
+        many: false,
+      },
+    ],
+    page_field_ids: ['plugin_id', 'settings_json'],
+    sidebar_record_sort_field_id: 'updated_at',
+    sidebar_record_sort_dir: 'desc',
+    managed: { fields: false, views: false, sidebar: false },
+    custom: {},
+    home: false,
+    color: null,
+  };
+
+  function cloneShape() {
+    try {
+      return structuredClone(PLUGIN_SETTINGS_SHAPE);
+    } catch (_) {
+      return JSON.parse(JSON.stringify(PLUGIN_SETTINGS_SHAPE));
+    }
+  }
 
   function drain() {
     if (busy || !q.length) return;
     busy = true;
     const job = q.shift();
     Promise.resolve(typeof job === 'function' ? job() : job)
-      .catch((e) => console.error('[ThymerExtPathB]', e))
+      .catch((e) => console.error('[ThymerPluginSettings]', e))
       .finally(() => {
         busy = false;
         if (q.length) setTimeout(drain, 450);
@@ -38,6 +90,34 @@
     } catch (_) {
       return null;
     }
+  }
+
+  function ensurePluginSettingsCollection(data) {
+    if (!data || typeof data.getAllCollections !== 'function' || typeof data.createCollection !== 'function') {
+      return Promise.resolve();
+    }
+    const work = async () => {
+      try {
+        const existing = await findColl(data);
+        if (existing) return;
+        const coll = await data.createCollection();
+        if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') {
+          return;
+        }
+        const again = await findColl(data);
+        if (again) return;
+        const conf = cloneShape();
+        const base = coll.getConfiguration();
+        if (base && typeof base.ver === 'number') conf.ver = base.ver;
+        const ok = await coll.saveConfiguration(conf);
+        if (ok === false) return;
+        await new Promise((r) => setTimeout(r, 350));
+      } catch (e) {
+        console.error('[ThymerPluginSettings] ensure collection', e);
+      }
+    };
+    _ensureChain = _ensureChain.catch(() => {}).then(work);
+    return _ensureChain;
   }
 
   async function readDoc(data, pluginId) {
@@ -102,7 +182,7 @@
   }
 
   function showFirstRunDialog(ui, label, preferred, onPick) {
-    const id = 'thymerext-pathb-first-' + Math.random().toString(36).slice(2);
+    const id = 'thymerext-ps-first-' + Math.random().toString(36).slice(2);
     const box = document.createElement('div');
     box.id = id;
     box.style.cssText =
@@ -136,7 +216,11 @@
       return b;
     };
     const bLoc = mk('This device only', 'Browser localStorage only.', preferred === 'local');
-    const bSyn = mk('Sync via Plugin Settings', 'Workspace collection “' + COL_NAME + '”.', preferred === 'synced');
+    const bSyn = mk(
+      'Sync across devices',
+      'Store in the workspace “' + COL_NAME + '” collection (same account on any browser).',
+      preferred === 'synced'
+    );
     const fin = (m) => {
       try {
         box.remove();
@@ -153,11 +237,12 @@
     document.body.appendChild(box);
   }
 
-  g.ThymerExtPathB = {
+  g.ThymerPluginSettings = {
     COL_NAME,
     enqueue,
     async init(opts) {
       const { plugin, pluginId, modeKey, mirrorKeys, label, data, ui } = opts;
+
       let mode = null;
       try {
         mode = localStorage.getItem(modeKey);
@@ -190,11 +275,11 @@
         } catch (_) {}
       }
 
-      plugin._pathBMode = mode === 'synced' ? 'synced' : 'local';
-      plugin._pathBPluginId = pluginId;
+      plugin._pluginSettingsSyncMode = mode === 'synced' ? 'synced' : 'local';
+      plugin._pluginSettingsPluginId = pluginId;
       const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
 
-      if (plugin._pathBMode === 'synced' && remote && remote.payload && typeof remote.payload === 'object') {
+      if (plugin._pluginSettingsSyncMode === 'synced' && remote && remote.payload && typeof remote.payload === 'object') {
         for (const k of keys) {
           const v = remote.payload[k];
           if (typeof v === 'string') {
@@ -205,27 +290,28 @@
         }
       }
 
-      if (plugin._pathBMode === 'synced') {
+      if (plugin._pluginSettingsSyncMode === 'synced') {
         try {
-          await g.ThymerExtPathB.flushNow(data, pluginId, keys);
+          await g.ThymerPluginSettings.flushNow(data, pluginId, keys);
         } catch (_) {}
       }
     },
 
     scheduleFlush(plugin, mirrorKeys) {
-      if (plugin._pathBMode !== 'synced') return;
+      if (plugin._pluginSettingsSyncMode !== 'synced') return;
       const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
-      if (plugin._pathBFlushTimer) clearTimeout(plugin._pathBFlushTimer);
-      plugin._pathBFlushTimer = setTimeout(() => {
-        plugin._pathBFlushTimer = null;
-        const data = plugin.data;
-        const pid = plugin._pathBPluginId;
-        if (!pid || !data) return;
-        g.ThymerExtPathB.flushNow(data, pid, keys).catch((e) => console.error('[ThymerExtPathB] flush', e));
+      if (plugin._pluginSettingsFlushTimer) clearTimeout(plugin._pluginSettingsFlushTimer);
+      plugin._pluginSettingsFlushTimer = setTimeout(() => {
+        plugin._pluginSettingsFlushTimer = null;
+        const pdata = plugin.data;
+        const pid = plugin._pluginSettingsPluginId;
+        if (!pid || !pdata) return;
+        g.ThymerPluginSettings.flushNow(pdata, pid, keys).catch((e) => console.error('[ThymerPluginSettings] flush', e));
       }, 500);
     },
 
     async flushNow(data, pluginId, mirrorKeys) {
+      await ensurePluginSettingsCollection(data);
       const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
       const payload = {};
       for (const k of keys) {
@@ -245,7 +331,7 @@
 
     async openStorageDialog(opts) {
       const { plugin, pluginId, modeKey, mirrorKeys, label, data, ui } = opts;
-      const cur = plugin._pathBMode === 'synced' ? 'synced' : 'local';
+      const cur = plugin._pluginSettingsSyncMode === 'synced' ? 'synced' : 'local';
       const pick = await new Promise((resolve) => {
         const close = (v) => {
           try {
@@ -271,7 +357,7 @@
         b1.textContent = 'This device only';
         const b2 = document.createElement('button');
         b2.type = 'button';
-        b2.textContent = 'Sync via Plugin Settings';
+        b2.textContent = 'Sync across devices';
         [b1, b2].forEach((b) => {
           b.style.cssText =
             'display:block;width:100%;padding:10px 12px;margin-bottom:8px;border-radius:8px;cursor:pointer;border:1px solid var(--border-default,#3f3f46);background:transparent;color:inherit;text-align:left;';
@@ -295,20 +381,19 @@
       try {
         localStorage.setItem(modeKey, pick);
       } catch (_) {}
-      plugin._pathBMode = pick === 'synced' ? 'synced' : 'local';
+      plugin._pluginSettingsSyncMode = pick === 'synced' ? 'synced' : 'local';
       const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
-      if (pick === 'synced') await g.ThymerExtPathB.flushNow(data, pluginId, keys);
+      if (pick === 'synced') await g.ThymerPluginSettings.flushNow(data, pluginId, keys);
       ui.addToaster?.({
         title: label,
-        message: 'Storage: ' + (pick === 'synced' ? 'synced' : 'local only'),
+        message: pick === 'synced' ? 'Settings will sync across devices.' : 'Settings stay on this device only.',
         dismissible: true,
         autoDestroyTime: 3500,
       });
     },
   };
-
 })(typeof globalThis !== 'undefined' ? globalThis : window);
-// @generated END thymer-ext-path-b
+// @generated END thymer-plugin-settings
 
 
 /**
@@ -374,15 +459,15 @@ function formatReadwiseRefDateHeading(d) {
 class Plugin extends AppPlugin {
 
     async onLoad() {
-        await (globalThis.ThymerExtPathB?.init?.({
+        await (globalThis.ThymerPluginSettings?.init?.({
             plugin: this,
             pluginId: 'readwise-references',
             modeKey: 'thymerext_ps_mode_readwise_references',
-            mirrorKeys: () => this._pathBMirrorKeys(),
+            mirrorKeys: () => this._pluginSettingsMirrorKeys(),
             label: 'Readwise References',
             data: this.data,
             ui: this.ui,
-        }) ?? (console.warn('[Readwise Ref] ThymerExtPathB runtime missing (redeploy full plugin .js from repo).'), Promise.resolve()));
+        }) ?? (console.warn('[Readwise Ref] ThymerPluginSettings runtime missing (redeploy full plugin .js from repo).'), Promise.resolve()));
         this._syncing = false;
         this._cmdSetToken = this.ui.addCommandPaletteCommand({
             label: 'Readwise Ref: Set Token',
@@ -403,11 +488,11 @@ class Plugin extends AppPlugin {
             label: 'Readwise Ref: Storage location…',
             icon: 'ti-database',
             onSelected: () => {
-                globalThis.ThymerExtPathB?.openStorageDialog?.({
+                globalThis.ThymerPluginSettings?.openStorageDialog?.({
                     plugin: this,
                     pluginId: 'readwise-references',
                     modeKey: 'thymerext_ps_mode_readwise_references',
-                    mirrorKeys: () => this._pathBMirrorKeys(),
+                    mirrorKeys: () => this._pluginSettingsMirrorKeys(),
                     label: 'Readwise References',
                     data: this.data,
                     ui: this.ui,
@@ -485,7 +570,7 @@ class Plugin extends AppPlugin {
     }
 
     /** Keys mirrored to Plugin Settings when storage mode is synced. */
-    _pathBMirrorKeys() {
+    _pluginSettingsMirrorKeys() {
         return [
             RWR_TOKEN_KEY,
             RWR_LAST_RUN_KEY,
@@ -617,7 +702,7 @@ class Plugin extends AppPlugin {
     async _shuffleQuoteFromCommand() {
         let n = 0;
         for (const [, s] of (this._panelStates || new Map())) {
-            const sec = s.rootEl?.querySelector('[data-panel-section="shuffler"]');
+            const sec = s.shufflerRootEl || s.rootEl?.querySelector('[data-panel-section="shuffler"]');
             if (!sec) continue;
             const body = sec.querySelector('[data-role="body"]');
             if (!body || !s.journalDate) continue;
@@ -747,7 +832,7 @@ class Plugin extends AppPlugin {
                 localStorage.setItem(RWR_TOKEN_KEY, token);
                 this._toast('Token saved! Run "Readwise Ref: Full Sync".');
             }
-            globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => this._pathBMirrorKeys());
+            globalThis.ThymerPluginSettings?.scheduleFlush?.(this, () => this._pluginSettingsMirrorKeys());
         };
         saveBtn.addEventListener('click', () => done(true));
         cancelBtn.addEventListener('click', () => done(false));
@@ -781,7 +866,7 @@ class Plugin extends AppPlugin {
             this._toast('Done: ' + result.summary);
             localStorage.setItem(RWR_LAST_RUN_KEY, new Date().toISOString());
             this._clearFooterDataCaches();
-            globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => this._pathBMirrorKeys());
+            globalThis.ThymerPluginSettings?.scheduleFlush?.(this, () => this._pluginSettingsMirrorKeys());
         } catch (e) {
             console.error('[ReadwiseRef]', e);
             this._toast('Sync failed: ' + e.message);
@@ -1601,6 +1686,7 @@ class Plugin extends AppPlugin {
                     recordGuid: null,
                     journalDate: null,
                     rootEl: null,
+                    shufflerRootEl: null,
                     observer: null,
                     loading: false,
                     loaded: false,
@@ -1653,6 +1739,7 @@ class Plugin extends AppPlugin {
                 recordGuid: record.guid,
                 journalDate,
                 rootEl:   null,
+                shufflerRootEl: null,
                 observer: null,
                 loading:  false,
                 loaded:   false,
@@ -1698,7 +1785,8 @@ class Plugin extends AppPlugin {
         try { s.observer?.disconnect(); } catch (_) {}
         try { s._containerWatcher?.disconnect(); } catch (_) {}
         try { clearTimeout(s._navTimer); } catch (_) {}
-        try { s.rootEl?.remove(); }       catch (_) {}
+        try { s.rootEl?.remove(); } catch (_) {}
+        try { s.shufflerRootEl?.remove(); } catch (_) {}
         this._panelStates.delete(panelId);
     }
 
@@ -1715,7 +1803,10 @@ class Plugin extends AppPlugin {
 
     // Returns true if the footer was (re)built — caller should re-populate and drop stale async work
     _mountFooter(state, container, panelEl) {
-        if (state.rootEl && state.rootEl.isConnected && state.rootEl.parentElement === container) {
+        const rootOk = !state.rootEl || (state.rootEl.isConnected && state.rootEl.parentElement === container);
+        const shOk = !state.shufflerRootEl || (state.shufflerRootEl.isConnected && state.shufflerRootEl.parentElement === container);
+        const hasAny = !!(state.rootEl || state.shufflerRootEl);
+        if (hasAny && rootOk && shOk) {
             if (!state.observer) {
                 state.observer = this._createFooterObserver(state, panelEl);
             }
@@ -1732,9 +1823,17 @@ class Plugin extends AppPlugin {
         for (const el of container.querySelectorAll(':scope > .th-journal-footer')) {
             if (el.dataset?.panelId === state.panelId) { try { el.remove(); } catch (_) {} }
         }
+        for (const el of container.querySelectorAll(':scope > .th-footer--shuffler')) {
+            if (el.dataset?.panelId === state.panelId) { try { el.remove(); } catch (_) {} }
+        }
 
+        state.shufflerRootEl = null;
         state.rootEl = this._buildShell(state);
         if (state.rootEl) container.appendChild(state.rootEl);
+        if (this._showShufflerPanel()) {
+            state.shufflerRootEl = this._buildShufflerPanel(state);
+            if (state.shufflerRootEl) container.appendChild(state.shufflerRootEl);
+        }
         this._ensureFooterBottom(state, container);
 
         state.observer = this._createFooterObserver(state, panelEl);
@@ -1742,10 +1841,17 @@ class Plugin extends AppPlugin {
     }
 
     _ensureFooterBottom(state, container) {
-        if (!state?.rootEl || !container) return;
-        if (state.rootEl.parentElement !== container) return;
-        if (container.lastElementChild === state.rootEl) return;
-        container.appendChild(state.rootEl);
+        if (!container) return;
+        if (state.shufflerRootEl?.parentElement === container) {
+            container.appendChild(state.shufflerRootEl);
+        }
+        if (state.rootEl?.parentElement === container && state.shufflerRootEl?.parentElement === container) {
+            container.insertBefore(state.rootEl, state.shufflerRootEl);
+            return;
+        }
+        if (state.rootEl?.parentElement === container && container.lastElementChild !== state.rootEl) {
+            container.appendChild(state.rootEl);
+        }
     }
 
     _createFooterObserver(state, panelEl) {
@@ -1776,19 +1882,13 @@ class Plugin extends AppPlugin {
         return null;
     }
 
-    /** Wrapper for one or more journal footer cards (highlights + quote shuffler). */
+    /** Highlights card wrapper (Quote Shuffler is a sibling under page-content for ordering with other plugins). */
     _buildShell(state) {
+        if (!this._showHighlightsPanel()) return null;
         const root = document.createElement('div');
         root.className       = 'th-journal-footer';
         root.dataset.panelId = state.panelId;
-
-        if (this._showHighlightsPanel()) {
-            root.appendChild(this._buildHighlightsPanel(state));
-        }
-        if (this._showShufflerPanel()) {
-            root.appendChild(this._buildShufflerPanel(state));
-        }
-        if (!root.childElementCount) return null;
+        root.appendChild(this._buildHighlightsPanel(state));
         return root;
     }
 
@@ -1844,6 +1944,7 @@ class Plugin extends AppPlugin {
         const root = document.createElement('div');
         root.className            = 'th-footer th-footer--shuffler th-shuffler-shell';
         root.dataset.panelSection = 'shuffler';
+        root.dataset.panelId      = state.panelId;
 
         const chrome = document.createElement('div');
         chrome.className = 'th-shuffler-chrome';
@@ -1905,7 +2006,8 @@ class Plugin extends AppPlugin {
 
         const hiBody  = state.rootEl?.querySelector('[data-panel-section="highlights"] [data-role="body"]');
         const hiCount = state.rootEl?.querySelector('[data-panel-section="highlights"] [data-role="count"]');
-        const shBody  = state.rootEl?.querySelector('[data-panel-section="shuffler"] [data-role="body"]');
+        const shBody  = state.shufflerRootEl?.querySelector('[data-role="body"]')
+            || state.rootEl?.querySelector('[data-panel-section="shuffler"] [data-role="body"]');
 
         if (!hiBody && !shBody) {
             state.loaded = true;
@@ -2009,19 +2111,19 @@ class Plugin extends AppPlugin {
         try {
             localStorage.setItem(TH_KEY_SHUFFLER_QUOTES_BY_DAY, JSON.stringify(map));
         } catch (_) {}
-        this._scheduleShufflerDayMapPathBSync();
+        this._scheduleShufflerDayMapSettingsSync();
     }
 
-    _scheduleShufflerDayMapPathBSync() {
-        if (this._pathBMode !== 'synced') return;
+    _scheduleShufflerDayMapSettingsSync() {
+        if (this._pluginSettingsSyncMode !== 'synced') return;
         if (this._shufflerDayMapSyncTimer) {
             try { clearTimeout(this._shufflerDayMapSyncTimer); } catch (_) {}
         }
         this._shufflerDayMapSyncTimer = setTimeout(() => {
             this._shufflerDayMapSyncTimer = null;
-            const pathB = globalThis.ThymerExtPathB;
-            if (!pathB?.flushNow || !this.data || !this._pathBPluginId) return;
-            pathB.flushNow(this.data, this._pathBPluginId, this._pathBMirrorKeys()).catch(() => {});
+            const tps = globalThis.ThymerPluginSettings;
+            if (!tps?.flushNow || !this.data || !this._pluginSettingsPluginId) return;
+            tps.flushNow(this.data, this._pluginSettingsPluginId, this._pluginSettingsMirrorKeys()).catch(() => {});
         }, TH_SHUFFLER_DAYMAP_SYNC_IDLE_MS);
     }
 
@@ -2955,15 +3057,15 @@ class Plugin extends AppPlugin {
     }
     _saveBool(key, val) {
         try { localStorage.setItem(key, val ? 'true' : 'false'); } catch (_) {}
-        globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => this._pathBMirrorKeys());
+        globalThis.ThymerPluginSettings?.scheduleFlush?.(this, () => this._pluginSettingsMirrorKeys());
     }
 
     /** Persist quickly when storage mode is synced (in addition to debounced flush). */
-    _flushPathBNowBestEffort() {
-        if (this._pathBMode !== 'synced') return;
-        const pathB = globalThis.ThymerExtPathB;
-        if (!pathB?.flushNow || !this.data || !this._pathBPluginId) return;
-        pathB.flushNow(this.data, this._pathBPluginId, this._pathBMirrorKeys()).catch(() => {});
+    _flushSyncedSettingsNowBestEffort() {
+        if (this._pluginSettingsSyncMode !== 'synced') return;
+        const tps = globalThis.ThymerPluginSettings;
+        if (!tps?.flushNow || !this.data || !this._pluginSettingsPluginId) return;
+        tps.flushNow(this.data, this._pluginSettingsPluginId, this._pluginSettingsMirrorKeys()).catch(() => {});
     }
 
     // =========================================================================
@@ -2972,7 +3074,7 @@ class Plugin extends AppPlugin {
 
     _injectCSS() {
         this.ui.injectCSS(`
-            /* ── Journal footer wrapper (one or two cards) ── */
+            /* ── Journal footer wrapper (Today's Highlights card; Quote Shuffler is a sibling .th-footer--shuffler) ── */
             .th-journal-footer {
                 margin-top: 16px;
                 display: flex;
