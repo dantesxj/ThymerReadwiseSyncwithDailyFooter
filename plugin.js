@@ -5,8 +5,8 @@
  *
  * Edit this file, then from repo root: npm run embed-plugin-settings
  *
- * Debug: console filter `[ThymerExt/PluginBackend]`. To silence:
- *   localStorage.setItem('thymerext_debug_collections', '0'); location.reload();
+ * Debug: console filter `[ThymerExt/PluginBackend]`. Off by default; to enable:
+ *   localStorage.setItem('thymerext_debug_collections', '1'); location.reload();
  *
  * Rows:
  * - **Vault** (`record_kind` = `vault`): one per `plugin_id` — holds synced localStorage payload JSON.
@@ -35,14 +35,16 @@
 
   /**
    * Collection ensure diagnostics (read browser console for `[ThymerExt/PluginBackend]`.
-   * Disable: `localStorage.setItem('thymerext_debug_collections','0')` then reload.
+   * Opt-in: `localStorage.setItem('thymerext_debug_collections','1')` then reload.
+   * Opt-out: remove the key or set to `0` / `off` / `false`.
    */
   const DEBUG_COLLECTIONS = (() => {
     try {
       const o = localStorage.getItem('thymerext_debug_collections');
       if (o === '0' || o === 'off' || o === 'false') return false;
+      return o === '1' || o === 'true' || o === 'on';
     } catch (_) {}
-    return true;
+    return false;
   })();
   const DEBUG_PATHB_ID =
     'pb-' + (Date.now() & 0xffffffff).toString(16) + '-' + Math.random().toString(36).slice(2, 7);
@@ -810,6 +812,169 @@
     return s;
   }
 
+  /** Configured collection name only (avoids duplicating `collectionDisplayName` fallbacks). */
+  function collectionBackendConfiguredTitle(c) {
+    if (!c) return '';
+    try {
+      return String(c.getConfiguration?.()?.name || '').trim();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  /**
+   * When plugin iframes are opaque (blob/sandbox), `navigator.locks` and `window.top` globals do not
+   * dedupe across realms. First `localStorage` we can reach on the Thymer app origin is shared.
+   */
+  function getSharedThymerLocalStorage() {
+    const seen = new Set();
+    const tryWin = (w) => {
+      if (!w || seen.has(w)) return null;
+      seen.add(w);
+      try {
+        const ls = w.localStorage;
+        void ls.length;
+        return ls;
+      } catch (_) {
+        return null;
+      }
+    };
+    try {
+      const t = tryWin(window.top);
+      if (t) return t;
+    } catch (_) {}
+    try {
+      const t = tryWin(window);
+      if (t) return t;
+    } catch (_) {}
+    try {
+      let w = window;
+      for (let i = 0; i < 10 && w; i++) {
+        const t = tryWin(w);
+        if (t) return t;
+        if (w === w.parent) break;
+        w = w.parent;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  const LS_CREATE_LEASE_KEY = 'thymerext_plugin_backend_create_lease_v1';
+  const LS_RECENT_CREATE_KEY = 'thymerext_plugin_backend_recent_create_v1';
+  const LS_RECENT_CREATE_ATTEMPT_KEY = 'thymerext_plugin_backend_recent_create_attempt_v1';
+
+  /**
+   * Cross-realm mutex for `createCollection` + first `saveConfiguration` only.
+   * @returns {{ denied: boolean, release: () => void }}
+   */
+  async function acquirePluginBackendCreationLease(maxWaitMs) {
+    const noop = { denied: false, release() {} };
+    const ls = getSharedThymerLocalStorage();
+    if (!ls) return noop;
+    const holder =
+      (typeof crypto !== 'undefined' && crypto.randomUUID && crypto.randomUUID()) ||
+      `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+    const deadline = Date.now() + (Number(maxWaitMs) > 0 ? maxWaitMs : 12000);
+    let acquired = false;
+    let sawContention = false;
+    while (Date.now() < deadline) {
+      try {
+        const raw = ls.getItem(LS_CREATE_LEASE_KEY);
+        let busy = false;
+        if (raw) {
+          let j = null;
+          try {
+            j = JSON.parse(raw);
+          } catch (_) {
+            j = null;
+          }
+          if (j && typeof j.exp === 'number' && j.h !== holder && j.exp > Date.now()) busy = true;
+        }
+        if (busy) {
+          sawContention = true;
+          await new Promise((r) => setTimeout(r, 40 + Math.floor(Math.random() * 70)));
+          continue;
+        }
+        const exp = Date.now() + 45000;
+        const payload = JSON.stringify({ h: holder, exp });
+        ls.setItem(LS_CREATE_LEASE_KEY, payload);
+        await new Promise((r) => setTimeout(r, 0));
+        if (ls.getItem(LS_CREATE_LEASE_KEY) === payload) {
+          acquired = true;
+          if (DEBUG_COLLECTIONS) dlogPathB('lease_acquired', { via: 'localStorage', sawContention });
+          break;
+        }
+      } catch (_) {
+        return noop;
+      }
+      await new Promise((r) => setTimeout(r, 30 + Math.floor(Math.random() * 50)));
+    }
+    if (!acquired) {
+      if (DEBUG_COLLECTIONS) dlogPathB('lease_timeout_abort_create', { sawContention });
+      return { denied: true, release() {} };
+    }
+    return {
+      denied: false,
+      release() {
+        if (!acquired) return;
+        acquired = false;
+        try {
+          const cur = ls.getItem(LS_CREATE_LEASE_KEY);
+          if (!cur) return;
+          let j = null;
+          try {
+            j = JSON.parse(cur);
+          } catch (_) {
+            return;
+          }
+          if (j && j.h === holder) ls.removeItem(LS_CREATE_LEASE_KEY);
+        } catch (_) {}
+      },
+    };
+  }
+
+  function noteRecentPluginBackendCreate() {
+    const ls = getSharedThymerLocalStorage();
+    if (!ls) return;
+    try {
+      ls.setItem(LS_RECENT_CREATE_KEY, String(Date.now()));
+    } catch (_) {}
+  }
+
+  function getRecentPluginBackendCreateAgeMs() {
+    const ls = getSharedThymerLocalStorage();
+    if (!ls) return null;
+    try {
+      const raw = ls.getItem(LS_RECENT_CREATE_KEY);
+      const ts = Number(raw);
+      if (!Number.isFinite(ts) || ts <= 0) return null;
+      return Date.now() - ts;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function noteRecentPluginBackendCreateAttempt() {
+    const ls = getSharedThymerLocalStorage();
+    if (!ls) return;
+    try {
+      ls.setItem(LS_RECENT_CREATE_ATTEMPT_KEY, String(Date.now()));
+    } catch (_) {}
+  }
+
+  function getRecentPluginBackendCreateAttemptAgeMs() {
+    const ls = getSharedThymerLocalStorage();
+    if (!ls) return null;
+    try {
+      const raw = ls.getItem(LS_RECENT_CREATE_ATTEMPT_KEY);
+      const ts = Number(raw);
+      if (!Number.isFinite(ts) || ts <= 0) return null;
+      return Date.now() - ts;
+    } catch (_) {
+      return null;
+    }
+  }
+
   /** When Thymer omits names on `getAllCollections()` entries, match our Path B schema. */
   function pathBCollectionScore(c) {
     if (!c) return 0;
@@ -846,7 +1011,8 @@
     if (!cands.length) return null;
     const named = cands.find((c) => {
       const n = collectionDisplayName(c);
-      return n === COL_NAME || n === COL_NAME_LEGACY;
+      const cfg = collectionBackendConfiguredTitle(c);
+      return n === COL_NAME || n === COL_NAME_LEGACY || cfg === COL_NAME || cfg === COL_NAME_LEGACY;
     });
     return named || cands[0];
   }
@@ -858,6 +1024,8 @@
         return (
           list.find((c) => collectionDisplayName(c) === COL_NAME) ||
           list.find((c) => collectionDisplayName(c) === COL_NAME_LEGACY) ||
+          list.find((c) => collectionBackendConfiguredTitle(c) === COL_NAME) ||
+          list.find((c) => collectionBackendConfiguredTitle(c) === COL_NAME_LEGACY) ||
           null
         );
       };
@@ -880,6 +1048,8 @@
     for (const c of all) {
       const nm = collectionDisplayName(c);
       if (nm === COL_NAME || nm === COL_NAME_LEGACY) return true;
+      const cfg = collectionBackendConfiguredTitle(c);
+      if (cfg === COL_NAME || cfg === COL_NAME_LEGACY) return true;
     }
     return !!pickPathBCollectionHeuristic(all);
   }
@@ -1023,16 +1193,52 @@
         void 0;
       }
       if (DEBUG_COLLECTIONS) dlogPathB('ensureBody_about_to_create', { pathB: pathBWindowSnapshot() });
-      const coll = await queueDataCreateOnSharedWindow(() => data.createCollection());
-      if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') {
-        return;
+      const lease = await acquirePluginBackendCreationLease(14000);
+      if (lease.denied) return;
+      try {
+        if (await findColl(data)) return;
+        if (await hasPluginBackendOnWorkspace(data)) return;
+        const recentAttemptAge = getRecentPluginBackendCreateAttemptAgeMs();
+        if (recentAttemptAge != null && recentAttemptAge >= 0 && recentAttemptAge < 120000) {
+          // Another plugin iframe attempted creation very recently. Avoid burst duplicate creates.
+          for (let i = 0; i < 10; i++) {
+            await new Promise((r) => setTimeout(r, 130 + i * 70));
+            if (await findColl(data)) return;
+            if (await hasPluginBackendOnWorkspace(data)) return;
+          }
+          return;
+        }
+        const recentAge = getRecentPluginBackendCreateAgeMs();
+        if (recentAge != null && recentAge >= 0 && recentAge < 90000) {
+          // Another plugin/runtime likely just created it; let collection list/indexing settle first.
+          for (let i = 0; i < 8; i++) {
+            await new Promise((r) => setTimeout(r, 120 + i * 60));
+            if (await findColl(data)) return;
+            if (await hasPluginBackendOnWorkspace(data)) return;
+          }
+        }
+        noteRecentPluginBackendCreateAttempt();
+        const coll = await queueDataCreateOnSharedWindow(() => data.createCollection());
+        if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') {
+          return;
+        }
+        const conf = cloneShape();
+        const base = coll.getConfiguration();
+        if (base && typeof base.ver === 'number') conf.ver = base.ver;
+        let ok = await coll.saveConfiguration(conf);
+        if (ok === false) {
+          // Transient host races can reject the first save; retry before giving up.
+          await new Promise((r) => setTimeout(r, 180));
+          ok = await coll.saveConfiguration(conf);
+        }
+        if (ok === false) return;
+        noteRecentPluginBackendCreate();
+        await new Promise((r) => setTimeout(r, 250));
+      } finally {
+        try {
+          lease.release();
+        } catch (_) {}
       }
-      const conf = cloneShape();
-      const base = coll.getConfiguration();
-      if (base && typeof base.ver === 'number') conf.ver = base.ver;
-      const ok = await coll.saveConfiguration(conf);
-      if (ok === false) return;
-      await new Promise((r) => setTimeout(r, 250));
     } catch (e) {
       console.error('[ThymerPluginSettings] ensure collection', e);
     }
@@ -1448,591 +1654,6 @@
 })(typeof globalThis !== 'undefined' ? globalThis : window);
 // @generated END thymer-plugin-settings
 
-// @generated BEGIN thymer-readwise-references-coll (source: plugins/readwise-references/ThymerReadwiseReferencesCollectionRuntime.js — run: npm run embed-readwise-refs-coll)
-/**
- * ThymerReadwiseReferencesColl — ensure workspace **References** collection (Readwise Option B).
- * Shape matches `ThymerReadwiseSyncwithDailyFooter/References.json` (filter_colguid omitted for portability).
- *
- * Edit in repo, then: `npm run embed-readwise-refs-coll`
- * Debug: `[ThymerExt/ReadwiseRefs]`; silence: `localStorage.setItem('thymerext_debug_collections','0')`
- *
- * API:
- *   ThymerReadwiseReferencesColl.findColl(data) — locate existing collection (no create)
- *   ThymerReadwiseReferencesColl.ensure(data) — create if missing + merge schema; returns collection or null
- */
-(function readwiseRefsCollRuntime(g) {
-  if (g.ThymerReadwiseReferencesColl) return;
-
-  const COL_NAME = 'References';
-  const MANAGED_UNLOCK = { fields: false, views: false, sidebar: false };
-
-  const DEBUG_COLLECTIONS = (() => {
-    try {
-      const o = localStorage.getItem('thymerext_debug_collections');
-      if (o === '0' || o === 'off' || o === 'false') return false;
-    } catch (_) {}
-    return true;
-  })();
-  const DEBUG_REFS_ID = 'rr-' + (Date.now() & 0xffffffff).toString(16) + '-' + Math.random().toString(36).slice(2, 7);
-
-  /**
-   * Same dedupe as Plugin Settings: use **`window.top`** (shared) for cross-iframe promises when
-   * not cross-origin, plus `__thymerExtSerializedDataCreateP_v1` on that window for all `data.createCollection()`.
-   */
-  function getSharedDeduplicationWindow() {
-    try {
-      if (typeof window === 'undefined') return g;
-      const t = window.top;
-      if (t) {
-        void t.document;
-        return t;
-      }
-    } catch (_) {}
-    try {
-      let w = typeof window !== 'undefined' ? window : null;
-      let best = w || g;
-      while (w) {
-        try {
-          void w.document;
-          best = w;
-        } catch (_) {
-          break;
-        }
-        if (w === w.top) break;
-        w = w.parent;
-      }
-      return best;
-    } catch (_) {
-      return typeof window !== 'undefined' ? window : g;
-    }
-  }
-
-  const RR_ENSURE_GLOBAL_P = '__thymerReadwiseReferencesEnsureGlobalP';
-  const SERIAL_DATA_CREATE_P = '__thymerExtSerializedDataCreateP_v1';
-  const GETALL_COLLECTIONS_SANITY = '__thymerExtGetAllCollectionsSanityV1';
-  function touchGetAllSanityFromCount(len) {
-    const n = Number(len) || 0;
-    const h = getSharedDeduplicationWindow();
-    if (!h[GETALL_COLLECTIONS_SANITY]) h[GETALL_COLLECTIONS_SANITY] = { nLast: 0, tLast: 0 };
-    const s = h[GETALL_COLLECTIONS_SANITY];
-    if (n > 0) {
-      s.nLast = n;
-      s.tLast = Date.now();
-    }
-  }
-  function isSuspiciousEmptyAfterRecentNonEmptyList(currentLen) {
-    const c = Number(currentLen) || 0;
-    if (c > 0) {
-      touchGetAllSanityFromCount(c);
-      return false;
-    }
-    const h = getSharedDeduplicationWindow();
-    const s = h[GETALL_COLLECTIONS_SANITY];
-    if (!s || s.nLast <= 0 || !s.tLast) return false;
-    return Date.now() - s.tLast < 60_000;
-  }
-
-  function chainReferencesEnsure(data, work) {
-    const root = getSharedDeduplicationWindow();
-    try {
-      if (!root[RR_ENSURE_GLOBAL_P]) root[RR_ENSURE_GLOBAL_P] = Promise.resolve();
-    } catch (_) {
-      return Promise.resolve().then(work);
-    }
-    root[RR_ENSURE_GLOBAL_P] = root[RR_ENSURE_GLOBAL_P].catch(() => {}).then(work);
-    return root[RR_ENSURE_GLOBAL_P];
-  }
-
-  function withUnlockedManaged(base) {
-    return { ...(base && typeof base === 'object' ? base : {}), managed: MANAGED_UNLOCK };
-  }
-
-  function cloneFieldDef(x) {
-    try {
-      return structuredClone(x);
-    } catch (_) {
-      return JSON.parse(JSON.stringify(x));
-    }
-  }
-
-  function mergeViewsArray(baseViews, desiredViews) {
-    const desired = Array.isArray(desiredViews) ? desiredViews.map((v) => cloneFieldDef(v)) : [];
-    const cur = Array.isArray(baseViews) ? baseViews.map((v) => cloneFieldDef(v)) : [];
-    if (cur.length === 0) {
-      return { views: desired, changed: desired.length > 0 };
-    }
-    const ids = new Set(cur.map((v) => v && v.id).filter(Boolean));
-    let changed = false;
-    for (const v of desired) {
-      if (v && v.id && !ids.has(v.id)) {
-        cur.push(cloneFieldDef(v));
-        ids.add(v.id);
-        changed = true;
-      }
-    }
-    return { views: cur, changed };
-  }
-
-  /**
-   * Canonical shape — keep in sync with `ThymerReadwiseSyncwithDailyFooter/References.json`.
-   * `filter_colguid` on `source_author` is workspace-specific; omitted so auto-create works in any workspace.
-   */
-  const REFERENCES_SHAPE = {
-    ver: 1,
-    name: COL_NAME,
-    icon: 'ti-books',
-    color: null,
-    home: false,
-    page_field_ids: [
-      'external_id',
-      'source_title',
-      'source_author',
-      'source_url',
-      'highlight_count',
-      'captured_at',
-      'synced_at',
-      'banner',
-    ],
-    item_name: 'Reference',
-    description: 'Books, articles, and other sources from Readwise (Option B: highlights in body)',
-    show_sidebar_items: true,
-    show_cmdpal_items: true,
-    fields: [
-      { icon: 'ti-id', id: 'external_id', label: 'External ID', type: 'text', read_only: true },
-      { icon: 'ti-book', id: 'source_title', label: 'Title', type: 'text', read_only: true },
-      {
-        icon: 'ti-user',
-        id: 'source_author',
-        label: 'Author',
-        many: false,
-        read_only: true,
-        active: true,
-        type: 'record',
-        target_collection_id: 'People',
-      },
-      { icon: 'ti-link', id: 'source_url', label: 'URL', type: 'url', read_only: true },
-      { icon: 'ti-quote', id: 'highlight_count', label: 'Highlight Count', type: 'number', read_only: true },
-      { icon: 'ti-calendar-event', id: 'captured_at', label: 'Captured', type: 'datetime', read_only: true },
-      { icon: 'ti-clock-plus', id: 'synced_at', label: 'Synced', type: 'datetime', read_only: true },
-      {
-        icon: 'ti-abc',
-        id: 'title',
-        label: 'Title',
-        many: false,
-        read_only: false,
-        active: true,
-        type: 'text',
-      },
-      {
-        icon: 'ti-clock-edit',
-        id: 'updated_at',
-        label: 'Modified',
-        many: false,
-        read_only: true,
-        active: true,
-        type: 'datetime',
-      },
-      {
-        icon: 'ti-clock-plus',
-        id: 'created_at',
-        label: 'Created',
-        many: false,
-        read_only: true,
-        active: true,
-        type: 'datetime',
-      },
-      {
-        icon: 'ti-photo',
-        id: 'banner',
-        label: 'Banner',
-        many: false,
-        read_only: false,
-        active: true,
-        type: 'banner',
-      },
-      {
-        icon: 'ti-align-left',
-        id: 'icon',
-        label: 'Icon',
-        many: false,
-        read_only: false,
-        active: true,
-        type: 'text',
-      },
-    ],
-    sidebar_record_sort_dir: 'desc',
-    sidebar_record_sort_field_id: 'updated_at',
-    managed: MANAGED_UNLOCK,
-    custom: {},
-    views: [
-      {
-        id: 'table',
-        type: 'table',
-        icon: '',
-        label: 'Table',
-        description: '',
-        read_only: false,
-        shown: true,
-        field_ids: [
-          'title',
-          'external_id',
-          'source_title',
-          'source_author',
-          'source_url',
-          'highlight_count',
-          'captured_at',
-          'synced_at',
-          'banner',
-        ],
-        sort_dir: 'asc',
-        sort_field_id: 'title',
-        group_by_field_id: null,
-      },
-    ],
-  };
-
-  function cloneShape() {
-    try {
-      return structuredClone(REFERENCES_SHAPE);
-    } catch (_) {
-      return JSON.parse(JSON.stringify(REFERENCES_SHAPE));
-    }
-  }
-
-  function collectionDisplayName(c) {
-    if (!c) return '';
-    let s = '';
-    try {
-      s = String(c.getName?.() || '').trim();
-    } catch (_) {}
-    if (s) return s;
-    try {
-      s = String(c.getConfiguration?.()?.name || '').trim();
-    } catch (_) {}
-    return s;
-  }
-
-  /** When Thymer omits names on list entries, match the Readwise References schema. */
-  function refsHeuristicScore(c) {
-    if (!c) return 0;
-    try {
-      const conf = c.getConfiguration?.() || {};
-      const fields = Array.isArray(conf.fields) ? conf.fields : [];
-      const ids = new Set(fields.map((f) => f && f.id).filter(Boolean));
-      if (!ids.has('external_id') || !ids.has('source_title')) return 0;
-      let s = 2;
-      if (ids.has('source_url')) s += 1;
-      if (ids.has('highlight_count')) s += 1;
-      const nm = collectionDisplayName(c).toLowerCase();
-      if (nm === 'references') s += 2;
-      return s;
-    } catch (_) {
-      return 0;
-    }
-  }
-
-  function pickRefsHeuristic(all) {
-    const list = Array.isArray(all) ? all : [];
-    const cands = [];
-    let bestS = 0;
-    for (const c of list) {
-      const sc = refsHeuristicScore(c);
-      if (sc > bestS) {
-        bestS = sc;
-        cands.length = 0;
-        cands.push(c);
-      } else if (sc === bestS && sc >= 2) {
-        cands.push(c);
-      }
-    }
-    if (!cands.length) return null;
-    const named = cands.find((c) => collectionDisplayName(c) === COL_NAME);
-    return named || cands[0];
-  }
-
-  async function findReferencesColl(data) {
-    if (!data || typeof data.getAllCollections !== 'function') return null;
-    try {
-      const pick = (all) => {
-        const list = Array.isArray(all) ? all : [];
-        return list.find((c) => collectionDisplayName(c) === COL_NAME) || null;
-      };
-      const all = await data.getAllCollections();
-      return pick(all) || pickRefsHeuristic(all) || null;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  async function hasReferencesOnWorkspace(data) {
-    let all;
-    try {
-      all = await data.getAllCollections();
-    } catch (_) {
-      return false;
-    }
-    if (!Array.isArray(all) || all.length === 0) return false;
-    for (const c of all) {
-      if (collectionDisplayName(c) === COL_NAME) return true;
-    }
-    return !!pickRefsHeuristic(all);
-  }
-
-  async function upgradeReferencesSchema(data, collOpt) {
-    await ensureReferencesCollection(data);
-    const coll = collOpt || (await findReferencesColl(data));
-    if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') return;
-    try {
-      let base = coll.getConfiguration() || {};
-      try {
-        if (typeof coll.getExistingCodeAndConfig === 'function') {
-          const pack = coll.getExistingCodeAndConfig();
-          if (pack && pack.json && typeof pack.json === 'object') {
-            base = { ...base, ...pack.json };
-          }
-        }
-      } catch (_) {}
-
-      const desired = cloneShape();
-      const curFields = Array.isArray(base.fields) ? base.fields.map((f) => cloneFieldDef(f)) : [];
-      const curIds = new Set(curFields.map((f) => (f && f.id ? f.id : null)).filter(Boolean));
-      let changed = false;
-      for (const f of desired.fields) {
-        if (!f || !f.id || curIds.has(f.id)) continue;
-        curFields.push(cloneFieldDef(f));
-        curIds.add(f.id);
-        changed = true;
-      }
-
-      const vMerge = mergeViewsArray(base.views, desired.views);
-      if (vMerge.changed) changed = true;
-
-      const curPages = [...(base.page_field_ids || [])];
-      const wantPages = [...(desired.page_field_ids || [])];
-      const mergedPages = [...new Set([...wantPages, ...curPages])];
-      if (JSON.stringify(curPages) !== JSON.stringify(mergedPages)) changed = true;
-
-      if ((base.description || '') !== desired.description) changed = true;
-      if ((base.item_name || '') !== (desired.item_name || '')) changed = true;
-      if (String(base.name || '').trim() !== COL_NAME) changed = true;
-      if ((base.icon || '') !== (desired.icon || '')) changed = true;
-
-      if (changed) {
-        const merged = withUnlockedManaged({
-          ...base,
-          name: COL_NAME,
-          description: desired.description,
-          item_name: desired.item_name || base.item_name,
-          icon: desired.icon || base.icon,
-          color: desired.color !== undefined ? desired.color : base.color,
-          home: desired.home !== undefined ? desired.home : base.home,
-          fields: curFields,
-          views: vMerge.views,
-          page_field_ids: mergedPages.length ? mergedPages : wantPages,
-          sidebar_record_sort_field_id: desired.sidebar_record_sort_field_id || base.sidebar_record_sort_field_id,
-          sidebar_record_sort_dir: desired.sidebar_record_sort_dir || base.sidebar_record_sort_dir,
-        });
-        const ok = await coll.saveConfiguration(merged);
-        if (ok === false) console.warn('[ThymerReadwiseReferencesColl] saveConfiguration returned false (schema merge)');
-      }
-    } catch (e) {
-      console.error('[ThymerReadwiseReferencesColl] upgrade schema', e);
-    }
-  }
-
-  const RR_LOCK_NAME = 'thymer-ext-readwise-references-ensure-v1';
-  const DATA_ENSURE_P = '__thymerExtDataReadwiseReferencesEnsureP';
-
-  function dlogRef(phase, extra) {
-    if (!DEBUG_COLLECTIONS) return;
-    try {
-      const row = { runId: DEBUG_REFS_ID, kind: 'ReadwiseReferences', phase, t: (typeof performance !== 'undefined' && performance.now) ? +performance.now().toFixed(1) : 0, ...extra };
-      console.info('[ThymerExt/ReadwiseRefs]', row);
-    } catch (_) {
-      void 0;
-    }
-  }
-
-  function refsPathWindowSnapshot() {
-    const snap = { runId: DEBUG_REFS_ID, topReadable: null, hasLocks: null };
-    try {
-      if (typeof window !== 'undefined' && window.top) {
-        void window.top.document;
-        snap.topReadable = true;
-      }
-    } catch (e) {
-      snap.topReadable = false;
-      try { snap.topErr = String((e && e.name) || e) || 'top'; } catch (_) { snap.topErr = 'top'; }
-    }
-    const host = getSharedDeduplicationWindow();
-    try { snap.hasLocks = !!(typeof navigator !== 'undefined' && navigator.locks && navigator.locks.request); } catch (_) { snap.hasLocks = 'err'; }
-    try { snap.locationHref = typeof location !== 'undefined' ? String(location.href) : ''; } catch (_) { snap.locationHref = ''; }
-    try {
-      snap.selfIsTop = typeof window !== 'undefined' && window === window.top;
-      snap.hostIsTop = host === (typeof window !== 'undefined' ? window.top : null);
-      snap.hostType = (host && host.constructor && host.constructor.name) || '';
-      snap.gHasRrP = host && host[RR_ENSURE_GLOBAL_P] != null;
-      snap.gHasCreateQ = host && host[SERIAL_DATA_CREATE_P] != null;
-    } catch (_) {
-      void 0;
-    }
-    return snap;
-  }
-
-  function queueDataCreateOnSharedWindow(factory) {
-    const host = getSharedDeduplicationWindow();
-    if (DEBUG_COLLECTIONS) dlogRef('queueDataCreate_enter', refsPathWindowSnapshot());
-    try {
-      if (!host[SERIAL_DATA_CREATE_P] || typeof host[SERIAL_DATA_CREATE_P].then !== 'function') {
-        host[SERIAL_DATA_CREATE_P] = Promise.resolve();
-      }
-      const p = (host[SERIAL_DATA_CREATE_P] = host[SERIAL_DATA_CREATE_P].catch(() => {}).then(factory));
-      if (DEBUG_COLLECTIONS) dlogRef('queueDataCreate_chained', { ok: true });
-      return p;
-    } catch (e) {
-      if (DEBUG_COLLECTIONS) dlogRef('queueDataCreate_fallback', { err: String((e && e.message) || e) });
-      return factory();
-    }
-  }
-
-  async function runReferencesEnsureBody(data) {
-    if (DEBUG_COLLECTIONS) {
-      dlogRef('ensureBody_start', { path: refsPathWindowSnapshot() });
-      try {
-        if (data && data.getAllCollections) {
-          const a = await data.getAllCollections();
-          const names = (Array.isArray(a) ? a : []).map((c) => { try { return String(collectionDisplayName(c) || '').trim() || '(no-name)'; } catch (__) { return '(err)'; } });
-          dlogRef('ensureBody_collections', { count: (names && names.length) || 0, names: (names || []).slice(0, 40) });
-          if (data && data.getAllCollections) touchGetAllSanityFromCount((names && names.length) || 0);
-        }
-      } catch (e) {
-        dlogRef('ensureBody_getAll_failed', { err: String((e && e.message) || e) });
-      }
-    }
-    try {
-      let existing = null;
-      for (let attempt = 0; attempt < 4; attempt++) {
-        existing = await findReferencesColl(data);
-        if (existing) return;
-        if (await hasReferencesOnWorkspace(data)) return;
-        if (attempt < 3) await new Promise((r) => setTimeout(r, 50 + attempt * 50));
-      }
-      existing = await findReferencesColl(data);
-      if (existing) return;
-      if (await hasReferencesOnWorkspace(data)) return;
-      await new Promise((r) => setTimeout(r, 120));
-      if (await findReferencesColl(data)) return;
-      if (await hasReferencesOnWorkspace(data)) return;
-      let preCreateLen = 0;
-      try {
-        if (data && data.getAllCollections) {
-          const all0 = await data.getAllCollections();
-          preCreateLen = Array.isArray(all0) ? all0.length : 0;
-          if (preCreateLen > 0) touchGetAllSanityFromCount(preCreateLen);
-        }
-        if (preCreateLen === 0) {
-          await new Promise((r) => setTimeout(r, 150));
-          if (data && data.getAllCollections) {
-            const all1 = await data.getAllCollections();
-            preCreateLen = Array.isArray(all1) ? all1.length : 0;
-            if (preCreateLen > 0) touchGetAllSanityFromCount(preCreateLen);
-          }
-        }
-        if (preCreateLen > 0) {
-          if (await findReferencesColl(data)) return;
-          if (await hasReferencesOnWorkspace(data)) return;
-        }
-        if (isSuspiciousEmptyAfterRecentNonEmptyList(preCreateLen) && preCreateLen === 0) {
-          if (DEBUG_COLLECTIONS) {
-            try {
-              const h = getSharedDeduplicationWindow();
-              dlogRef('refuse_create_flaky_getall_empty', { path: refsPathWindowSnapshot(), s: h[GETALL_COLLECTIONS_SANITY] || null });
-            } catch (_) {
-              dlogRef('refuse_create_flaky_getall_empty', { path: refsPathWindowSnapshot() });
-            }
-          }
-          return;
-        }
-      } catch (_) {
-        void 0;
-      }
-      if (DEBUG_COLLECTIONS) dlogRef('ensureBody_about_to_create', { path: refsPathWindowSnapshot() });
-      const coll = await queueDataCreateOnSharedWindow(() => data.createCollection());
-      if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') {
-        return;
-      }
-      const conf = cloneShape();
-      const base = coll.getConfiguration();
-      if (base && typeof base.ver === 'number') conf.ver = base.ver;
-      const ok = await coll.saveConfiguration(withUnlockedManaged(conf));
-      if (ok === false) console.warn('[ThymerReadwiseReferencesColl] initial saveConfiguration returned false');
-      await new Promise((r) => setTimeout(r, 250));
-    } catch (e) {
-      console.error('[ThymerReadwiseReferencesColl] ensure collection', e);
-    }
-  }
-
-  function runReferencesEnsureWithLocksOrChain(data) {
-    try {
-      if (typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function') {
-        if (DEBUG_COLLECTIONS) dlogRef('ensure_route', { via: 'locks', lockName: RR_LOCK_NAME, path: refsPathWindowSnapshot() });
-        return navigator.locks.request(RR_LOCK_NAME, () => runReferencesEnsureBody(data));
-      }
-    } catch (e) {
-      if (DEBUG_COLLECTIONS) dlogRef('ensure_locks_threw', { err: String((e && e.message) || e) });
-    }
-    if (DEBUG_COLLECTIONS) dlogRef('ensure_route', { via: 'hierarchyChain', path: refsPathWindowSnapshot() });
-    return chainReferencesEnsure(data, () => runReferencesEnsureBody(data));
-  }
-
-  function ensureReferencesCollection(data) {
-    if (DEBUG_COLLECTIONS) {
-      let dHint = 'no-data';
-      try {
-        dHint = data
-          ? `ctor=${(data && data.constructor && data.constructor.name) || '?'},eqPrev=${
-            !!(data && data === g.__th_lastDataRr)
-          }`
-          : 'null';
-        g.__th_lastDataRr = data;
-      } catch (_) {
-        dHint = 'err';
-      }
-      dlogRef('ensureReferencesCollection', { dataHint: dHint, hasDataEnsure: (() => { try { return data ? !!data[DATA_ENSURE_P] : false; } catch (_) { return 'throw'; } })(), path: refsPathWindowSnapshot() });
-    }
-    if (!data || typeof data.getAllCollections !== 'function' || typeof data.createCollection !== 'function') {
-      return Promise.resolve();
-    }
-    try {
-      if (!data[DATA_ENSURE_P] || typeof data[DATA_ENSURE_P].then !== 'function') {
-        data[DATA_ENSURE_P] = Promise.resolve();
-      }
-      if (DEBUG_COLLECTIONS) dlogRef('data_ensure_p_chained', {});
-      const next = data[DATA_ENSURE_P]
-        .catch(() => {})
-        .then(() => runReferencesEnsureWithLocksOrChain(data));
-      data[DATA_ENSURE_P] = next;
-      return next;
-    } catch (e) {
-      if (DEBUG_COLLECTIONS) dlogRef('data_ensure_p_throw', { err: String((e && e.message) || e) });
-      return runReferencesEnsureWithLocksOrChain(data);
-    }
-  }
-
-  g.ThymerReadwiseReferencesColl = {
-    COL_NAME,
-    findColl: findReferencesColl,
-    ensureReferencesCollection,
-    upgradeSchema: (data, coll) => upgradeReferencesSchema(data, coll),
-    async ensure(data) {
-      await ensureReferencesCollection(data);
-      await upgradeReferencesSchema(data, null);
-      return findReferencesColl(data);
-    },
-  };
-})(typeof globalThis !== 'undefined' ? globalThis : window);
-// @generated END thymer-readwise-references-coll
-
 
 /**
  * Readwise References (Option B) — one **References** record per Readwise source document.
@@ -2097,15 +1718,15 @@ function formatReadwiseRefDateHeading(d) {
 class Plugin extends AppPlugin {
 
     async onLoad() {
-        await (globalThis.ThymerPluginSettings?.init?.({
+        await (globalThis.ThymerExtPathB?.init?.({
             plugin: this,
             pluginId: 'readwise-references',
             modeKey: 'thymerext_ps_mode_readwise_references',
-            mirrorKeys: () => this._pluginSettingsMirrorKeys(),
+            mirrorKeys: () => this._pathBMirrorKeys(),
             label: 'Readwise References',
             data: this.data,
             ui: this.ui,
-        }) ?? (console.warn('[Readwise Ref] ThymerPluginSettings runtime missing (redeploy full plugin .js from repo).'), Promise.resolve()));
+        }) ?? (console.warn('[Readwise Ref] ThymerExtPathB runtime missing (redeploy full plugin .js from repo).'), Promise.resolve()));
         this._syncing = false;
         this._cmdSetToken = this.ui.addCommandPaletteCommand({
             label: 'Readwise Ref: Set Token',
@@ -2126,11 +1747,11 @@ class Plugin extends AppPlugin {
             label: 'Readwise Ref: Storage location…',
             icon: 'ti-database',
             onSelected: () => {
-                globalThis.ThymerPluginSettings?.openStorageDialog?.({
+                globalThis.ThymerExtPathB?.openStorageDialog?.({
                     plugin: this,
                     pluginId: 'readwise-references',
                     modeKey: 'thymerext_ps_mode_readwise_references',
-                    mirrorKeys: () => this._pluginSettingsMirrorKeys(),
+                    mirrorKeys: () => this._pathBMirrorKeys(),
                     label: 'Readwise References',
                     data: this.data,
                     ui: this.ui,
@@ -2175,7 +1796,7 @@ class Plugin extends AppPlugin {
             const p = this.ui.getActivePanel();
             if (p) this._handlePanel(p);
         }, 400);
-        this._scheduleIdleEnsureReferencesCollection();
+        setTimeout(() => { void this._warmQuotePoolCache(); }, 1200);
     }
 
     onUnload() {
@@ -2207,8 +1828,8 @@ class Plugin extends AppPlugin {
         document.getElementById('rwr-token-dialog')?.remove();
     }
 
-    /** Keys mirrored to Plugin Backend when storage mode is synced. */
-    _pluginSettingsMirrorKeys() {
+    /** Keys mirrored to Plugin Settings when storage mode is synced. */
+    _pathBMirrorKeys() {
         return [
             RWR_TOKEN_KEY,
             RWR_LAST_RUN_KEY,
@@ -2340,7 +1961,7 @@ class Plugin extends AppPlugin {
     async _shuffleQuoteFromCommand() {
         let n = 0;
         for (const [, s] of (this._panelStates || new Map())) {
-            const sec = s.shufflerRootEl || s.rootEl?.querySelector('[data-panel-section="shuffler"]');
+            const sec = s.rootEl?.querySelector('[data-panel-section="shuffler"]');
             if (!sec) continue;
             const body = sec.querySelector('[data-role="body"]');
             if (!body || !s.journalDate) continue;
@@ -2470,7 +2091,7 @@ class Plugin extends AppPlugin {
                 localStorage.setItem(RWR_TOKEN_KEY, token);
                 this._toast('Token saved! Run "Readwise Ref: Full Sync".');
             }
-            globalThis.ThymerPluginSettings?.scheduleFlush?.(this, () => this._pluginSettingsMirrorKeys());
+            globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => this._pathBMirrorKeys());
         };
         saveBtn.addEventListener('click', () => done(true));
         cancelBtn.addEventListener('click', () => done(false));
@@ -2504,7 +2125,7 @@ class Plugin extends AppPlugin {
             this._toast('Done: ' + result.summary);
             localStorage.setItem(RWR_LAST_RUN_KEY, new Date().toISOString());
             this._clearFooterDataCaches();
-            globalThis.ThymerPluginSettings?.scheduleFlush?.(this, () => this._pluginSettingsMirrorKeys());
+            globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => this._pathBMirrorKeys());
         } catch (e) {
             console.error('[ReadwiseRef]', e);
             this._toast('Sync failed: ' + e.message);
@@ -2610,68 +2231,6 @@ class Plugin extends AppPlugin {
         return { highlightById, coverByDocId };
     }
 
-    /**
-     * Locate the Readwise **References** collection (does not create). Uses
-     * `ThymerReadwiseReferencesColl` when embedded; otherwise name match on `getAllCollections()`.
-     */
-    async _findReferencesCollection() {
-        const api = globalThis.ThymerReadwiseReferencesColl;
-        if (api && typeof api.findColl === 'function') {
-            return api.findColl(this.data);
-        }
-        try {
-            const all = await this.data.getAllCollections();
-            const nm = (c) => {
-                let s = '';
-                try {
-                    s = String(c.getName?.() || '').trim();
-                } catch (_) {}
-                if (s) return s;
-                try {
-                    s = String(c.getConfiguration?.()?.name || '').trim();
-                } catch (_) {}
-                return s;
-            };
-            return all.find((c) => nm(c) === 'References') || null;
-        } catch (_) {
-            return null;
-        }
-    }
-
-    /** Create or merge the **References** collection before a sync run. */
-    async _ensureReferencesCollectionForSync() {
-        const api = globalThis.ThymerReadwiseReferencesColl;
-        if (api && typeof api.ensure === 'function') {
-            await api.ensure(this.data);
-        }
-    }
-
-    /**
-     * Ensure **References** exists soon after install — off the critical path (idle / delayed)
-     * so opening the journal does not block on `createCollection` / `saveConfiguration`.
-     */
-    _scheduleIdleEnsureReferencesCollection() {
-        const run = () => {
-            void (async () => {
-                try {
-                    if (!this.data || !globalThis.ThymerReadwiseReferencesColl?.ensure) return;
-                    await globalThis.ThymerReadwiseReferencesColl.ensure(this.data);
-                } catch (e) {
-                    console.warn('[Readwise Ref] References ensure (idle)', e);
-                }
-            })();
-        };
-        try {
-            if (typeof requestIdleCallback === 'function') {
-                requestIdleCallback(run, { timeout: 8000 });
-            } else {
-                setTimeout(run, 2000);
-            }
-        } catch (_) {
-            setTimeout(run, 2000);
-        }
-    }
-
     async _sync(token, forceFullSync) {
         this._loggedStructure = false;
         this._rwrWritten = 0;
@@ -2679,15 +2238,10 @@ class Plugin extends AppPlugin {
         const since = (lastRun && !forceFullSync) ? lastRun : null;
         this._log(since ? ('Incremental since ' + since) : 'Full sync');
 
-        await this._ensureReferencesCollectionForSync();
         const allCollections = await this.data.getAllCollections();
-        const refsColl = await this._findReferencesCollection();
+        const refsColl = allCollections.find(c => c.getName() === 'References');
         const peopleColl = allCollections.find(c => c.getName() === 'People');
-        if (!refsColl) {
-            throw new Error(
-                'References collection not found — paste the full plugin .js from the repo (includes ThymerReadwiseReferencesColl).'
-            );
-        }
+        if (!refsColl) throw new Error('References collection not found');
         this._log('References: true  People: ' + (!!peopleColl));
 
         const peopleByKey = new Map();
@@ -3391,7 +2945,6 @@ class Plugin extends AppPlugin {
                     recordGuid: null,
                     journalDate: null,
                     rootEl: null,
-                    shufflerRootEl: null,
                     observer: null,
                     loading: false,
                     loaded: false,
@@ -3444,7 +2997,6 @@ class Plugin extends AppPlugin {
                 recordGuid: record.guid,
                 journalDate,
                 rootEl:   null,
-                shufflerRootEl: null,
                 observer: null,
                 loading:  false,
                 loaded:   false,
@@ -3487,15 +3039,10 @@ class Plugin extends AppPlugin {
         }
         const s = this._panelStates.get(panelId);
         if (!s) return;
-        if (s._footerObsRaf != null) {
-            try { cancelAnimationFrame(s._footerObsRaf); } catch (_) {}
-            s._footerObsRaf = null;
-        }
         try { s.observer?.disconnect(); } catch (_) {}
         try { s._containerWatcher?.disconnect(); } catch (_) {}
         try { clearTimeout(s._navTimer); } catch (_) {}
-        try { s.rootEl?.remove(); } catch (_) {}
-        try { s.shufflerRootEl?.remove(); } catch (_) {}
+        try { s.rootEl?.remove(); }       catch (_) {}
         this._panelStates.delete(panelId);
     }
 
@@ -3512,10 +3059,7 @@ class Plugin extends AppPlugin {
 
     // Returns true if the footer was (re)built — caller should re-populate and drop stale async work
     _mountFooter(state, container, panelEl) {
-        const rootOk = !state.rootEl || (state.rootEl.isConnected && state.rootEl.parentElement === container);
-        const shOk = !state.shufflerRootEl || (state.shufflerRootEl.isConnected && state.shufflerRootEl.parentElement === container);
-        const hasAny = !!(state.rootEl || state.shufflerRootEl);
-        if (hasAny && rootOk && shOk) {
+        if (state.rootEl && state.rootEl.isConnected && state.rootEl.parentElement === container) {
             if (!state.observer) {
                 state.observer = this._createFooterObserver(state, panelEl);
             }
@@ -3532,17 +3076,9 @@ class Plugin extends AppPlugin {
         for (const el of container.querySelectorAll(':scope > .th-journal-footer')) {
             if (el.dataset?.panelId === state.panelId) { try { el.remove(); } catch (_) {} }
         }
-        for (const el of container.querySelectorAll(':scope > .th-footer--shuffler')) {
-            if (el.dataset?.panelId === state.panelId) { try { el.remove(); } catch (_) {} }
-        }
 
-        state.shufflerRootEl = null;
         state.rootEl = this._buildShell(state);
         if (state.rootEl) container.appendChild(state.rootEl);
-        if (this._showShufflerPanel()) {
-            state.shufflerRootEl = this._buildShufflerPanel(state);
-            if (state.shufflerRootEl) container.appendChild(state.shufflerRootEl);
-        }
         this._ensureFooterBottom(state, container);
 
         state.observer = this._createFooterObserver(state, panelEl);
@@ -3550,23 +3086,10 @@ class Plugin extends AppPlugin {
     }
 
     _ensureFooterBottom(state, container) {
-        if (!container) return;
-        const sh = state.shufflerRootEl;
-        const hi = state.rootEl;
-        if (sh && sh.parentElement === container) {
-            if (sh !== container.lastElementChild) {
-                container.appendChild(sh);
-            }
-        }
-        if (hi && hi.parentElement === container && sh && sh.parentElement === container) {
-            if (hi.nextElementSibling !== sh) {
-                container.insertBefore(hi, sh);
-            }
-            return;
-        }
-        if (hi && hi.parentElement === container && hi !== container.lastElementChild) {
-            container.appendChild(hi);
-        }
+        if (!state?.rootEl || !container) return;
+        if (state.rootEl.parentElement !== container) return;
+        if (container.lastElementChild === state.rootEl) return;
+        container.appendChild(state.rootEl);
     }
 
     _createFooterObserver(state, panelEl) {
@@ -3579,14 +3102,8 @@ class Plugin extends AppPlugin {
                     }
                 }, 300);
             }
-            if (state._footerObsRaf != null) return;
-            state._footerObsRaf = requestAnimationFrame(() => {
-                state._footerObsRaf = null;
-                try {
-                    const container = this._findContainer(panelEl);
-                    if (container) this._ensureFooterBottom(state, container);
-                } catch (_) {}
-            });
+            const container = this._findContainer(panelEl);
+            if (container) this._ensureFooterBottom(state, container);
         });
         obs.observe(panelEl, { childList: true, subtree: true });
         return obs;
@@ -3603,13 +3120,19 @@ class Plugin extends AppPlugin {
         return null;
     }
 
-    /** Highlights card wrapper (Quote Shuffler is a sibling under page-content for ordering with other plugins). */
+    /** Wrapper for one or more journal footer cards (highlights + quote shuffler). */
     _buildShell(state) {
-        if (!this._showHighlightsPanel()) return null;
         const root = document.createElement('div');
         root.className       = 'th-journal-footer';
         root.dataset.panelId = state.panelId;
-        root.appendChild(this._buildHighlightsPanel(state));
+
+        if (this._showHighlightsPanel()) {
+            root.appendChild(this._buildHighlightsPanel(state));
+        }
+        if (this._showShufflerPanel()) {
+            root.appendChild(this._buildShufflerPanel(state));
+        }
+        if (!root.childElementCount) return null;
         return root;
     }
 
@@ -3665,7 +3188,6 @@ class Plugin extends AppPlugin {
         const root = document.createElement('div');
         root.className            = 'th-footer th-footer--shuffler th-shuffler-shell';
         root.dataset.panelSection = 'shuffler';
-        root.dataset.panelId      = state.panelId;
 
         const chrome = document.createElement('div');
         chrome.className = 'th-shuffler-chrome';
@@ -3727,8 +3249,7 @@ class Plugin extends AppPlugin {
 
         const hiBody  = state.rootEl?.querySelector('[data-panel-section="highlights"] [data-role="body"]');
         const hiCount = state.rootEl?.querySelector('[data-panel-section="highlights"] [data-role="count"]');
-        const shBody  = state.shufflerRootEl?.querySelector('[data-role="body"]')
-            || state.rootEl?.querySelector('[data-panel-section="shuffler"] [data-role="body"]');
+        const shBody  = state.rootEl?.querySelector('[data-panel-section="shuffler"] [data-role="body"]');
 
         if (!hiBody && !shBody) {
             state.loaded = true;
@@ -3741,14 +3262,14 @@ class Plugin extends AppPlugin {
         if (shBody) shBody.innerHTML = '';
 
         try {
-            // Run sequentially so we do not load the full References quote pool at the same time
-            // as per-day highlight parsing (both are heavy on large libraries).
+            const jobs = [];
             if (hiBody) {
-                await this._populateHighlightsSection(state, hiBody, hiCount, targetJournal, targetRoot, targetGuid);
+                jobs.push(this._populateHighlightsSection(state, hiBody, hiCount, targetJournal, targetRoot, targetGuid));
             }
             if (shBody) {
-                await this._populateShufflerSection(state, shBody, targetJournal, targetRoot, targetGuid);
+                jobs.push(this._populateShufflerSection(state, shBody, targetJournal, targetRoot, targetGuid));
             }
+            await Promise.all(jobs);
 
             if (state.journalDate !== targetJournal || state.rootEl !== targetRoot || state.recordGuid !== targetGuid) {
                 state.loading = false;
@@ -3799,10 +3320,10 @@ class Plugin extends AppPlugin {
     }
 
     async _populateShufflerSection(state, shBody, targetJournal, targetRoot, targetGuid) {
+        await this._warmQuotePoolCache();
+        const pool = Array.isArray(this._quotePoolCache) ? this._quotePoolCache : [];
         const saved = this._loadDayShufflePick(targetJournal);
         if (saved && saved.guid && String(saved.text || '').trim()) {
-            await this._warmQuotePoolCache();
-            const pool = Array.isArray(this._quotePoolCache) ? this._quotePoolCache : [];
             let pick = this._pickFromStored(saved);
             const merged = this._mergeShufflePickWithPool(pick, pool);
             if (merged !== pick) {
@@ -3832,19 +3353,19 @@ class Plugin extends AppPlugin {
         try {
             localStorage.setItem(TH_KEY_SHUFFLER_QUOTES_BY_DAY, JSON.stringify(map));
         } catch (_) {}
-        this._scheduleShufflerDayMapSettingsSync();
+        this._scheduleShufflerDayMapPathBSync();
     }
 
-    _scheduleShufflerDayMapSettingsSync() {
-        if (this._pluginSettingsSyncMode !== 'synced') return;
+    _scheduleShufflerDayMapPathBSync() {
+        if (this._pathBMode !== 'synced') return;
         if (this._shufflerDayMapSyncTimer) {
             try { clearTimeout(this._shufflerDayMapSyncTimer); } catch (_) {}
         }
         this._shufflerDayMapSyncTimer = setTimeout(() => {
             this._shufflerDayMapSyncTimer = null;
-            const tps = globalThis.ThymerPluginSettings;
-            if (!tps?.flushNow || !this.data || !this._pluginSettingsPluginId) return;
-            tps.flushNow(this.data, this._pluginSettingsPluginId, this._pluginSettingsMirrorKeys()).catch(() => {});
+            const pathB = globalThis.ThymerExtPathB;
+            if (!pathB?.flushNow || !this.data || !this._pathBPluginId) return;
+            pathB.flushNow(this.data, this._pathBPluginId, this._pathBMirrorKeys()).catch(() => {});
         }, TH_SHUFFLER_DAYMAP_SYNC_IDLE_MS);
     }
 
@@ -4167,7 +3688,8 @@ class Plugin extends AppPlugin {
     }
 
     async _rebuildQuoteShufflePoolFromReferences({ persist }) {
-        const refsColl = await this._findReferencesCollection();
+        const collections = await this.data.getAllCollections();
+        const refsColl = collections.find(c => c.getName() === 'References');
         if (!refsColl) {
             this._quotePoolCache = [];
             this._quotePoolCacheSavedAt = Date.now();
@@ -4206,7 +3728,7 @@ class Plugin extends AppPlugin {
                     });
                 }
             }
-            await new Promise((r) => requestAnimationFrame(() => r()));
+            await this._sleep(0);
         }
 
         this._quotePoolCache = results;
@@ -4236,8 +3758,9 @@ class Plugin extends AppPlugin {
 
     /** References collection takes precedence when present (Readwise References Option B). */
     async _getHighlightsForDate(yyyymmdd) {
-        const refsColl = await this._findReferencesCollection();
-        if (refsColl) {
+        const collections = await this.data.getAllCollections();
+        const hasRefs = collections.some(c => c.getName() === 'References');
+        if (hasRefs) {
             return await this._getHighlightsFromReferencesForDate(yyyymmdd);
         }
         return await this._getHighlightsFromHighlightsCollection(yyyymmdd);
@@ -4255,7 +3778,8 @@ class Plugin extends AppPlugin {
         const d = parseInt(yyyymmdd.slice(6, 8), 10);
         const targetLabel = formatReadwiseRefDateHeading(new Date(y, m, d));
 
-        const refsColl = await this._findReferencesCollection();
+        const collections = await this.data.getAllCollections();
+        const refsColl = collections.find(c => c.getName() === 'References');
         if (!refsColl) return [];
 
         let records;
@@ -4285,7 +3809,6 @@ class Plugin extends AppPlugin {
                     });
                 }
             }
-            await new Promise((r) => requestAnimationFrame(() => r()));
         }
 
         results.sort((a, b) => a.source_title.localeCompare(b.source_title));
@@ -4776,15 +4299,15 @@ class Plugin extends AppPlugin {
     }
     _saveBool(key, val) {
         try { localStorage.setItem(key, val ? 'true' : 'false'); } catch (_) {}
-        globalThis.ThymerPluginSettings?.scheduleFlush?.(this, () => this._pluginSettingsMirrorKeys());
+        globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => this._pathBMirrorKeys());
     }
 
     /** Persist quickly when storage mode is synced (in addition to debounced flush). */
-    _flushSyncedSettingsNowBestEffort() {
-        if (this._pluginSettingsSyncMode !== 'synced') return;
-        const tps = globalThis.ThymerPluginSettings;
-        if (!tps?.flushNow || !this.data || !this._pluginSettingsPluginId) return;
-        tps.flushNow(this.data, this._pluginSettingsPluginId, this._pluginSettingsMirrorKeys()).catch(() => {});
+    _flushPathBNowBestEffort() {
+        if (this._pathBMode !== 'synced') return;
+        const pathB = globalThis.ThymerExtPathB;
+        if (!pathB?.flushNow || !this.data || !this._pathBPluginId) return;
+        pathB.flushNow(this.data, this._pathBPluginId, this._pathBMirrorKeys()).catch(() => {});
     }
 
     // =========================================================================
@@ -4793,7 +4316,7 @@ class Plugin extends AppPlugin {
 
     _injectCSS() {
         this.ui.injectCSS(`
-            /* ── Journal footer wrapper (Today's Highlights card; Quote Shuffler is a sibling .th-footer--shuffler) ── */
+            /* ── Journal footer wrapper (one or two cards) ── */
             .th-journal-footer {
                 margin-top: 16px;
                 display: flex;
