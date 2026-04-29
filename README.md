@@ -11,7 +11,7 @@ This repo now uses a consolidated References-based model and no longer ships the
 
 If you are upgrading from the old setup:
 
-1. Import/create `References` using `References.json`.
+1. Ensure a **`References`** collection exists (plugin can create it on first load, or import `References.json`).
 2. Install only `plugin.js` + `plugin.json`.
 3. Disable/remove legacy Readwise + Today's Highlights plugins to avoid duplicate behavior.
 4. Run `Readwise Ref: Full Sync` once to rebuild from the new model.
@@ -46,7 +46,7 @@ If you are upgrading from the old setup:
 
 ## Setup
 
-1. Create collection `References` using `References.json`.
+1. **References collection:** On first load the plugin creates **`References`** (and merges fields/views) if it is missing — same shape as `References.json`. You can still import `References.json` manually first if you prefer.
 2. Create plugin `Readwise References`:
   - Configuration: `plugin.json`
   - Custom Code: `plugin.js`
