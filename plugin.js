@@ -2403,6 +2403,8 @@
 
 const RWR_TOKEN_KEY    = 'readwise_references_token';
 const RWR_LAST_RUN_KEY = 'readwise_references_last_run';
+/** JSON blob from the last sync — use "Readwise Ref: Log last sync diagnostics" to inspect. */
+const RWR_LAST_SYNC_DIAG_KEY = 'readwise_references_last_sync_diag';
 
 /** Journal footer panels — persisted (localStorage + Path B when synced). */
 const TH_KEY_SHOW_HIGHLIGHTS   = 'th_panel_show_highlights';
@@ -2427,8 +2429,17 @@ const RWR_UI_YIELD_EVERY = 1;
  */
 const RWR_UI_REFS_COLL_REFRESH_EVERY = 80;
 
-/** How many source documents to process concurrently (body rebuild is the slow part). */
-const RWR_SYNC_CONCURRENCY = 3;
+/** Debounce panel.navigated / panel.focused → footer work (matches Backreferences-style scheduling). */
+const RWR_PANEL_DEBOUNCE_MS = 350;
+
+/**
+ * How many source documents to process concurrently during full sync.
+ * Body rebuild is sync-line heavy on the main thread; parallel >1 makes Thymer feel frozen for long runs.
+ */
+const RWR_SYNC_CONCURRENCY = 1;
+
+/** Yield every N highlights while rebuilding a reference body (lower = more responsive UI). */
+const RWR_BODY_YIELD_EVERY_HIGHLIGHTS = 8;
 
 /** Visible separator between highlights under the same day (Thymer may not style `br` or `---` as a rule). */
 const READWISE_REF_QUOTE_SEPARATOR_TEXT = '\u2500'.repeat(28);
@@ -2454,6 +2465,8 @@ class Plugin extends AppPlugin {
     _rwRefsColl = null;
     _rwPeopleColl = null;
     _rwHighlightsColl = null;
+    /** Ephemeral status bar chip while sync runs (see `_syncStatusShow` / `_syncStatusHide`). */
+    _rwrSyncStatusItem = null;
 
     async _ensureRwCollections() {
         let key = '';
@@ -2494,7 +2507,14 @@ class Plugin extends AppPlugin {
     }
 
     async onLoad() {
-        await (globalThis.ThymerExtPathB?.init?.({
+        try {
+            await globalThis.ThymerPluginSettings?.upgradeCollectionSchema?.(this.data);
+            await globalThis.ThymerPluginSettings?.registerPluginSlug?.(this.data, {
+                slug: 'readwise-references',
+                label: 'Readwise References',
+            });
+        } catch (_) {}
+        await (globalThis.ThymerPluginSettings?.init?.({
             plugin: this,
             pluginId: 'readwise-references',
             modeKey: 'thymerext_ps_mode_readwise_references',
@@ -2502,7 +2522,7 @@ class Plugin extends AppPlugin {
             label: 'Readwise References',
             data: this.data,
             ui: this.ui,
-        }) ?? (console.warn('[Readwise Ref] ThymerExtPathB runtime missing (redeploy full plugin .js from repo).'), Promise.resolve()));
+        }) ?? (console.warn('[Readwise Ref] ThymerPluginSettings runtime missing (redeploy full plugin .js from repo).'), Promise.resolve()));
         try {
             await this._bootstrapReferencesCollectionIfNeeded();
         } catch (_) {}
@@ -2522,11 +2542,16 @@ class Plugin extends AppPlugin {
             icon: 'ti-book-2',
             onSelected: () => this._runSync(true),
         });
+        this._cmdSyncDiag = this.ui.addCommandPaletteCommand({
+            label: 'Readwise Ref: Log last sync diagnostics',
+            icon: 'ti-stethoscope',
+            onSelected: () => this._logLastSyncDiagnostics(),
+        });
         this._cmdStorage = this.ui.addCommandPaletteCommand({
             label: 'Readwise Ref: Storage location…',
             icon: 'ti-database',
             onSelected: () => {
-                globalThis.ThymerExtPathB?.openStorageDialog?.({
+                globalThis.ThymerPluginSettings?.openStorageDialog?.({
                     plugin: this,
                     pluginId: 'readwise-references',
                     modeKey: 'thymerext_ps_mode_readwise_references',
@@ -2565,17 +2590,24 @@ class Plugin extends AppPlugin {
         this._hydrateQuotePoolCacheFromStorage();
         this._injectCSS();
         this._eventHandlerIds.push(this.events.on('panel.navigated', ev => this._deferHandlePanel(ev.panel)));
-        this._eventHandlerIds.push(this.events.on('panel.focused',   ev => this._handlePanel(ev.panel)));
+        this._eventHandlerIds.push(this.events.on('panel.focused',   ev => this._deferHandlePanel(ev.panel)));
         this._eventHandlerIds.push(this.events.on('panel.closed',    ev => this._disposePanel(ev.panel?.getId?.())));
         this._eventHandlerIds.push(this.events.on('record.created',  () => {
             this._clearFooterDataCaches();
             this._refreshAll();
         }));
+        try {
+            const p0 = this.ui.getActivePanel();
+            if (p0) requestAnimationFrame(() => this._handlePanel(p0));
+        } catch (_) {}
         setTimeout(() => {
             const p = this.ui.getActivePanel();
             if (p) this._handlePanel(p);
-        }, 400);
-        setTimeout(() => { void this._warmQuotePoolCache(); }, 1200);
+        }, 120);
+        /** Quote pool rebuild touches every References record — only warm when Shuffler is enabled. */
+        setTimeout(() => {
+            if (this._showShufflerPanel()) void this._warmQuotePoolCache();
+        }, 1200);
     }
 
     onUnload() {
@@ -2596,10 +2628,12 @@ class Plugin extends AppPlugin {
             try { clearTimeout(this._shufflerDayMapSyncTimer); } catch (_) {}
             this._shufflerDayMapSyncTimer = null;
         }
+        this._syncStatusHide();
 
         this._cmdSetToken?.remove();
         this._cmdSync?.remove();
         this._cmdFullSync?.remove();
+        this._cmdSyncDiag?.remove();
         this._cmdStorage?.remove();
         this._cmdToggleHighlights?.remove();
         this._cmdToggleShuffler?.remove();
@@ -2714,10 +2748,10 @@ class Plugin extends AppPlugin {
         return (Date.now() - this._quotePoolCacheSavedAt) > TH_SHUFFLER_POOL_CACHE_MAX_AGE_MS;
     }
 
-    async _warmQuotePoolCache() {
+    async _warmQuotePoolCache(onProgress) {
         if (this._quotePoolBuildingPromise) return this._quotePoolBuildingPromise;
         if (Array.isArray(this._quotePoolCache) && this._quotePoolCache.length && !this._isQuotePoolCacheStale()) return this._quotePoolCache;
-        this._quotePoolBuildingPromise = this._rebuildQuoteShufflePoolFromReferences({ persist: true })
+        this._quotePoolBuildingPromise = this._rebuildQuoteShufflePoolFromReferences({ persist: true, onProgress })
             .catch(() => [])
             .finally(() => { this._quotePoolBuildingPromise = null; });
         return this._quotePoolBuildingPromise;
@@ -2871,7 +2905,7 @@ class Plugin extends AppPlugin {
                 localStorage.setItem(RWR_TOKEN_KEY, token);
                 this._toast('Token saved! Run "Readwise Ref: Full Sync".');
             }
-            globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => this._pathBMirrorKeys());
+            globalThis.ThymerPluginSettings?.scheduleFlush?.(this, () => this._pathBMirrorKeys());
         };
         saveBtn.addEventListener('click', () => done(true));
         cancelBtn.addEventListener('click', () => done(false));
@@ -2890,6 +2924,7 @@ class Plugin extends AppPlugin {
         if (!token) { this._toast('No token. Run "Readwise Ref: Set Token" first.'); return; }
         this._syncing = true;
         this._toast(forceFullSync ? 'Readwise Ref full sync…' : 'Readwise Ref: syncing…');
+        this._syncStatusShow(forceFullSync ? 'Full sync — checking token…' : 'Sync — checking token…');
         this._log('Nothing is written to References until the Reader list download (and export) finish — the table stays empty during "List page" logs.');
         try {
             const testResp = await fetch('https://readwise.io/api/v3/list/?limit=1', {
@@ -2899,16 +2934,23 @@ class Plugin extends AppPlugin {
             if (testResp.status === 429) {
                 this._toast('Rate limited. Wait and retry.');
                 this._syncing = false;
+                this._syncStatusHide();
                 return;
             }
             const result = await this._sync(token, forceFullSync);
             this._toast('Done: ' + result.summary);
             localStorage.setItem(RWR_LAST_RUN_KEY, new Date().toISOString());
             this._clearFooterDataCaches();
-            globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => this._pathBMirrorKeys());
+            globalThis.ThymerPluginSettings?.scheduleFlush?.(this, () => this._pathBMirrorKeys());
         } catch (e) {
             console.error('[ReadwiseRef]', e);
+            if (this._lastSyncDiag) {
+                this._lastSyncDiag.syncThrown = String(e && e.message ? e.message : e);
+                this._persistSyncDiag({ ok: false });
+            }
             this._toast('Sync failed: ' + e.message);
+        } finally {
+            this._syncStatusHide();
         }
         this._syncing = false;
     }
@@ -3011,12 +3053,67 @@ class Plugin extends AppPlugin {
         return { highlightById, coverByDocId };
     }
 
+    _persistSyncDiag(extra) {
+        try {
+            const payload = Object.assign({}, this._lastSyncDiag || {}, extra || {}, {
+                savedAt: new Date().toISOString(),
+            });
+            localStorage.setItem(RWR_LAST_SYNC_DIAG_KEY, JSON.stringify(payload));
+        } catch (_) {}
+    }
+
+    _logLastSyncDiagnostics() {
+        let raw = '';
+        try { raw = localStorage.getItem(RWR_LAST_SYNC_DIAG_KEY) || ''; } catch (_) {}
+        if (!raw || !String(raw).trim()) {
+            this._toast('No diagnostics yet — run a sync first.');
+            return;
+        }
+        try {
+            const o = JSON.parse(raw);
+            this._log('LAST_SYNC_DIAGNOSTICS_JSON ' + raw);
+            const h = o.highlightsWithoutDocKey || 0;
+            const d = o.datelessHighlightsInBodies || 0;
+            const oa = o.skippedOrphans || 0;
+            const rss = o.skippedRss || 0;
+            const inc = o.incremental ? 'incremental' : 'full';
+            this._toast('Diagnostics logged (console). ' + inc + ' · unmapped HL: ' + h + ' · dateless in body: ' + d + ' · orphan skip: ' + oa + ' · rss skip: ' + rss);
+        } catch (_) {
+            this._toast('Diagnostics JSON is invalid.');
+        }
+    }
+
     async _sync(token, forceFullSync) {
         this._loggedStructure = false;
         this._rwrWritten = 0;
         const lastRun = localStorage.getItem(RWR_LAST_RUN_KEY);
         const since = (lastRun && !forceFullSync) ? lastRun : null;
         this._log(since ? ('Incremental since ' + since) : 'Full sync');
+        this._syncStatusShow(since ? 'Incremental — preparing…' : 'Full sync — preparing…');
+
+        this._lastSyncDiag = {
+            incremental: !!since,
+            forceFullSync: !!forceFullSync,
+            since: since || null,
+            listRows: 0,
+            pageDocs: 0,
+            pageHLs: 0,
+            parentBuckets: 0,
+            docEntriesToWrite: 0,
+            highlightsWithoutDocKey: 0,
+            skippedOrphans: 0,
+            skippedRss: 0,
+            skippedFailedCreate: 0,
+            bodyRebuildErrors: 0,
+            datelessHighlightsInBodies: 0,
+            body_getRecordReadyFail: 0,
+            body_getLineItemsFail: 0,
+            referencesWritten: 0,
+            createdRef: 0,
+            updatedRef: 0,
+            exportRowsApprox: 0,
+            exportError: null,
+        };
 
         await this._ensureRwCollections();
         const refsColl = this._rwRefsColl;
@@ -3042,7 +3139,9 @@ class Plugin extends AppPlugin {
 
         let createdRef = 0, updatedRef = 0;
 
+        this._syncStatusShow(since ? 'Downloading Reader list (incremental)…' : 'Downloading Reader list (full)…');
         const allResults = await this._fetchReadwiseListAll(token, since);
+        this._lastSyncDiag.listRows = allResults.length;
         this._log('List download complete: ' + allResults.length + ' rows.');
         this._toast('Readwise list done. Fetching export + saving references…');
 
@@ -3050,11 +3149,14 @@ class Plugin extends AppPlugin {
         let exportCoverByDocId = new Map();
         if (allResults.length > 0) {
             try {
+                this._syncStatusShow('Fetching export enrichment (' + allResults.length + ' list rows)…');
                 const enr = await this._fetchExportEnrichmentMap(token, since);
                 exportByHlId = enr.highlightById;
                 exportCoverByDocId = enr.coverByDocId;
+                this._lastSyncDiag.exportRowsApprox = exportByHlId.size;
                 this._log('v2 export: ' + exportByHlId.size + ' highlights');
             } catch (e) {
+                this._lastSyncDiag.exportError = String(e && e.message ? e.message : e);
                 this._log('⚠️ Export skipped: ' + e.message);
             }
         }
@@ -3080,13 +3182,24 @@ class Plugin extends AppPlugin {
             if (r && r.id != null) allRowsById.set(String(r.id), r);
         }
 
-        const pageHLsByDoc = this._groupPageHLsByOwningDocument(pageHLs, docByIdStr, allRowsById);
+        const grouped = this._groupPageHLsByOwningDocument(pageHLs, docByIdStr, allRowsById);
+        const pageHLsByDoc = grouped.map;
+        this._lastSyncDiag.pageDocs = pageDocs.length;
+        this._lastSyncDiag.pageHLs = pageHLs.length;
+        this._lastSyncDiag.highlightsWithoutDocKey = grouped.highlightsWithoutDocKey;
+        this._lastSyncDiag.parentBuckets = pageHLsByDoc.size;
 
-        this._log('Grouped: ' + pageDocs.length + ' docs, ' + pageHLs.length + ' HL rows, ' + pageHLsByDoc.size + ' parents');
+        this._log('Grouped: ' + pageDocs.length + ' docs, ' + pageHLs.length + ' HL rows, ' + pageHLsByDoc.size + ' parents, '
+            + grouped.highlightsWithoutDocKey + ' highlight rows with no document key');
 
         let syntheticParentCount = 0;
 
         const docEntries = Array.from(pageHLsByDoc.entries()).filter(([, hl]) => hl && hl.length > 0);
+        const docTotal = docEntries.length;
+        this._lastSyncDiag.docEntriesToWrite = docTotal;
+        if (docTotal > 0) {
+            this._syncStatusShow('Saving references 0/' + docTotal + '…');
+        }
         for (let bi = 0; bi < docEntries.length; bi += RWR_SYNC_CONCURRENCY) {
             const batch = docEntries.slice(bi, bi + RWR_SYNC_CONCURRENCY);
             const batchOut = await Promise.all(batch.map(async ([parentIdStr, docHL]) => {
@@ -3097,12 +3210,16 @@ class Plugin extends AppPlugin {
                     const t0 = this._resolveDocTitle(syn);
                     if (/^(note|highlight)\s*\(untitled\)$/i.test(String(t0 || '').trim())) {
                         this._log('Skipping orphan group ' + parentIdStr + ' (' + t0 + ') — could not resolve owning document');
+                        if (this._lastSyncDiag) this._lastSyncDiag.skippedOrphans++;
                         return { created: 0, updated: 0, synth: 0, written: 0 };
                     }
                     doc = syn;
                     synthAdded = 1;
                 }
-                if (doc.category === 'rss') return { created: 0, updated: 0, synth: 0, written: 0 };
+                if (doc.category === 'rss') {
+                    if (this._lastSyncDiag) this._lastSyncDiag.skippedRss++;
+                    return { created: 0, updated: 0, synth: 0, written: 0 };
+                }
 
                 const docTitle = this._resolveDocTitle(doc);
                 const extId = 'readwise_' + String(doc.id);
@@ -3150,6 +3267,7 @@ class Plugin extends AppPlugin {
                         refRecord = r;
                     } else {
                         this._log('⚠️ Failed to create Reference: ' + extId);
+                        if (this._lastSyncDiag) this._lastSyncDiag.skippedFailedCreate++;
                     }
                 }
 
@@ -3159,9 +3277,11 @@ class Plugin extends AppPlugin {
                         await this._rebuildReferenceHighlightsBody(refRecord, doc, docHL, exportByHlId);
                     } catch (e) {
                         this._log('⚠️ Body rebuild: ' + (e && e.message ? e.message : e));
+                        if (this._lastSyncDiag) this._lastSyncDiag.bodyRebuildErrors++;
                     }
                     written = 1;
                     this._rwrWritten++;
+                    if (this._lastSyncDiag) this._lastSyncDiag.referencesWritten++;
                     await this._yieldUi(refsColl);
                 }
                 return { created, updated, synth: synthAdded, written };
@@ -3171,6 +3291,11 @@ class Plugin extends AppPlugin {
                 updatedRef += o.updated;
                 syntheticParentCount += o.synth;
             }
+            const done = Math.min(bi + batch.length, docTotal);
+            if (docTotal > 0) {
+                this._syncStatusShow('Saving references ' + done + '/' + docTotal + '…');
+            }
+            await this._sleep(0);
         }
 
         if (syntheticParentCount > 0) {
@@ -3181,6 +3306,12 @@ class Plugin extends AppPlugin {
             this._log('Totals: ' + createdRef + ' created, ' + updatedRef + ' updated');
         }
 
+        this._lastSyncDiag.createdRef = createdRef;
+        this._lastSyncDiag.updatedRef = updatedRef;
+        this._log('[ReadwiseRef] SYNC_DIAG ' + JSON.stringify(this._lastSyncDiag));
+        this._persistSyncDiag({ ok: true });
+
+        this._syncStatusShow('Refreshing workspace…');
         await this._tryHostCollectionRefresh(refsColl);
         this._clearFooterDataCaches();
 
@@ -3188,7 +3319,22 @@ class Plugin extends AppPlugin {
             createdRef > 0 ? createdRef + ' references added' : null,
             updatedRef > 0 ? updatedRef + ' references updated' : null,
         ].filter(Boolean);
-        return { summary: parts.length ? parts.join(', ') : 'No changes' };
+        const d = this._lastSyncDiag;
+        const warn = [];
+        if (d && d.highlightsWithoutDocKey > 0) {
+            warn.push(d.highlightsWithoutDocKey + ' list highlights not mapped to a document');
+        }
+        if (d && d.datelessHighlightsInBodies > 0) {
+            warn.push(d.datelessHighlightsInBodies + ' highlights skipped in bodies (no date)');
+        }
+        if (d && d.skippedOrphans > 0) warn.push(d.skippedOrphans + ' orphan groups skipped');
+        if (d && d.skippedRss > 0) warn.push(d.skippedRss + ' RSS sources skipped');
+        if (d && d.incremental && (d.highlightsWithoutDocKey > 0 || d.skippedOrphans > 0)) {
+            warn.push('incremental sync — run Full Sync if counts look wrong');
+        }
+        let summary = parts.length ? parts.join(', ') : 'No changes';
+        if (warn.length) summary += ' · Note: ' + warn.join('; ');
+        return { summary, diag: this._lastSyncDiag };
     }
 
     /**
@@ -3196,13 +3342,17 @@ class Plugin extends AppPlugin {
      */
     async _rebuildReferenceHighlightsBody(refRecord, doc, docHL, exportByHlId) {
         const record = await this._getRecordReady(refRecord.guid);
-        if (!record) return;
+        if (!record) {
+            if (this._lastSyncDiag) this._lastSyncDiag.body_getRecordReadyFail = (this._lastSyncDiag.body_getRecordReadyFail || 0) + 1;
+            return;
+        }
 
         await this._sleep(12);
         let items;
         try {
             items = await record.getLineItems();
         } catch (e) {
+            if (this._lastSyncDiag) this._lastSyncDiag.body_getLineItemsFail = (this._lastSyncDiag.body_getLineItemsFail || 0) + 1;
             return;
         }
 
@@ -3217,7 +3367,10 @@ class Plugin extends AppPlugin {
         }
         await this._applyLineHeading(sectionLine, 2);
 
-        const byDay = this._groupHighlightsByLocalDay(docHL);
+        const { byDay, skippedNoDate } = this._groupHighlightsByLocalDay(docHL);
+        if (this._lastSyncDiag && skippedNoDate > 0) {
+            this._lastSyncDiag.datelessHighlightsInBodies = (this._lastSyncDiag.datelessHighlightsInBodies || 0) + skippedNoDate;
+        }
         const dayKeys = Array.from(byDay.keys()).sort();
 
         let prevUnderSection = null;
@@ -3273,6 +3426,7 @@ class Plugin extends AppPlugin {
 
             let prevUnderDate = null;
             for (let hi = 0; hi < highlights.length; hi++) {
+                if (hi > 0 && hi % RWR_BODY_YIELD_EVERY_HIGHLIGHTS === 0) await this._sleep(0);
                 const h = highlights[hi];
                 const body = this._highlightBody(h);
                 const ex = exportByHlId.get(String(h.id)) || exportByHlId.get(String(h.external_id ?? ''));
@@ -3330,8 +3484,10 @@ class Plugin extends AppPlugin {
         }
     }
 
+    /** Highlights without a parseable local date are omitted from the body (`skippedNoDate`). */
     _groupHighlightsByLocalDay(docHL) {
         const byDay = new Map();
+        let skippedNoDate = 0;
         for (const h of docHL) {
             const raw = h.highlighted_at || h.created_at;
             let dt = null;
@@ -3341,7 +3497,10 @@ class Plugin extends AppPlugin {
                     if (isNaN(dt.getTime())) dt = null;
                 } catch (_) { dt = null; }
             }
-            if (!dt) continue;
+            if (!dt) {
+                skippedNoDate++;
+                continue;
+            }
             const y = dt.getFullYear();
             const m = dt.getMonth();
             const d = dt.getDate();
@@ -3352,7 +3511,7 @@ class Plugin extends AppPlugin {
             }
             byDay.get(key).highlights.push(h);
         }
-        return byDay;
+        return { byDay, skippedNoDate };
     }
 
     /** Delete every line in document order (children before parents where possible). */
@@ -3457,16 +3616,29 @@ class Plugin extends AppPlugin {
         }
     }
 
-    /** Group list rows under the Reader **document** id (walks parent chain; prefers parent_document_id). */
+    /**
+     * Group list rows under the Reader **document** id (walks parent chain; prefers parent_document_id).
+     * Highlights with no resolvable document key are counted in `highlightsWithoutDocKey` (otherwise silent drops).
+     */
     _groupPageHLsByOwningDocument(pageHLs, docByIdStr, allRowsById) {
         const pageHLsByDoc = new Map();
+        let highlightsWithoutDocKey = 0;
         for (const h of pageHLs) {
             const docKey = this._resolveDocKeyForListRow(h, docByIdStr, allRowsById);
-            if (docKey == null) continue;
+            if (docKey == null) {
+                highlightsWithoutDocKey++;
+                if (this._lastSyncDiag) {
+                    if (!this._lastSyncDiag.unmappedSampleIds) this._lastSyncDiag.unmappedSampleIds = [];
+                    if (this._lastSyncDiag.unmappedSampleIds.length < 25 && h && h.id != null) {
+                        this._lastSyncDiag.unmappedSampleIds.push(String(h.id));
+                    }
+                }
+                continue;
+            }
             if (!pageHLsByDoc.has(docKey)) pageHLsByDoc.set(docKey, []);
             pageHLsByDoc.get(docKey).push(h);
         }
-        return pageHLsByDoc;
+        return { map: pageHLsByDoc, highlightsWithoutDocKey };
     }
 
     _resolveDocKeyForListRow(h, docByIdStr, allRowsById) {
@@ -3667,16 +3839,19 @@ class Plugin extends AppPlugin {
             }
         };
         await this._tryRefreshRefsCollectionOnly(refsColl);
+        await this._sleep(0);
         await tryOne(this.data, [
             'refresh', 'refreshAll', 'refreshCollections', 'reloadCollections',
             'invalidate', 'notifyDataChanged', 'notifyChange', 'sync',
         ]);
+        await this._sleep(0);
         await tryOne(this.ui, ['refresh', 'refreshActivePanel', 'refreshCollections']);
     }
 
     async _yieldUi(refsColl) {
         if (RWR_UI_YIELD_EVERY > 0 && this._rwrWritten % RWR_UI_YIELD_EVERY === 0) {
             await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+            await this._sleep(0);
         }
         if (this._rwrWritten > 0 && RWR_UI_REFS_COLL_REFRESH_EVERY > 0
             && this._rwrWritten % RWR_UI_REFS_COLL_REFRESH_EVERY === 0) {
@@ -3694,7 +3869,17 @@ class Plugin extends AppPlugin {
         this._navDeferTimers.set(panelId, setTimeout(() => {
             this._navDeferTimers.delete(panelId);
             this._handlePanel(panel);
-        }, 400));
+        }, RWR_PANEL_DEBOUNCE_MS));
+    }
+
+    /** Drop stale async footer work when navigation beats slow highlights/shuffler awaits. */
+    _isPopulateStillCurrent(state, seq, targetJournal, targetRoot, targetGuid) {
+        return !!state
+            && state.populateSeq === seq
+            && state.journalDate === targetJournal
+            && state.rootEl === targetRoot
+            && state.recordGuid === targetGuid
+            && !!state.rootEl?.isConnected;
     }
 
     // =========================================================================
@@ -3728,6 +3913,7 @@ class Plugin extends AppPlugin {
                     observer: null,
                     loading: false,
                     loaded: false,
+                    populateSeq: 0,
                     _pendingPopulate: false,
                     expandedSources: new Map(),
                     _containerWatcher: null,
@@ -3780,6 +3966,7 @@ class Plugin extends AppPlugin {
                 observer: null,
                 loading:  false,
                 loaded:   false,
+                populateSeq: 0,
                 _pendingPopulate: false,
                 expandedSources: new Map(),
                 _containerWatcher: null,
@@ -3792,6 +3979,7 @@ class Plugin extends AppPlugin {
             state.recordGuid = record.guid;
             state.panel = panel;
             if (typeof state._pendingPopulate !== 'boolean') state._pendingPopulate = false;
+            if (typeof state.populateSeq !== 'number') state.populateSeq = 0;
             if (dateChanged || recordChanged || wasPlaceholder) {
                 state.loaded = false;
                 state.expandedSources = new Map();
@@ -4022,6 +4210,8 @@ class Plugin extends AppPlugin {
     async _populate(state) {
         if (state.loading) return;
         state.loading = true;
+        if (typeof state.populateSeq !== 'number') state.populateSeq = 0;
+        const seq = ++state.populateSeq;
 
         const targetJournal = state.journalDate;
         const targetRoot    = state.rootEl;
@@ -4038,34 +4228,35 @@ class Plugin extends AppPlugin {
             return;
         }
 
-        if (hiBody) hiBody.innerHTML = '<div class="th-loading">Loading…</div>';
-        if (shBody) shBody.innerHTML = '';
+        if (hiBody) hiBody.innerHTML = '<div class="th-loading">Scanning highlights…</div>';
+        if (shBody) shBody.innerHTML = '<div class="th-loading">Loading quote library…</div>';
 
         try {
             const jobs = [];
             if (hiBody) {
-                jobs.push(this._populateHighlightsSection(state, hiBody, hiCount, targetJournal, targetRoot, targetGuid));
+                jobs.push(this._populateHighlightsSection(state, hiBody, hiCount, targetJournal, targetRoot, targetGuid, seq));
             }
             if (shBody) {
-                jobs.push(this._populateShufflerSection(state, shBody, targetJournal, targetRoot, targetGuid));
+                jobs.push(this._populateShufflerSection(state, shBody, targetJournal, targetRoot, targetGuid, seq));
             }
             await Promise.all(jobs);
 
-            if (state.journalDate !== targetJournal || state.rootEl !== targetRoot || state.recordGuid !== targetGuid) {
+            if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetRoot, targetGuid)) {
                 state.loading = false;
                 this._flushPendingPopulate(state);
                 return;
             }
-            if (!state.rootEl?.isConnected) { state.loading = false; this._flushPendingPopulate(state); return; }
 
             state.loaded = true;
         } catch (e) {
             console.error('[ReadwiseRef|TH]', e);
-            if (hiBody && state.rootEl === targetRoot && state.journalDate === targetJournal) {
-                hiBody.innerHTML = '<div class="th-empty">Error loading highlights.</div>';
-            }
-            if (shBody && state.rootEl === targetRoot && state.journalDate === targetJournal) {
-                shBody.innerHTML = '<div class="th-empty">Error loading quote.</div>';
+            if (this._isPopulateStillCurrent(state, seq, targetJournal, targetRoot, targetGuid)) {
+                if (hiBody) {
+                    hiBody.innerHTML = '<div class="th-empty">Error loading highlights.</div>';
+                }
+                if (shBody) {
+                    shBody.innerHTML = '<div class="th-empty">Error loading quote.</div>';
+                }
             }
         }
 
@@ -4073,10 +4264,14 @@ class Plugin extends AppPlugin {
         this._flushPendingPopulate(state);
     }
 
-    async _populateHighlightsSection(state, bodyEl, countEl, targetJournal, targetRoot, targetGuid) {
-        const highlights = await this._getHighlightsForDate(targetJournal);
-        if (state.journalDate !== targetJournal || state.rootEl !== targetRoot || state.recordGuid !== targetGuid) return;
-        if (!state.rootEl?.isConnected) return;
+    async _populateHighlightsSection(state, bodyEl, countEl, targetJournal, targetRoot, targetGuid, seq) {
+        const reportHi = (msg) => {
+            if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetRoot, targetGuid)) return;
+            const el = bodyEl.querySelector('.th-loading');
+            if (el) el.textContent = msg;
+        };
+        const highlights = await this._getHighlightsForDate(targetJournal, reportHi);
+        if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetRoot, targetGuid)) return;
 
         bodyEl.innerHTML = '';
 
@@ -4099,8 +4294,14 @@ class Plugin extends AppPlugin {
         }
     }
 
-    async _populateShufflerSection(state, shBody, targetJournal, targetRoot, targetGuid) {
-        await this._warmQuotePoolCache();
+    async _populateShufflerSection(state, shBody, targetJournal, targetRoot, targetGuid, seq) {
+        const reportPool = (msg) => {
+            if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetRoot, targetGuid)) return;
+            const el = shBody.querySelector('.th-loading');
+            if (el) el.textContent = msg;
+        };
+        await this._warmQuotePoolCache(reportPool);
+        if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetRoot, targetGuid)) return;
         const pool = Array.isArray(this._quotePoolCache) ? this._quotePoolCache : [];
         const saved = this._loadDayShufflePick(targetJournal);
         if (saved && saved.guid && String(saved.text || '').trim()) {
@@ -4114,8 +4315,7 @@ class Plugin extends AppPlugin {
         } else {
             this._renderShufflerIdle(state, shBody, targetJournal);
         }
-        if (state.journalDate !== targetJournal || state.rootEl !== targetRoot || state.recordGuid !== targetGuid) return;
-        if (!state.rootEl?.isConnected) return;
+        if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetRoot, targetGuid)) return;
     }
 
     _getShufflerDayMap() {
@@ -4137,15 +4337,15 @@ class Plugin extends AppPlugin {
     }
 
     _scheduleShufflerDayMapPathBSync() {
-        if (this._pathBMode !== 'synced') return;
+        if (this._pluginSettingsSyncMode !== 'synced') return;
         if (this._shufflerDayMapSyncTimer) {
             try { clearTimeout(this._shufflerDayMapSyncTimer); } catch (_) {}
         }
         this._shufflerDayMapSyncTimer = setTimeout(() => {
             this._shufflerDayMapSyncTimer = null;
-            const pathB = globalThis.ThymerExtPathB;
-            if (!pathB?.flushNow || !this.data || !this._pathBPluginId) return;
-            pathB.flushNow(this.data, this._pathBPluginId, this._pathBMirrorKeys()).catch(() => {});
+            const ps = globalThis.ThymerPluginSettings;
+            if (!ps?.flushNow || !this.data || !this._pluginSettingsPluginId) return;
+            ps.flushNow(this.data, this._pluginSettingsPluginId, this._pathBMirrorKeys()).catch(() => {});
         }, TH_SHUFFLER_DAYMAP_SYNC_IDLE_MS);
     }
 
@@ -4467,7 +4667,7 @@ class Plugin extends AppPlugin {
         return this._quotePoolBuildingPromise;
     }
 
-    async _rebuildQuoteShufflePoolFromReferences({ persist }) {
+    async _rebuildQuoteShufflePoolFromReferences({ persist, onProgress }) {
         await this._ensureRwCollections();
         const refsColl = this._rwRefsColl;
         if (!refsColl) {
@@ -4485,8 +4685,13 @@ class Plugin extends AppPlugin {
         }
 
         const results = [];
+        const total = records.length;
         for (let i = 0; i < records.length; i += TH_SHUFFLER_POOL_CONCURRENCY) {
             const chunk = records.slice(i, i + TH_SHUFFLER_POOL_CONCURRENCY);
+            if (onProgress) {
+                const upto = Math.min(i + chunk.length, total);
+                try { onProgress(`Scanning quote library… ${upto}/${total}`); } catch (_) {}
+            }
             const parsed = await Promise.all(chunk.map((record) =>
                 this._extractAllHighlightsFromReferenceBody(record)));
             for (let j = 0; j < chunk.length; j++) {
@@ -4537,18 +4742,18 @@ class Plugin extends AppPlugin {
     }
 
     /** References collection takes precedence when present (Readwise References Option B). */
-    async _getHighlightsForDate(yyyymmdd) {
+    async _getHighlightsForDate(yyyymmdd, onProgress) {
         await this._ensureRwCollections();
         if (this._rwRefsColl) {
-            return await this._getHighlightsFromReferencesForDate(yyyymmdd);
+            return await this._getHighlightsFromReferencesForDate(yyyymmdd, onProgress);
         }
-        return await this._getHighlightsFromHighlightsCollection(yyyymmdd);
+        return await this._getHighlightsFromHighlightsCollection(yyyymmdd, onProgress);
     }
 
     /**
      * Parse Reference record bodies: Highlights section → date heading → quote blocks (+ note/loc children).
      */
-    async _getHighlightsFromReferencesForDate(yyyymmdd) {
+    async _getHighlightsFromReferencesForDate(yyyymmdd, onProgress) {
         const hit = this._thRefQueryCache?.get(yyyymmdd);
         if (hit) return hit;
 
@@ -4567,8 +4772,13 @@ class Plugin extends AppPlugin {
 
         const results = [];
         const CONCURRENCY = 24;
+        const total = records.length;
         for (let i = 0; i < records.length; i += CONCURRENCY) {
             const chunk = records.slice(i, i + CONCURRENCY);
+            if (onProgress) {
+                const upto = Math.min(i + chunk.length, total);
+                try { onProgress(`Scanning highlights… ${upto}/${total}`); } catch (_) {}
+            }
             const parsed = await Promise.all(chunk.map((record) =>
                 this._extractHighlightsFromReferenceBody(record, targetLabel, yyyymmdd)));
             for (let j = 0; j < chunk.length; j++) {
@@ -4588,6 +4798,7 @@ class Plugin extends AppPlugin {
                     });
                 }
             }
+            await this._sleep(0);
         }
 
         results.sort((a, b) => a.source_title.localeCompare(b.source_title));
@@ -4798,7 +5009,7 @@ class Plugin extends AppPlugin {
     }
 
     /** Legacy: one Highlight record per Readwise highlight. */
-    async _getHighlightsFromHighlightsCollection(yyyymmdd) {
+    async _getHighlightsFromHighlightsCollection(yyyymmdd, onProgress) {
         const y = parseInt(yyyymmdd.slice(0, 4), 10);
         const m = parseInt(yyyymmdd.slice(4, 6), 10) - 1;
         const d = parseInt(yyyymmdd.slice(6, 8), 10);
@@ -4814,7 +5025,13 @@ class Plugin extends AppPlugin {
         catch (_) { return []; }
 
         const results = [];
+        const total = records.length;
+        let idx = 0;
         for (const record of records) {
+            idx += 1;
+            if (onProgress && (idx === 1 || idx % 120 === 0 || idx === total)) {
+                try { onProgress(`Scanning highlights… ${idx}/${total}`); } catch (_) {}
+            }
             const date = this._getDateValue(record, 'highlighted_at');
             if (!date) continue;
             if (date >= dayStart && date <= dayEnd) {
@@ -4829,6 +5046,7 @@ class Plugin extends AppPlugin {
                     category:     record.prop('category')?.choice() || '',
                 });
             }
+            if (idx % 120 === 0) await this._sleep(0);
         }
 
         results.sort((a, b) => a.source_title.localeCompare(b.source_title));
@@ -5078,15 +5296,15 @@ class Plugin extends AppPlugin {
     }
     _saveBool(key, val) {
         try { localStorage.setItem(key, val ? 'true' : 'false'); } catch (_) {}
-        globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => this._pathBMirrorKeys());
+        globalThis.ThymerPluginSettings?.scheduleFlush?.(this, () => this._pathBMirrorKeys());
     }
 
     /** Persist quickly when storage mode is synced (in addition to debounced flush). */
     _flushPathBNowBestEffort() {
-        if (this._pathBMode !== 'synced') return;
-        const pathB = globalThis.ThymerExtPathB;
-        if (!pathB?.flushNow || !this.data || !this._pathBPluginId) return;
-        pathB.flushNow(this.data, this._pathBPluginId, this._pathBMirrorKeys()).catch(() => {});
+        if (this._pluginSettingsSyncMode !== 'synced') return;
+        const ps = globalThis.ThymerPluginSettings;
+        if (!ps?.flushNow || !this.data || !this._pluginSettingsPluginId) return;
+        ps.flushNow(this.data, this._pluginSettingsPluginId, this._pathBMirrorKeys()).catch(() => {});
     }
 
     // =========================================================================
@@ -5480,6 +5698,36 @@ class Plugin extends AppPlugin {
     _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
     _trunc(s, max) { return s && s.length > max ? s.slice(0, max - 1) + '...' : (s || ''); }
     _log(msg) { console.log('[ReadwiseRef] ' + msg); }
+    /** Minimal HTML escape for status bar labels. */
+    _syncStatusEscape(s) {
+        return String(s || '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+    _syncStatusShow(text) {
+        try {
+            if (typeof this.ui.addStatusBarItem !== 'function') return;
+            const safe = this._syncStatusEscape(text);
+            const html = '<span class="rwr-sync-status">' + safe + '</span>';
+            const tip = 'Readwise References — ' + String(text || '').trim();
+            if (!this._rwrSyncStatusItem) {
+                this._rwrSyncStatusItem = this.ui.addStatusBarItem({
+                    icon: 'ti-book-2',
+                    htmlLabel: html,
+                    tooltip: tip,
+                });
+            } else {
+                this._rwrSyncStatusItem.setHtmlLabel?.(html);
+                this._rwrSyncStatusItem.setTooltip?.(tip);
+            }
+        } catch (_) {}
+    }
+    _syncStatusHide() {
+        try { this._rwrSyncStatusItem?.remove?.(); } catch (_) {}
+        this._rwrSyncStatusItem = null;
+    }
     _toast(msg) {
         this.ui.addToaster({ title: 'Readwise Ref', message: msg, dismissible: true, autoDestroyTime: 4000 });
     }
