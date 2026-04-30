@@ -2418,6 +2418,16 @@ const TH_SHUFFLER_DAYMAP_SYNC_IDLE_MS = 15000;
 const TH_SHUFFLER_POOL_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const TH_SHUFFLER_POOL_CONCURRENCY = 10;
 
+/** Opt-in: `localStorage.setItem('thymerext_debug_readwise_dupes','1')` → `[ReadwiseRef/DupDiag]` lines for duplicate-collection repro. */
+function rwDupDiagReadwiseEnabled() {
+    try {
+        const o = localStorage.getItem('thymerext_debug_readwise_dupes');
+        return o === '1' || o === 'true' || o === 'on';
+    } catch (_) {
+        return false;
+    }
+}
+
 /** Must match Today's Highlights parser. */
 const READWISE_REF_HIGHLIGHTS_HEADER = '❣️ Highlights...';
 
@@ -2490,23 +2500,52 @@ class Plugin extends AppPlugin {
         this._rwHighlightsColl = null;
     }
 
-    /** On load: create **References** if missing and merge schema (embedded `ThymerReadwiseReferencesColl`). */
+    _rwDupDiagLog(phase, detail) {
+        if (!rwDupDiagReadwiseEnabled()) return;
+        try {
+            let ws = '';
+            try {
+                ws = String(this.data?.getActiveUsers?.()?.[0]?.workspaceGuid || '').slice(0, 10);
+            } catch (_) {}
+            const dt = this.data ? this.data.constructor?.name || 'data' : 'null';
+            console.info('[ReadwiseRef/DupDiag]', phase, { ws, dataType: dt, ...detail });
+        } catch (_) {}
+    }
+
+    /** On load: create **References** if missing and merge schema (embedded `ThymerReadwiseReferencesColl`). Single-flight so overlapping callers share one `ensure`. */
     async _bootstrapReferencesCollectionIfNeeded() {
+        if (this._rwRefsBootstrapPromise) {
+            this._rwDupDiagLog('references_bootstrap_coalesce', { reason: 'in-flight' });
+            try {
+                await this._rwRefsBootstrapPromise;
+            } catch (_) {}
+            return;
+        }
         const api = globalThis.ThymerReadwiseReferencesColl;
         if (!api || typeof api.ensure !== 'function') {
             console.warn('[Readwise Ref] References collection helper missing — redeploy full plugin.js from repo (embed-readwise-refs-coll).');
             return;
         }
+        this._rwDupDiagLog('references_bootstrap_start', {});
+        this._rwRefsBootstrapPromise = (async () => {
+            try {
+                await api.ensure(this.data);
+            } catch (e) {
+                console.warn('[Readwise Ref] References collection setup failed', e);
+            } finally {
+                this._invalidateRwCollectionHandleCache();
+            }
+        })();
         try {
-            await api.ensure(this.data);
-        } catch (e) {
-            console.warn('[Readwise Ref] References collection setup failed', e);
-            return;
+            await this._rwRefsBootstrapPromise;
+        } finally {
+            this._rwRefsBootstrapPromise = null;
         }
-        this._invalidateRwCollectionHandleCache();
     }
 
     async onLoad() {
+        this._rwDupLoadSeq = (this._rwDupLoadSeq | 0) + 1;
+        this._rwDupDiagLog('onLoad_enter', { loadSeq: this._rwDupLoadSeq });
         try {
             await globalThis.ThymerPluginSettings?.upgradeCollectionSchema?.(this.data);
             await globalThis.ThymerPluginSettings?.registerPluginSlug?.(this.data, {
@@ -2596,6 +2635,22 @@ class Plugin extends AppPlugin {
             this._clearFooterDataCaches();
             this._refreshAll();
         }));
+        this._readwiseJfsNotifyBound = () => {
+            /** Suite tab changes do not emit `panel.navigated` — often no `_panelStates` row yet when standalone footers are off. */
+            let activeId = null;
+            try {
+                const p = this.ui.getActivePanel?.() || this.ui.getCurrentPanel?.();
+                if (p?.getId) {
+                    activeId = p.getId();
+                    requestAnimationFrame(() => this._handlePanel(p));
+                }
+            } catch (_) {}
+            for (const [, s] of this._panelStates || []) {
+                const pid = s?.panel?.getId?.();
+                if (s?.panel && pid && pid !== activeId) this._deferHandlePanel(s.panel);
+            }
+        };
+        globalThis.__thymerReadwiseJfsSuiteNotify = this._readwiseJfsNotifyBound;
         try {
             const p0 = this.ui.getActivePanel();
             if (p0) requestAnimationFrame(() => this._handlePanel(p0));
@@ -2604,10 +2659,7 @@ class Plugin extends AppPlugin {
             const p = this.ui.getActivePanel();
             if (p) this._handlePanel(p);
         }, 120);
-        /** Quote pool rebuild touches every References record — only warm when Shuffler is enabled. */
-        setTimeout(() => {
-            if (this._showShufflerPanel()) void this._warmQuotePoolCache();
-        }, 1200);
+        /** Quote pool warms only when the shuffler populates (see `_populateShufflerSection`) — no journal-load scan. */
     }
 
     onUnload() {
@@ -2629,6 +2681,12 @@ class Plugin extends AppPlugin {
             this._shufflerDayMapSyncTimer = null;
         }
         this._syncStatusHide();
+
+        if (globalThis.__thymerReadwiseJfsSuiteNotify === this._readwiseJfsNotifyBound) {
+            try { delete globalThis.__thymerReadwiseJfsSuiteNotify; } catch (_) {
+                globalThis.__thymerReadwiseJfsSuiteNotify = undefined;
+            }
+        }
 
         this._cmdSetToken?.remove();
         this._cmdSync?.remove();
@@ -2655,11 +2713,11 @@ class Plugin extends AppPlugin {
     }
 
     _showHighlightsPanel() {
-        return this._loadBool(TH_KEY_SHOW_HIGHLIGHTS, true);
+        return this._loadBool(TH_KEY_SHOW_HIGHLIGHTS, false);
     }
 
     _showShufflerPanel() {
-        return this._loadBool(TH_KEY_SHOW_SHUFFLER, true);
+        return this._loadBool(TH_KEY_SHOW_SHUFFLER, false);
     }
 
     /**
@@ -2768,14 +2826,13 @@ class Plugin extends AppPlugin {
         const next = !this._showShufflerPanel();
         this._saveBool(TH_KEY_SHOW_SHUFFLER, next);
         this._toast(next ? 'Quote Shuffler panel: on' : 'Quote Shuffler panel: off');
-        if (next) void this._warmQuotePoolCache();
         this._rebuildAllJournalFooters();
     }
 
     async _shuffleQuoteFromCommand() {
         let n = 0;
         for (const [, s] of (this._panelStates || new Map())) {
-            const sec = s.rootEl?.querySelector('[data-panel-section="shuffler"]');
+            const sec = (s.shufflerRootEl || s.rootEl)?.querySelector('[data-panel-section="shuffler"]');
             if (!sec) continue;
             const body = sec.querySelector('[data-role="body"]');
             if (!body || !s.journalDate) continue;
@@ -2794,16 +2851,24 @@ class Plugin extends AppPlugin {
             if (!panelEl) continue;
             const record = panel?.getActiveRecord?.();
             const journalDate = this._journalDateFromRecord(record);
-            if (!this._showHighlightsPanel() && !this._showShufflerPanel()) {
+            const suiteHi =
+                typeof globalThis.__thymerJfsReadwiseGetHighlightsMountEl === 'function'
+                    ? globalThis.__thymerJfsReadwiseGetHighlightsMountEl(s.panelId)
+                    : null;
+            const suiteSh =
+                typeof globalThis.__thymerJfsReadwiseGetShufflerMountEl === 'function'
+                    ? globalThis.__thymerJfsReadwiseGetShufflerMountEl(s.panelId)
+                    : null;
+            if (!suiteHi && !suiteSh && !this._showHighlightsPanel() && !this._showShufflerPanel()) {
                 this._disposePanel(s.panelId);
                 continue;
             }
             if (!journalDate) continue;
             const container = this._findContainer(panelEl);
-            if (!container) continue;
+            if (!container && !suiteHi && !suiteSh) continue;
             s.loaded = false;
             s.expandedSources = new Map();
-            const rebuilt = this._mountFooter(s, container, panelEl);
+            const rebuilt = this._mountFooter(s, panelEl, { suiteHi, suiteSh, container });
             if (rebuilt) s.loading = false;
             this._populate(s);
         }
@@ -3872,14 +3937,23 @@ class Plugin extends AppPlugin {
         }, RWR_PANEL_DEBOUNCE_MS));
     }
 
-    /** Drop stale async footer work when navigation beats slow highlights/shuffler awaits. */
-    _isPopulateStillCurrent(state, seq, targetJournal, targetRoot, targetGuid) {
-        return !!state
-            && state.populateSeq === seq
-            && state.journalDate === targetJournal
-            && state.rootEl === targetRoot
-            && state.recordGuid === targetGuid
-            && !!state.rootEl?.isConnected;
+    /**
+     * Drop stale async footer work when navigation beats slow highlights/shuffler awaits.
+     * @param {HTMLElement|null} targetHiRoot — highlights `.th-journal-footer` (or combined single root)
+     * @param {HTMLElement|null} targetShRoot — shuffler mount root; combined mode uses same as hi root
+     */
+    _isPopulateStillCurrent(state, seq, targetJournal, targetHiRoot, targetShRoot, targetGuid) {
+        if (!state || state.populateSeq !== seq || state.journalDate !== targetJournal || state.recordGuid !== targetGuid) {
+            return false;
+        }
+        if (targetHiRoot) {
+            if (state.rootEl !== targetHiRoot || !state.rootEl?.isConnected) return false;
+        }
+        if (targetShRoot) {
+            const cur = state.shufflerRootEl || state.rootEl;
+            if (cur !== targetShRoot || !cur?.isConnected) return false;
+        }
+        return true;
     }
 
     // =========================================================================
@@ -3900,6 +3974,15 @@ class Plugin extends AppPlugin {
         const panelEl   = panel?.getElement?.();
         if (!panelEl) { this._disposePanel(panelId); return; }
 
+        const suiteHi =
+            typeof globalThis.__thymerJfsReadwiseGetHighlightsMountEl === 'function'
+                ? globalThis.__thymerJfsReadwiseGetHighlightsMountEl(panelId)
+                : null;
+        const suiteSh =
+            typeof globalThis.__thymerJfsReadwiseGetShufflerMountEl === 'function'
+                ? globalThis.__thymerJfsReadwiseGetShufflerMountEl(panelId)
+                : null;
+
         const container = this._findContainer(panelEl);
         if (!container) {
             let state = this._panelStates.get(panelId);
@@ -3910,6 +3993,7 @@ class Plugin extends AppPlugin {
                     recordGuid: null,
                     journalDate: null,
                     rootEl: null,
+                    shufflerRootEl: null,
                     observer: null,
                     loading: false,
                     loaded: false,
@@ -3943,7 +4027,8 @@ class Plugin extends AppPlugin {
         const journalDate = this._journalDateFromRecord(record);
         if (!journalDate) { this._disposePanel(panelId); return; }
 
-        if (!this._showHighlightsPanel() && !this._showShufflerPanel()) {
+        const suiteWantsHighlights = !!suiteHi;
+        if (!suiteWantsHighlights && !this._showHighlightsPanel() && !this._showShufflerPanel()) {
             this._disposePanel(panelId);
             return;
         }
@@ -3986,7 +4071,9 @@ class Plugin extends AppPlugin {
             }
         }
 
-        const rebuilt = this._mountFooter(state, container, panelEl);
+        const mountParent = suiteHi || container;
+        const suiteHighlightsOnly = !!suiteHi;
+        const rebuilt = this._mountFooter(state, mountParent, panelEl, suiteHighlightsOnly);
         if (rebuilt) {
             state.loading = false; // In-flight populate may target a removed root (same as Today's Notes)
             state.expandedSources = new Map();
@@ -4025,13 +4112,63 @@ class Plugin extends AppPlugin {
     // DOM mounting
     // =========================================================================
 
-    // Returns true if the footer was (re)built — caller should re-populate and drop stale async work
-    _mountFooter(state, container, panelEl) {
-        if (state.rootEl && state.rootEl.isConnected && state.rootEl.parentElement === container) {
-            if (!state.observer) {
-                state.observer = this._createFooterObserver(state, panelEl);
+    /** Remove Readwise footer wrappers owned by `panelId` from each parent (suite + page). */
+    _stripThJournalFooters(panelId, parents) {
+        const seen = new Set();
+        for (const par of parents) {
+            if (!par || seen.has(par)) continue;
+            seen.add(par);
+            for (const el of par.querySelectorAll(':scope > .th-journal-footer')) {
+                if (el.dataset?.panelId === panelId) {
+                    try { el.remove(); } catch (_) {}
+                }
             }
-            this._ensureFooterBottom(state, container);
+        }
+    }
+
+    // Returns true if the footer was (re)built — caller should re-populate and drop stale async work
+    _mountFooter(state, panelEl, { suiteHi, suiteSh, container }) {
+        const wantHi = !!suiteHi || this._showHighlightsPanel();
+        const wantSh = !!suiteSh || this._showShufflerPanel();
+        if (!wantHi && !wantSh) return false;
+
+        const hiParent = wantHi ? (suiteHi || container) : null;
+        const shParent = wantSh ? (suiteSh || container) : null;
+        const combined = !!(wantHi && wantSh && hiParent && shParent && hiParent === shParent);
+
+        const parents = [...new Set([container, suiteHi, suiteSh].filter(Boolean))];
+
+        let fast = false;
+        if (combined) {
+            fast = !!(state.rootEl?.isConnected
+                && state.rootEl.parentElement === hiParent
+                && !state.shufflerRootEl
+                && state.rootEl.querySelector('[data-panel-section="highlights"]')
+                && state.rootEl.querySelector('[data-panel-section="shuffler"]')
+                && state.observer);
+        } else if (wantHi && wantSh) {
+            fast = !!(state.rootEl?.isConnected
+                && state.rootEl.parentElement === hiParent
+                && state.shufflerRootEl?.isConnected
+                && state.shufflerRootEl.parentElement === shParent
+                && state.observer);
+        } else if (wantHi && !wantSh) {
+            fast = !!(state.rootEl?.isConnected
+                && state.rootEl.parentElement === hiParent
+                && !state.shufflerRootEl
+                && state.observer);
+        } else if (!wantHi && wantSh) {
+            fast = !!(!state.rootEl
+                && state.shufflerRootEl?.isConnected
+                && state.shufflerRootEl.parentElement === shParent
+                && state.observer);
+        }
+        if (fast) {
+            if (!state.observer) state.observer = this._createFooterObserver(state, panelEl);
+            if (container) {
+                if (state.rootEl?.parentElement === container) this._ensureFooterBottom(state, container);
+                if (state.shufflerRootEl?.parentElement === container) this._ensureFooterBottom(state, container);
+            }
             return false;
         }
 
@@ -4041,37 +4178,77 @@ class Plugin extends AppPlugin {
         }
         try { clearTimeout(state._navTimer); } catch (_) {}
 
-        for (const el of container.querySelectorAll(':scope > .th-journal-footer')) {
-            if (el.dataset?.panelId === state.panelId) { try { el.remove(); } catch (_) {} }
-        }
+        this._stripThJournalFooters(state.panelId, parents);
 
-        state.rootEl = this._buildShell(state);
-        if (state.rootEl) container.appendChild(state.rootEl);
-        this._ensureFooterBottom(state, container);
+        state.rootEl = null;
+        state.shufflerRootEl = null;
+
+        if (combined) {
+            state.rootEl = this._buildShell(state, false);
+            if (state.rootEl) hiParent.appendChild(state.rootEl);
+            this._ensureFooterBottom(state, hiParent);
+        } else {
+            if (wantHi) {
+                let wrap;
+                if (suiteHi) {
+                    wrap = this._buildShell(state, true);
+                } else {
+                    wrap = document.createElement('div');
+                    wrap.className = 'th-journal-footer';
+                    wrap.dataset.panelId = state.panelId;
+                    wrap.appendChild(this._buildHighlightsPanel(state));
+                }
+                if (wrap && wrap.childElementCount) {
+                    hiParent.appendChild(wrap);
+                    state.rootEl = wrap;
+                }
+            }
+            if (wantSh) {
+                const wrapSh = document.createElement('div');
+                wrapSh.className = 'th-journal-footer';
+                wrapSh.dataset.panelId = state.panelId;
+                if (suiteSh) wrapSh.dataset.rwSuiteMount = 'shuffler';
+                wrapSh.appendChild(this._buildShufflerPanel(state));
+                shParent.appendChild(wrapSh);
+                if (!wantHi || hiParent !== shParent) state.shufflerRootEl = wrapSh;
+            }
+        }
 
         state.observer = this._createFooterObserver(state, panelEl);
         return true;
     }
 
     _ensureFooterBottom(state, container) {
-        if (!state?.rootEl || !container) return;
-        if (state.rootEl.parentElement !== container) return;
-        if (container.lastElementChild === state.rootEl) return;
-        container.appendChild(state.rootEl);
+        if (!container) return;
+        if (state?.rootEl?.parentElement === container && state.rootEl.dataset?.rwSuiteMount !== 'highlights') {
+            if (container.lastElementChild !== state.rootEl) container.appendChild(state.rootEl);
+        }
+        if (state?.shufflerRootEl?.parentElement === container) {
+            if (container.lastElementChild !== state.shufflerRootEl) container.appendChild(state.shufflerRootEl);
+        }
     }
 
     _createFooterObserver(state, panelEl) {
         const obs = new MutationObserver(() => {
-            if (state.rootEl && !state.rootEl.isConnected) {
+            const lostHi = state.rootEl && !state.rootEl.isConnected;
+            const lostSh = state.shufflerRootEl && !state.shufflerRootEl.isConnected;
+            if (lostHi || lostSh) {
                 try { clearTimeout(state._navTimer); } catch (_) {}
                 state._navTimer = setTimeout(() => {
-                    if (state.panel && state.rootEl && !state.rootEl.isConnected) {
-                        this._handlePanel(state.panel);
-                    }
+                    const stillLost = (state.rootEl && !state.rootEl.isConnected)
+                        || (state.shufflerRootEl && !state.shufflerRootEl.isConnected);
+                    if (state.panel && stillLost) this._handlePanel(state.panel);
                 }, 300);
             }
             const container = this._findContainer(panelEl);
-            if (container) this._ensureFooterBottom(state, container);
+            if (container) {
+                if (state.rootEl?.parentElement === container && state.rootEl.dataset?.rwSuiteMount !== 'highlights') {
+                    this._ensureFooterBottom(state, container);
+                }
+                if (state.shufflerRootEl?.parentElement === container) {
+                    this._ensureFooterBottom(state, container);
+                }
+            }
         });
         obs.observe(panelEl, { childList: true, subtree: true });
         return obs;
@@ -4088,11 +4265,20 @@ class Plugin extends AppPlugin {
         return null;
     }
 
-    /** Wrapper for one or more journal footer cards (highlights + quote shuffler). */
-    _buildShell(state) {
+    /**
+     * Wrapper for one or more journal footer cards (highlights + quote shuffler).
+     * @param {boolean} suiteHighlightsOnly — Journal Footer Suite: mount only highlights into `.jfs-body`.
+     */
+    _buildShell(state, suiteHighlightsOnly) {
         const root = document.createElement('div');
         root.className       = 'th-journal-footer';
         root.dataset.panelId = state.panelId;
+
+        if (suiteHighlightsOnly) {
+            root.dataset.rwSuiteMount = 'highlights';
+            root.appendChild(this._buildHighlightsPanel(state));
+            return root.childElementCount ? root : null;
+        }
 
         if (this._showHighlightsPanel()) {
             root.appendChild(this._buildHighlightsPanel(state));
@@ -4214,12 +4400,14 @@ class Plugin extends AppPlugin {
         const seq = ++state.populateSeq;
 
         const targetJournal = state.journalDate;
-        const targetRoot    = state.rootEl;
         const targetGuid    = state.recordGuid;
 
         const hiBody  = state.rootEl?.querySelector('[data-panel-section="highlights"] [data-role="body"]');
         const hiCount = state.rootEl?.querySelector('[data-panel-section="highlights"] [data-role="count"]');
-        const shBody  = state.rootEl?.querySelector('[data-panel-section="shuffler"] [data-role="body"]');
+        const shBody  = (state.shufflerRootEl || state.rootEl)?.querySelector('[data-panel-section="shuffler"] [data-role="body"]');
+
+        const targetHiRoot = hiBody ? state.rootEl : null;
+        const targetShRoot = shBody ? (state.shufflerRootEl || state.rootEl) : null;
 
         if (!hiBody && !shBody) {
             state.loaded = true;
@@ -4234,14 +4422,16 @@ class Plugin extends AppPlugin {
         try {
             const jobs = [];
             if (hiBody) {
-                jobs.push(this._populateHighlightsSection(state, hiBody, hiCount, targetJournal, targetRoot, targetGuid, seq));
+                jobs.push(this._populateHighlightsSection(
+                    state, hiBody, hiCount, targetJournal, targetHiRoot, targetShRoot, targetGuid, seq));
             }
             if (shBody) {
-                jobs.push(this._populateShufflerSection(state, shBody, targetJournal, targetRoot, targetGuid, seq));
+                jobs.push(this._populateShufflerSection(
+                    state, shBody, targetJournal, targetHiRoot, targetShRoot, targetGuid, seq));
             }
             await Promise.all(jobs);
 
-            if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetRoot, targetGuid)) {
+            if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetHiRoot, targetShRoot, targetGuid)) {
                 state.loading = false;
                 this._flushPendingPopulate(state);
                 return;
@@ -4250,7 +4440,7 @@ class Plugin extends AppPlugin {
             state.loaded = true;
         } catch (e) {
             console.error('[ReadwiseRef|TH]', e);
-            if (this._isPopulateStillCurrent(state, seq, targetJournal, targetRoot, targetGuid)) {
+            if (this._isPopulateStillCurrent(state, seq, targetJournal, targetHiRoot, targetShRoot, targetGuid)) {
                 if (hiBody) {
                     hiBody.innerHTML = '<div class="th-empty">Error loading highlights.</div>';
                 }
@@ -4264,14 +4454,14 @@ class Plugin extends AppPlugin {
         this._flushPendingPopulate(state);
     }
 
-    async _populateHighlightsSection(state, bodyEl, countEl, targetJournal, targetRoot, targetGuid, seq) {
+    async _populateHighlightsSection(state, bodyEl, countEl, targetJournal, targetHiRoot, targetShRoot, targetGuid, seq) {
         const reportHi = (msg) => {
-            if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetRoot, targetGuid)) return;
+            if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetHiRoot, targetShRoot, targetGuid)) return;
             const el = bodyEl.querySelector('.th-loading');
             if (el) el.textContent = msg;
         };
         const highlights = await this._getHighlightsForDate(targetJournal, reportHi);
-        if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetRoot, targetGuid)) return;
+        if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetHiRoot, targetShRoot, targetGuid)) return;
 
         bodyEl.innerHTML = '';
 
@@ -4294,14 +4484,14 @@ class Plugin extends AppPlugin {
         }
     }
 
-    async _populateShufflerSection(state, shBody, targetJournal, targetRoot, targetGuid, seq) {
+    async _populateShufflerSection(state, shBody, targetJournal, targetHiRoot, targetShRoot, targetGuid, seq) {
         const reportPool = (msg) => {
-            if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetRoot, targetGuid)) return;
+            if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetHiRoot, targetShRoot, targetGuid)) return;
             const el = shBody.querySelector('.th-loading');
             if (el) el.textContent = msg;
         };
         await this._warmQuotePoolCache(reportPool);
-        if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetRoot, targetGuid)) return;
+        if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetHiRoot, targetShRoot, targetGuid)) return;
         const pool = Array.isArray(this._quotePoolCache) ? this._quotePoolCache : [];
         const saved = this._loadDayShufflePick(targetJournal);
         if (saved && saved.guid && String(saved.text || '').trim()) {
@@ -4315,7 +4505,7 @@ class Plugin extends AppPlugin {
         } else {
             this._renderShufflerIdle(state, shBody, targetJournal);
         }
-        if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetRoot, targetGuid)) return;
+        if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetHiRoot, targetShRoot, targetGuid)) return;
     }
 
     _getShufflerDayMap() {
@@ -4490,7 +4680,7 @@ class Plugin extends AppPlugin {
             return;
         }
 
-        if (!state.rootEl?.isConnected) return;
+        if (!(state.shufflerRootEl || state.rootEl)?.isConnected) return;
 
         if (!pool.length) {
             bodyEl.innerHTML = '<div class="th-empty">No highlights in References yet.</div>';
@@ -5322,6 +5512,40 @@ class Plugin extends AppPlugin {
             }
             .th-journal-footer > .th-footer {
                 margin-top: 0;
+            }
+
+            /* Journal Footer Suite — one glass shell; highlights list only (no second title card). */
+            .th-journal-footer[data-rw-suite-mount="highlights"] {
+                margin-top: 0;
+                gap: 0;
+            }
+            .th-journal-footer[data-rw-suite-mount="highlights"] > .th-footer--highlights {
+                margin-top: 0;
+                padding: 0;
+                background: transparent !important;
+                border: none !important;
+                box-shadow: none !important;
+                border-radius: 0;
+            }
+            .th-journal-footer[data-rw-suite-mount="highlights"] .th-footer--highlights > .th-header {
+                display: none !important;
+            }
+            .th-journal-footer[data-rw-suite-mount="highlights"] .th-footer--highlights > .th-body {
+                display: block !important;
+                padding-bottom: 2px;
+            }
+
+            /* Journal Footer Suite — shuffler in dock / detached host (glass chrome stays in JFS header). */
+            .th-journal-footer[data-rw-suite-mount="shuffler"] {
+                margin-top: 0;
+            }
+            .th-journal-footer[data-rw-suite-mount="shuffler"] > .th-footer--shuffler {
+                margin-top: 0;
+                padding: 4px 2px 6px;
+                background: transparent !important;
+                border: none !important;
+                box-shadow: none !important;
+                border-radius: 0;
             }
 
             /* ── Outer card — matches Backreferences / Today's Notes ── */
