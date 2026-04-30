@@ -2635,8 +2635,26 @@ class Plugin extends AppPlugin {
             this._clearFooterDataCaches();
             this._refreshAll();
         }));
-        this._readwiseJfsNotifyBound = () => {
-            /** Suite tab changes do not emit `panel.navigated` — often no `_panelStates` row yet when standalone footers are off. */
+        /**
+         * Journal Footer Suite calls with `{ panels: Panel[] }` so every journal view that has a
+         * mounted shell is refreshed — `getActivePanel()` is often not that panel during load/split UI.
+         * Callers with no args keep the legacy active-panel + cached `_panelStates` path.
+         */
+        this._readwiseJfsNotifyBound = (opts) => {
+            const fromSuite = opts && Array.isArray(opts.panels) ? opts.panels.filter(Boolean) : null;
+            const seen = new Set();
+            const kick = (panel) => {
+                const id = panel?.getId?.();
+                if (!id || seen.has(id)) return;
+                seen.add(id);
+                this._deferHandlePanel(panel);
+            };
+            if (fromSuite && fromSuite.length) {
+                requestAnimationFrame(() => {
+                    for (const p of fromSuite) kick(p);
+                });
+                return;
+            }
             let activeId = null;
             try {
                 const p = this.ui.getActivePanel?.() || this.ui.getCurrentPanel?.();
@@ -2647,7 +2665,7 @@ class Plugin extends AppPlugin {
             } catch (_) {}
             for (const [, s] of this._panelStates || []) {
                 const pid = s?.panel?.getId?.();
-                if (s?.panel && pid && pid !== activeId) this._deferHandlePanel(s.panel);
+                if (s?.panel && pid && pid !== activeId) kick(s.panel);
             }
         };
         globalThis.__thymerReadwiseJfsSuiteNotify = this._readwiseJfsNotifyBound;
@@ -4027,8 +4045,7 @@ class Plugin extends AppPlugin {
         const journalDate = this._journalDateFromRecord(record);
         if (!journalDate) { this._disposePanel(panelId); return; }
 
-        const suiteWantsHighlights = !!suiteHi;
-        if (!suiteWantsHighlights && !this._showHighlightsPanel() && !this._showShufflerPanel()) {
+        if (!suiteHi && !suiteSh && !this._showHighlightsPanel() && !this._showShufflerPanel()) {
             this._disposePanel(panelId);
             return;
         }
@@ -4047,10 +4064,11 @@ class Plugin extends AppPlugin {
                 panel,
                 recordGuid: record.guid,
                 journalDate,
-                rootEl:   null,
+                rootEl: null,
+                shufflerRootEl: null,
                 observer: null,
-                loading:  false,
-                loaded:   false,
+                loading: false,
+                loaded: false,
                 populateSeq: 0,
                 _pendingPopulate: false,
                 expandedSources: new Map(),
@@ -4071,9 +4089,7 @@ class Plugin extends AppPlugin {
             }
         }
 
-        const mountParent = suiteHi || container;
-        const suiteHighlightsOnly = !!suiteHi;
-        const rebuilt = this._mountFooter(state, mountParent, panelEl, suiteHighlightsOnly);
+        const rebuilt = this._mountFooter(state, panelEl, { suiteHi, suiteSh, container });
         if (rebuilt) {
             state.loading = false; // In-flight populate may target a removed root (same as Today's Notes)
             state.expandedSources = new Map();
@@ -4097,7 +4113,8 @@ class Plugin extends AppPlugin {
         try { s.observer?.disconnect(); } catch (_) {}
         try { s._containerWatcher?.disconnect(); } catch (_) {}
         try { clearTimeout(s._navTimer); } catch (_) {}
-        try { s.rootEl?.remove(); }       catch (_) {}
+        try { s.rootEl?.remove(); } catch (_) {}
+        try { s.shufflerRootEl?.remove(); } catch (_) {}
         this._panelStates.delete(panelId);
     }
 
