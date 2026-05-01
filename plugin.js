@@ -4355,6 +4355,49 @@ class Plugin extends AppPlugin {
         return root;
     }
 
+    /** Collapse/expand chrome + body for `.th-shuffler-shell` (Quote Shuffler). */
+    _syncShufflerShellLayout(shufflerRoot) {
+        if (!shufflerRoot?.classList?.contains?.('th-shuffler-shell')) return;
+        const c = !!this._shufflerCollapsed;
+        shufflerRoot.classList.toggle('th-shuffler-is-collapsed', c);
+        const toggle = shufflerRoot.querySelector('.th-shuffler-chrome .th-toggle');
+        const bodyEl = shufflerRoot.querySelector('.th-shuffler-body');
+        if (toggle) toggle.textContent = c ? '+' : '−';
+        if (bodyEl) bodyEl.style.display = c ? 'none' : 'block';
+    }
+
+    /** Hover-reveal collapse control (matches journal-header-suite random-memory row). */
+    _appendShufflerCollapseMini(leftContentEl, bodyEl) {
+        const topActions = document.createElement('div');
+        topActions.className = 'th-shuffler-top-actions';
+        const collapseMiniBtn = document.createElement('button');
+        collapseMiniBtn.type = 'button';
+        collapseMiniBtn.className = 'th-shuffler-collapse-mini button-none';
+        const inSuite = !!bodyEl.closest('[data-rw-suite-mount="shuffler"]');
+        collapseMiniBtn.title = inSuite
+            ? 'Hide Quote Shuffler (same as footer header quote icon)'
+            : 'Collapse Quote Shuffler';
+        collapseMiniBtn.innerHTML = '<i class="ti ti-chevron-up" aria-hidden="true"></i>';
+        collapseMiniBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (inSuite && typeof globalThis.__thymerJfsCloseQuoteShufflerDock === 'function') {
+                globalThis.__thymerJfsCloseQuoteShufflerDock();
+                return;
+            }
+            const shell = bodyEl.closest('.th-shuffler-shell');
+            if (!shell) return;
+            this._shufflerCollapsed = true;
+            this._saveBool(TH_KEY_SHUFFLER_COLLAPSED, true);
+            this._syncShufflerShellLayout(shell);
+        });
+        const hoverZone = document.createElement('div');
+        hoverZone.className = 'th-shuffler-quote-hover-zone';
+        hoverZone.appendChild(collapseMiniBtn);
+        hoverZone.appendChild(leftContentEl);
+        topActions.appendChild(hoverZone);
+        return topActions;
+    }
+
     _buildShufflerPanel(state) {
         const root = document.createElement('div');
         root.className            = 'th-footer th-footer--shuffler th-shuffler-shell';
@@ -4387,19 +4430,12 @@ class Plugin extends AppPlugin {
         body.className = 'th-body th-shuffler-body';
         body.style.display = this._shufflerCollapsed ? 'none' : 'block';
 
-        const syncLayout = () => {
-            const c = !!this._shufflerCollapsed;
-            root.classList.toggle('th-shuffler-is-collapsed', c);
-            toggle.textContent = c ? '+' : '−';
-            body.style.display = c ? 'none' : 'block';
-        };
-
         toggle.addEventListener('click', () => {
             this._shufflerCollapsed = !this._shufflerCollapsed;
             this._saveBool(TH_KEY_SHUFFLER_COLLAPSED, this._shufflerCollapsed);
-            syncLayout();
+            this._syncShufflerShellLayout(root);
         });
-        syncLayout();
+        this._syncShufflerShellLayout(root);
 
         root.appendChild(chrome);
         root.appendChild(body);
@@ -4679,7 +4715,7 @@ class Plugin extends AppPlugin {
         cap.className = 'th-shuffler-idle-caption';
         cap.textContent = 'Draw a quote for this day';
 
-        idle.appendChild(iconBtn);
+        idle.appendChild(this._appendShufflerCollapseMini(iconBtn, bodyEl));
         idle.appendChild(cap);
         bodyEl.appendChild(idle);
     }
@@ -4737,7 +4773,9 @@ class Plugin extends AppPlugin {
         quoteEl.className = 'th-shuffler-quote-display';
         quoteEl.textContent = picked.text || '';
 
-        body.appendChild(markWrap);
+        const markRow = this._appendShufflerCollapseMini(markWrap, bodyEl);
+        markRow.classList.add('th-shuffler-quote-mark-row');
+        body.appendChild(markRow);
         body.appendChild(quoteEl);
 
         const hasMeta = (picked.source_title && String(picked.source_title).trim())
@@ -5757,12 +5795,9 @@ class Plugin extends AppPlugin {
             .th-shuffler-shell:not(.th-shuffler-is-collapsed) .th-shuffler-chrome .th-shuffler-panel-title {
                 display: none !important;
             }
+            /* Expanded: collapse via hover chevron beside quote icon (see .th-shuffler-top-actions), not a floating −. */
             .th-shuffler-shell:not(.th-shuffler-is-collapsed) .th-shuffler-chrome .th-toggle {
-                position: absolute;
-                left: 10px;
-                top: 8px;
-                z-index: 4;
-                margin: 0;
+                display: none !important;
             }
             .th-shuffler-shell.th-shuffler-is-collapsed .th-shuffler-chrome .th-toggle {
                 position: static;
@@ -5772,7 +5807,7 @@ class Plugin extends AppPlugin {
             }
             .th-shuffler-body {
                 text-align: center;
-                padding: 28px 8px 6px;
+                padding: 12px 8px 6px;
             }
             .th-shuffler-shell.th-shuffler-is-collapsed .th-shuffler-body {
                 padding-top: 0;
@@ -5818,6 +5853,71 @@ class Plugin extends AppPlugin {
             }
             .th-shuffler-draw-btn:hover {
                 opacity: 0.92;
+            }
+
+            /* Quote glyph centered in panel; chevron sits just left (off-axis). Hover only on icon band (+ slim bridge to chevron). */
+            .th-shuffler-top-actions {
+                width: 100%;
+                margin: 0 auto;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+            }
+            .th-shuffler-quote-hover-zone {
+                position: relative;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                padding: 2px 4px;
+            }
+            /* Invisible strip so moving pointer toward the chevron does not drop :hover before click */
+            .th-shuffler-quote-hover-zone::before {
+                content: '';
+                position: absolute;
+                right: 100%;
+                width: 20px;
+                top: 0;
+                bottom: 0;
+            }
+            .th-shuffler-collapse-mini {
+                position: absolute;
+                right: 100%;
+                margin-right: 5px;
+                top: 50%;
+                transform: translateY(-50%);
+                opacity: 0;
+                pointer-events: none;
+                transition: opacity 0.12s ease;
+                color: #8a7e6a;
+                cursor: pointer;
+                border: none;
+                background: transparent;
+                width: 18px;
+                height: 18px;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                padding: 0;
+                font-size: 10px;
+                line-height: 1;
+            }
+            .th-shuffler-collapse-mini .ti {
+                font-size: 14px;
+                line-height: 1;
+            }
+            .th-shuffler-quote-hover-zone:hover .th-shuffler-collapse-mini,
+            .th-shuffler-quote-hover-zone:focus-within .th-shuffler-collapse-mini {
+                opacity: 1;
+                pointer-events: auto;
+            }
+            .th-shuffler-collapse-mini:hover {
+                color: #e8e0d0;
+            }
+            .th-shuffler-quote-mark-row {
+                margin-bottom: 12px;
+            }
+            .th-shuffler-quote-mark-row .th-shuffler-quote-mark {
+                margin: 0;
             }
 
             /* Drawn quote: same surface as idle — no inner bordered card */
