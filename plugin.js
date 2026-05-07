@@ -1117,6 +1117,28 @@
 
   const PB_LOCK_NAME = 'thymer-ext-plugin-backend-ensure-v1';
   const DATA_ENSURE_P = '__thymerExtDataPluginBackendEnsureP';
+  /** Per-workspace: Plugin Backend already ensured — skip repeat bodies (avoids getAllCollections / lock storms). */
+  const WS_ENSURE_OK_MAP = '__thymerExtPbWorkspaceEnsureOkMap_v1';
+
+  function markWorkspacePluginBackendEnsureDone(data) {
+    try {
+      const slug = workspaceSlugFromData(data);
+      const h = getSharedDeduplicationWindow();
+      if (!h[WS_ENSURE_OK_MAP] || typeof h[WS_ENSURE_OK_MAP] !== 'object') h[WS_ENSURE_OK_MAP] = Object.create(null);
+      h[WS_ENSURE_OK_MAP][slug] = true;
+    } catch (_) {}
+  }
+
+  function isWorkspacePluginBackendEnsureDone(data) {
+    try {
+      const slug = workspaceSlugFromData(data);
+      const h = getSharedDeduplicationWindow();
+      const m = h[WS_ENSURE_OK_MAP];
+      return !!(m && m[slug]);
+    } catch (_) {
+      return false;
+    }
+  }
 
   function dlogPathB(phase, extra) {
     if (!DEBUG_COLLECTIONS) return;
@@ -1191,22 +1213,46 @@
   }
 
   async function runPluginBackendEnsureBody(data) {
+    if (data && isWorkspacePluginBackendEnsureDone(data)) return;
     if (DEBUG_COLLECTIONS) {
       dlogPathB('ensureBody_start', { pathB: pathBWindowSnapshot() });
       try {
         if (data && data.getAllCollections) {
           const a = await data.getAllCollections();
-          const collNames = (Array.isArray(a) ? a : []).map((c) => {
+          const list = Array.isArray(a) ? a : [];
+          const collNames = list.map((c) => {
             try { return String(collectionDisplayName(c) || '').trim() || '(no-name)'; } catch (__) { return '(err)'; }
           });
           dlogPathB('ensureBody_collections', { count: (collNames && collNames.length) || 0, names: (collNames || []).slice(0, 40) });
           if (data && data.getAllCollections) touchGetAllSanityFromCount((collNames && collNames.length) || 0);
+          const dupExact = list.filter((c) => {
+            try {
+              const nm = collectionDisplayName(c);
+              return nm === COL_NAME || nm === COL_NAME_LEGACY;
+            } catch (__) {
+              return false;
+            }
+          });
+          if (dupExact.length > 1) {
+            dlogPathB('duplicate_plugin_backend_named_collections', {
+              count: dupExact.length,
+              guids: dupExact.map((c) => {
+                try {
+                  return c.getGuid?.() || null;
+                } catch (__) {
+                  return null;
+                }
+              }),
+              doc: 'docs/PLUGIN_BACKEND_DUPLICATE_HYGIENE.md',
+            });
+          }
         }
       } catch (e) {
         dlogPathB('ensureBody_getAll_failed', { err: String((e && e.message) || e) });
       }
     }
     try {
+      const markPbOk = () => markWorkspacePluginBackendEnsureDone(data);
       let existing = null;
       for (let attempt = 0; attempt < 4; attempt++) {
         let allAttempt;
@@ -1217,12 +1263,24 @@
         }
         if (allAttempt != null) {
           existing = pickCollFromAll(allAttempt);
-          if (existing) return;
-          if (hasPluginBackendInAll(allAttempt)) return;
+          if (existing) {
+            markPbOk();
+            return;
+          }
+          if (hasPluginBackendInAll(allAttempt)) {
+            markPbOk();
+            return;
+          }
         } else {
           existing = await findColl(data);
-          if (existing) return;
-          if (await hasPluginBackendOnWorkspace(data)) return;
+          if (existing) {
+            markPbOk();
+            return;
+          }
+          if (await hasPluginBackendOnWorkspace(data)) {
+            markPbOk();
+            return;
+          }
         }
         if (attempt < 3) await new Promise((r) => setTimeout(r, 50 + attempt * 50));
       }
@@ -1234,12 +1292,24 @@
       }
       if (allPost != null) {
         existing = pickCollFromAll(allPost);
-        if (existing) return;
-        if (hasPluginBackendInAll(allPost)) return;
+        if (existing) {
+          markPbOk();
+          return;
+        }
+        if (hasPluginBackendInAll(allPost)) {
+          markPbOk();
+          return;
+        }
       } else {
         existing = await findColl(data);
-        if (existing) return;
-        if (await hasPluginBackendOnWorkspace(data)) return;
+        if (existing) {
+          markPbOk();
+          return;
+        }
+        if (await hasPluginBackendOnWorkspace(data)) {
+          markPbOk();
+          return;
+        }
       }
       await new Promise((r) => setTimeout(r, 120));
       let allAfterWait;
@@ -1249,11 +1319,23 @@
         allAfterWait = null;
       }
       if (allAfterWait != null) {
-        if (pickCollFromAll(allAfterWait)) return;
-        if (hasPluginBackendInAll(allAfterWait)) return;
+        if (pickCollFromAll(allAfterWait)) {
+          markPbOk();
+          return;
+        }
+        if (hasPluginBackendInAll(allAfterWait)) {
+          markPbOk();
+          return;
+        }
       } else {
-        if (await findColl(data)) return;
-        if (await hasPluginBackendOnWorkspace(data)) return;
+        if (await findColl(data)) {
+          markPbOk();
+          return;
+        }
+        if (await hasPluginBackendOnWorkspace(data)) {
+          markPbOk();
+          return;
+        }
       }
       let preCreateLen = 0;
       try {
@@ -1278,11 +1360,23 @@
             allPre = null;
           }
           if (allPre != null) {
-            if (pickCollFromAll(allPre)) return;
-            if (hasPluginBackendInAll(allPre)) return;
+            if (pickCollFromAll(allPre)) {
+              markPbOk();
+              return;
+            }
+            if (hasPluginBackendInAll(allPre)) {
+              markPbOk();
+              return;
+            }
           } else {
-            if (await findColl(data)) return;
-            if (await hasPluginBackendOnWorkspace(data)) return;
+            if (await findColl(data)) {
+              markPbOk();
+              return;
+            }
+            if (await hasPluginBackendOnWorkspace(data)) {
+              markPbOk();
+              return;
+            }
           }
         }
         if (isSuspiciousEmptyAfterRecentNonEmptyList(preCreateLen) && preCreateLen === 0) {
@@ -1310,11 +1404,23 @@
           allLease = null;
         }
         if (allLease != null) {
-          if (pickCollFromAll(allLease)) return;
-          if (hasPluginBackendInAll(allLease)) return;
+          if (pickCollFromAll(allLease)) {
+            markPbOk();
+            return;
+          }
+          if (hasPluginBackendInAll(allLease)) {
+            markPbOk();
+            return;
+          }
         } else {
-          if (await findColl(data)) return;
-          if (await hasPluginBackendOnWorkspace(data)) return;
+          if (await findColl(data)) {
+            markPbOk();
+            return;
+          }
+          if (await hasPluginBackendOnWorkspace(data)) {
+            markPbOk();
+            return;
+          }
         }
         const recentAttemptAge = getRecentPluginBackendCreateAttemptAgeMs(data);
         if (recentAttemptAge != null && recentAttemptAge >= 0 && recentAttemptAge < 120000) {
@@ -1328,11 +1434,23 @@
               allCont = null;
             }
             if (allCont != null) {
-              if (pickCollFromAll(allCont)) return;
-              if (hasPluginBackendInAll(allCont)) return;
+              if (pickCollFromAll(allCont)) {
+                markPbOk();
+                return;
+              }
+              if (hasPluginBackendInAll(allCont)) {
+                markPbOk();
+                return;
+              }
             } else {
-              if (await findColl(data)) return;
-              if (await hasPluginBackendOnWorkspace(data)) return;
+              if (await findColl(data)) {
+                markPbOk();
+                return;
+              }
+              if (await hasPluginBackendOnWorkspace(data)) {
+                markPbOk();
+                return;
+              }
             }
           }
           return;
@@ -1349,11 +1467,23 @@
               allSettle = null;
             }
             if (allSettle != null) {
-              if (pickCollFromAll(allSettle)) return;
-              if (hasPluginBackendInAll(allSettle)) return;
+              if (pickCollFromAll(allSettle)) {
+                markPbOk();
+                return;
+              }
+              if (hasPluginBackendInAll(allSettle)) {
+                markPbOk();
+                return;
+              }
             } else {
-              if (await findColl(data)) return;
-              if (await hasPluginBackendOnWorkspace(data)) return;
+              if (await findColl(data)) {
+                markPbOk();
+                return;
+              }
+              if (await hasPluginBackendOnWorkspace(data)) {
+                markPbOk();
+                return;
+              }
             }
           }
         }
@@ -1363,6 +1493,7 @@
           if (DEBUG_COLLECTIONS) {
             dlogPathB('abort_create_exact_backend_name_exists', { exactN, ws: workspaceSlugFromData(data) });
           }
+          markPbOk();
           return;
         }
         const coll = await queueDataCreateOnSharedWindow(() => data.createCollection());
@@ -1380,6 +1511,7 @@
         }
         if (ok === false) return;
         noteRecentPluginBackendCreate(data);
+        markPbOk();
         await new Promise((r) => setTimeout(r, 250));
       } finally {
         try {
@@ -1405,6 +1537,12 @@
   }
 
   function ensurePluginSettingsCollection(data) {
+    if (!data || typeof data.getAllCollections !== 'function' || typeof data.createCollection !== 'function') {
+      return Promise.resolve();
+    }
+    if (isWorkspacePluginBackendEnsureDone(data)) {
+      return Promise.resolve();
+    }
     if (DEBUG_COLLECTIONS) {
       let dHint = 'no-data';
       try {
@@ -1418,9 +1556,6 @@
         dHint = 'err';
       }
       dlogPathB('ensurePluginSettingsCollection', { dataHint: dHint, dataExpand: (() => { try { if (!data) return { ok: false }; return { hasDataEnsure: !!data[DATA_ENSURE_P] }; } catch (_) { return { ok: 'throw' }; } })(), pathB: pathBWindowSnapshot() });
-    }
-    if (!data || typeof data.getAllCollections !== 'function' || typeof data.createCollection !== 'function') {
-      return Promise.resolve();
     }
     try {
       if (!data[DATA_ENSURE_P] || typeof data[DATA_ENSURE_P].then !== 'function') {
@@ -1814,7 +1949,14 @@
  *   ThymerReadwiseReferencesColl.ensure(data) — create if missing + merge schema; returns collection or null
  */
 (function readwiseRefsCollRuntime(g) {
-  if (g.ThymerReadwiseReferencesColl) return;
+  /**
+   * Bump when REFERENCES_SHAPE changes. Without this, `if (ThymerReadwiseReferencesColl) return` kept an
+   * old embedded runtime on globalThis after in-app plugin saves (new plugin.js never re-ran the IIFE).
+   */
+  const THYMER_READWISE_REFS_COLL_SCHEMA_VER = 6;
+  if (g.ThymerReadwiseReferencesColl && g.ThymerReadwiseReferencesColl.SCHEMA_VER === THYMER_READWISE_REFS_COLL_SCHEMA_VER) {
+    return;
+  }
 
   const COL_NAME = 'References';
   const MANAGED_UNLOCK = { fields: false, views: false, sidebar: false };
@@ -1823,8 +1965,9 @@
     try {
       const o = localStorage.getItem('thymerext_debug_collections');
       if (o === '0' || o === 'off' || o === 'false') return false;
+      return o === '1' || o === 'true' || o === 'on';
     } catch (_) {}
-    return true;
+    return false;
   })();
   const DEBUG_REFS_ID = 'rr-' + (Date.now() & 0xffffffff).toString(16) + '-' + Math.random().toString(36).slice(2, 7);
 
@@ -1927,6 +2070,41 @@
   }
 
   /**
+   * Readwise `category` → Thymer choice ids (`prop.setChoice(id)`).
+   * Three choices only — see plugin `_normalizeReadwiseCategoryChoiceId`.
+   */
+  const READWISE_SOURCE_CATEGORY_CHOICES = [
+    { id: 'books', label: 'Books', color: '1', active: true },
+    { id: 'articles', label: 'Articles', color: '2', active: true },
+    { id: 'podcasts', label: 'Podcasts', color: '3', active: true },
+    { id: 'video', label: 'Video', color: '4', active: true },
+  ];
+
+  const READWISE_SOURCE_ORIGIN_CHOICES = [
+    { id: 'reader', label: 'Reader', color: '1', active: true },
+    { id: 'reader_mobile', label: 'Reader | mobile', color: '1', active: true },
+    { id: 'reader_web', label: 'Reader | web', color: '1', active: true },
+    { id: 'reader_rss', label: 'Reader | RSS', color: '1', active: true },
+    { id: 'reader_share_sheet', label: 'Reader | share sheet', color: '1', active: true },
+    { id: 'reader_in_app_save', label: 'Reader | in-app save', color: '1', active: true },
+    { id: 'reader_import_url', label: 'Reader | add (URL)', color: '1', active: true },
+    { id: 'reader_clipboard', label: 'Reader | add (clipboard)', color: '1', active: true },
+    { id: 'readwise_web_highlighter', label: 'Readwise | web highlighter', color: '2', active: true },
+    { id: 'readwise_onboarding', label: 'Readwise | onboarding', color: '2', active: true },
+    { id: 'kindle', label: 'Kindle', color: '3', active: true },
+    { id: 'upload', label: 'Upload | file', color: '4', active: true },
+    { id: 'pdf_upload', label: 'PDF upload', color: '4', active: true },
+    { id: 'snipd', label: 'Snipd', color: '5', active: true },
+    { id: 'instapaper', label: 'Instapaper', color: '6', active: true },
+    { id: 'raindrop', label: 'Raindrop', color: '6', active: true },
+    { id: 'api_article', label: 'API article', color: '7', active: true },
+    { id: 'manual', label: 'Manual', color: '0', active: true },
+    { id: 'supplemental', label: 'Supplemental', color: '0', active: true },
+    { id: 'unknown', label: 'Unknown', color: '0', active: true },
+    { id: 'other', label: 'Other', color: '0', active: true },
+  ];
+
+  /**
    * Canonical shape — keep in sync with `ThymerReadwiseSyncwithDailyFooter/References.json`.
    * `filter_colguid` on `source_author` is workspace-specific; omitted so auto-create works in any workspace.
    */
@@ -1941,13 +2119,15 @@
       'source_title',
       'source_author',
       'source_url',
+      'source_category',
+      'source_origin',
       'highlight_count',
       'captured_at',
       'synced_at',
       'banner',
     ],
     item_name: 'Reference',
-    description: 'Books, articles, and other sources from Readwise (Option B: highlights in body)',
+    description: 'Books, articles, and podcasts from Readwise (Option B: highlights in body)',
     show_sidebar_items: true,
     show_cmdpal_items: true,
     fields: [
@@ -1964,6 +2144,26 @@
         target_collection_id: 'People',
       },
       { icon: 'ti-link', id: 'source_url', label: 'URL', type: 'url', read_only: true },
+      {
+        icon: 'ti-category',
+        id: 'source_category',
+        label: 'Category',
+        type: 'choice',
+        read_only: true,
+        active: true,
+        many: false,
+        choices: READWISE_SOURCE_CATEGORY_CHOICES.map((c) => cloneFieldDef(c)),
+      },
+      {
+        icon: 'ti-cloud-download',
+        id: 'source_origin',
+        label: 'Source',
+        type: 'choice',
+        read_only: true,
+        active: true,
+        many: false,
+        choices: READWISE_SOURCE_ORIGIN_CHOICES.map((c) => cloneFieldDef(c)),
+      },
       { icon: 'ti-quote', id: 'highlight_count', label: 'Highlight Count', type: 'number', read_only: true },
       { icon: 'ti-calendar-event', id: 'captured_at', label: 'Captured', type: 'datetime', read_only: true },
       { icon: 'ti-clock-plus', id: 'synced_at', label: 'Synced', type: 'datetime', read_only: true },
@@ -2032,6 +2232,8 @@
           'source_title',
           'source_author',
           'source_url',
+          'source_category',
+          'source_origin',
           'highlight_count',
           'captured_at',
           'synced_at',
@@ -2103,36 +2305,57 @@
     return named || cands[0];
   }
 
-  async function findReferencesColl(data) {
-    if (!data || typeof data.getAllCollections !== 'function') return null;
-    try {
-      const pick = (all) => {
-        const list = Array.isArray(all) ? all : [];
-        return list.find((c) => collectionDisplayName(c) === COL_NAME) || null;
-      };
-      const all = await data.getAllCollections();
-      return pick(all) || pickRefsHeuristic(all) || null;
-    } catch (_) {
-      return null;
+  /** Same “has References” rule as `snapshotReferencesState`, on an existing list (no I/O). */
+  function hasReferencesOnWorkspaceSyncList(list) {
+    const arr = Array.isArray(list) ? list : [];
+    if (arr.length === 0) return false;
+    for (const c of arr) {
+      if (collectionDisplayName(c) === COL_NAME) return true;
     }
+    return !!pickRefsHeuristic(arr);
+  }
+
+  /** One `getAllCollections` — replaces paired `findReferencesColl` + `hasReferencesOnWorkspace` (was 2× per check). */
+  async function snapshotReferencesState(data) {
+    if (!data || typeof data.getAllCollections !== 'function') return { coll: null, has: false, len: 0 };
+    try {
+      const all = await data.getAllCollections();
+      const list = Array.isArray(all) ? all : [];
+      const coll = list.find((c) => collectionDisplayName(c) === COL_NAME) || pickRefsHeuristic(list) || null;
+      let has = false;
+      for (const c of list) {
+        if (collectionDisplayName(c) === COL_NAME) {
+          has = true;
+          break;
+        }
+      }
+      if (!has) has = !!pickRefsHeuristic(list);
+      return { coll, has, len: list.length };
+    } catch (_) {
+      return { coll: null, has: false, len: 0 };
+    }
+  }
+
+  async function findReferencesColl(data) {
+    return (await snapshotReferencesState(data)).coll;
   }
 
   async function hasReferencesOnWorkspace(data) {
-    let all;
-    try {
-      all = await data.getAllCollections();
-    } catch (_) {
-      return false;
-    }
-    if (!Array.isArray(all) || all.length === 0) return false;
-    for (const c of all) {
-      if (collectionDisplayName(c) === COL_NAME) return true;
-    }
-    return !!pickRefsHeuristic(all);
+    return (await snapshotReferencesState(data)).has;
   }
 
+  async function yieldMainForPaint() {
+    await new Promise((r) => {
+      try {
+        requestAnimationFrame(() => setTimeout(r, 0));
+      } catch (_) {
+        setTimeout(r, 0);
+      }
+    });
+  }
+
+  /** When `collOpt` is null, `ensure()` must have run `ensureReferencesCollection` first — nesting ensure here caused a second create (stale `getAllCollections`). */
   async function upgradeReferencesSchema(data, collOpt) {
-    await ensureReferencesCollection(data);
     const coll = collOpt || (await findReferencesColl(data));
     if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') return;
     try {
@@ -2151,10 +2374,22 @@
       const curIds = new Set(curFields.map((f) => (f && f.id ? f.id : null)).filter(Boolean));
       let changed = false;
       for (const f of desired.fields) {
-        if (!f || !f.id || curIds.has(f.id)) continue;
-        curFields.push(cloneFieldDef(f));
-        curIds.add(f.id);
-        changed = true;
+        if (!f || !f.id) continue;
+        const idx = curFields.findIndex((x) => x && x.id === f.id);
+        if (idx < 0) {
+          curFields.push(cloneFieldDef(f));
+          curIds.add(f.id);
+          changed = true;
+        } else {
+          const cur = curFields[idx];
+          const choiceMismatch =
+            f.type === 'choice'
+            && JSON.stringify(cur.choices || []) !== JSON.stringify(f.choices || []);
+          if (cur.type !== f.type || choiceMismatch) {
+            curFields[idx] = cloneFieldDef(f);
+            changed = true;
+          }
+        }
       }
 
       const vMerge = mergeViewsArray(base.views, desired.views);
@@ -2263,37 +2498,46 @@
       }
     }
     try {
-      let existing = null;
+      await yieldMainForPaint();
       for (let attempt = 0; attempt < 4; attempt++) {
-        existing = await findReferencesColl(data);
-        if (existing) return;
-        if (await hasReferencesOnWorkspace(data)) return;
+        const snap = await snapshotReferencesState(data);
+        if (snap.coll) return;
+        if (snap.has) return;
         if (attempt < 3) await new Promise((r) => setTimeout(r, 50 + attempt * 50));
       }
-      existing = await findReferencesColl(data);
-      if (existing) return;
-      if (await hasReferencesOnWorkspace(data)) return;
+      let post = await snapshotReferencesState(data);
+      if (post.coll) return;
+      if (post.has) return;
       await new Promise((r) => setTimeout(r, 120));
-      if (await findReferencesColl(data)) return;
-      if (await hasReferencesOnWorkspace(data)) return;
+      post = await snapshotReferencesState(data);
+      if (post.coll) return;
+      if (post.has) return;
       let preCreateLen = 0;
       try {
         if (data && data.getAllCollections) {
           const all0 = await data.getAllCollections();
-          preCreateLen = Array.isArray(all0) ? all0.length : 0;
+          const list0 = Array.isArray(all0) ? all0 : [];
+          preCreateLen = list0.length;
           if (preCreateLen > 0) touchGetAllSanityFromCount(preCreateLen);
+          if (preCreateLen > 0) {
+            const c0 = list0.find((c) => collectionDisplayName(c) === COL_NAME) || pickRefsHeuristic(list0) || null;
+            if (c0) return;
+            if (hasReferencesOnWorkspaceSyncList(list0)) return;
+          }
         }
         if (preCreateLen === 0) {
           await new Promise((r) => setTimeout(r, 150));
           if (data && data.getAllCollections) {
             const all1 = await data.getAllCollections();
-            preCreateLen = Array.isArray(all1) ? all1.length : 0;
+            const list1 = Array.isArray(all1) ? all1 : [];
+            preCreateLen = list1.length;
             if (preCreateLen > 0) touchGetAllSanityFromCount(preCreateLen);
+            if (preCreateLen > 0) {
+              const c1 = list1.find((c) => collectionDisplayName(c) === COL_NAME) || pickRefsHeuristic(list1) || null;
+              if (c1) return;
+              if (hasReferencesOnWorkspaceSyncList(list1)) return;
+            }
           }
-        }
-        if (preCreateLen > 0) {
-          if (await findReferencesColl(data)) return;
-          if (await hasReferencesOnWorkspace(data)) return;
         }
         if (isSuspiciousEmptyAfterRecentNonEmptyList(preCreateLen) && preCreateLen === 0) {
           if (DEBUG_COLLECTIONS) {
@@ -2309,6 +2553,7 @@
       } catch (_) {
         void 0;
       }
+      await yieldMainForPaint();
       if (DEBUG_COLLECTIONS) dlogRef('ensureBody_about_to_create', { path: refsPathWindowSnapshot() });
       const coll = await queueDataCreateOnSharedWindow(() => data.createCollection());
       if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') {
@@ -2373,6 +2618,7 @@
   }
 
   g.ThymerReadwiseReferencesColl = {
+    SCHEMA_VER: THYMER_READWISE_REFS_COLL_SCHEMA_VER,
     COL_NAME,
     findColl: findReferencesColl,
     ensureReferencesCollection,
@@ -2431,16 +2677,20 @@ function rwDupDiagReadwiseEnabled() {
 /** Must match Today's Highlights parser. */
 const READWISE_REF_HIGHLIGHTS_HEADER = '❣️ Highlights...';
 
-const RWR_UI_YIELD_EVERY = 1;
+/** 0 = no rAF / setTimeout yields between references during sync (fastest; UI may freeze until sync ends). */
+const RWR_UI_YIELD_EVERY = 0;
 /**
- * During the write loop, only refresh the References collection (cheap). Calling
- * this.data / this.ui refreshAll on a short interval retriggers every panel plugin
- * (Today's Notes, etc.) and makes the app crawl.
+ * 0 = no mid-sync References collection refresh (much faster navigation during sync; progress only in console/status).
+ * Final sync still runs a full refresh once at the end.
  */
-const RWR_UI_REFS_COLL_REFRESH_EVERY = 80;
+const RWR_UI_REFS_COLL_REFRESH_EVERY = 0;
 
 /** Debounce panel.navigated / panel.focused → footer work (matches Backreferences-style scheduling). */
-const RWR_PANEL_DEBOUNCE_MS = 350;
+const RWR_PANEL_DEBOUNCE_MS = 650;
+/** Coalesce MutationObserver callbacks — subtree:true sees every header/journal DOM tick; without this Readwise fights Journal Header Suite. */
+const RWR_MUTATION_OBS_DEBOUNCE_MS = 450;
+/** Coalesce `record.created` → `_refreshAll` (habit logs etc. can fire in bursts). */
+const RWR_RECORD_CREATED_DEBOUNCE_MS = 1500;
 
 /**
  * How many source documents to process concurrently during full sync.
@@ -2448,8 +2698,105 @@ const RWR_PANEL_DEBOUNCE_MS = 350;
  */
 const RWR_SYNC_CONCURRENCY = 1;
 
-/** Yield every N highlights while rebuilding a reference body (lower = more responsive UI). */
-const RWR_BODY_YIELD_EVERY_HIGHLIGHTS = 8;
+/** 0 = no yields inside the per-highlight body loop (fastest body rebuild). */
+const RWR_BODY_YIELD_EVERY_HIGHLIGHTS = 0;
+
+/**
+ * Reader `/api/v3/list/` — official Reader API default is **20 requests/minute/token** (~3000 ms between requests).
+ * Override: `readwise_references_list_delay_ms` (set lower at your own 429 risk).
+ */
+const RWR_LIST_PAGE_DELAY_MS_DEFAULT = 3000;
+/**
+ * v2 `/api/v2/export/` — main Readwise API docs cite **240 requests/minute/token** for most endpoints (~250 ms spacing).
+ * (Highlight LIST / Book LIST are 20/min — export paging is not those.) Override: `readwise_references_export_delay_ms`.
+ */
+const RWR_EXPORT_PAGE_DELAY_MS_DEFAULT = 250;
+
+/** `localStorage.setItem('readwise_references_include_rss','1')` — sync RSS feeds as References (default off). */
+function rwrIncludeRssFromStorage() {
+    try {
+        const o = localStorage.getItem('readwise_references_include_rss');
+        return o === '1' || o === 'true' || o === 'on';
+    } catch (_) {
+        return false;
+    }
+}
+
+function rwrParseDelayMs(key, defaultMs) {
+    try {
+        const v = parseInt(localStorage.getItem(key), 10);
+        if (Number.isFinite(v) && v >= 0) return v;
+    } catch (_) {}
+    return defaultMs;
+}
+
+/** Dev only: `localStorage.setItem('readwise_references_debug_max_sources','25')` — cap merged sources written this run (clear key for full sync). */
+function rwrDebugMaxSources() {
+    try {
+        const v = parseInt(localStorage.getItem('readwise_references_debug_max_sources'), 10);
+        if (Number.isFinite(v) && v > 0) return v;
+    } catch (_) {}
+    return 0;
+}
+
+/** Dev: `readwise_references_debug_max_list_rows` — stop Reader `/api/v3/list/` pagination after this many rows (still one full last page may be trimmed). */
+function rwrDebugMaxListRows() {
+    try {
+        const v = parseInt(localStorage.getItem('readwise_references_debug_max_list_rows'), 10);
+        if (Number.isFinite(v) && v > 0) return v;
+    } catch (_) {}
+    return 0;
+}
+
+/** Dev: `readwise_references_debug_max_export_pages` — stop v2 `/export/` after this many response pages. */
+function rwrDebugMaxExportPages() {
+    try {
+        const v = parseInt(localStorage.getItem('readwise_references_debug_max_export_pages'), 10);
+        if (Number.isFinite(v) && v > 0) return v;
+    } catch (_) {}
+    return 0;
+}
+
+/**
+ * Optional JSON on `localStorage.readwise_references_category_map`: map normalized Readwise keys → `books`|`articles`|`podcasts`.
+ * Keys use the same form as sync diagnostics `readwiseCategoryRawHistogram` (trimmed API string, or `(empty)`).
+ * Example: `{"tweets":"articles","supplemental_books":"books"}` — defaults still apply for keys you omit.
+ */
+function rwrCategoryMapOverride() {
+    try {
+        const j = localStorage.getItem('readwise_references_category_map');
+        if (!j || !String(j).trim()) return null;
+        const o = JSON.parse(j);
+        return o && typeof o === 'object' ? o : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+/** Must match `source_origin` choice ids in References.json / embedded READWISE_SOURCE_ORIGIN_CHOICES. */
+const READWISE_SOURCE_ORIGIN_ALLOWED = new Set([
+    'reader', 'reader_mobile', 'reader_web', 'reader_rss', 'reader_share_sheet',
+    'reader_in_app_save', 'reader_import_url', 'reader_clipboard',
+    'readwise_web_highlighter', 'readwise_onboarding',
+    'kindle', 'upload', 'pdf_upload', 'snipd', 'instapaper', 'raindrop',
+    'api_article', 'manual', 'supplemental', 'unknown', 'other',
+]);
+
+/**
+ * Optional JSON on `localStorage.readwise_references_source_map`: map Readwise `source` strings → `source_origin` choice id.
+ * Keys: exact trimmed API value, normalized key (`epub`, `google_play_books`), or `(empty)`.
+ * Values: allowed ids — `reader`, `kindle`, `epub`, …, `other`.
+ */
+function rwrSourceMapOverride() {
+    try {
+        const j = localStorage.getItem('readwise_references_source_map');
+        if (!j || !String(j).trim()) return null;
+        const o = JSON.parse(j);
+        return o && typeof o === 'object' ? o : null;
+    } catch (_) {
+        return null;
+    }
+}
 
 /** Visible separator between highlights under the same day (Thymer may not style `br` or `---` as a rule). */
 const READWISE_REF_QUOTE_SEPARATOR_TEXT = '\u2500'.repeat(28);
@@ -2477,8 +2824,58 @@ class Plugin extends AppPlugin {
     _rwHighlightsColl = null;
     /** Ephemeral status bar chip while sync runs (see `_syncStatusShow` / `_syncStatusHide`). */
     _rwrSyncStatusItem = null;
+    /** After a successful References `ensure`, skip re-running bootstrap. */
+    _rwRefsBootstrapComplete = false;
+    /** `requestIdleCallback` id or `setTimeout` id — cancelled when eager bootstrap runs or on unload. */
+    _rwRefsBootstrapDeferHandle = null;
+    _rwRefsBootstrapDeferIsIdle = false;
+    /** Trailing debounce for `record.created` → footer refresh (cleared on unload). */
+    _rwRecordCreatedRefreshTimer = null;
+    /** Resolves after `registerPluginSlug` + `ThymerPluginSettings.init` finish (deferred off critical path). */
+    _rwPathBReadyPromise = null;
+    _rwPathBReadyResolve = null;
+
+    _cancelReferencesBootstrapDefer() {
+        const h = this._rwRefsBootstrapDeferHandle;
+        if (h == null) return;
+        this._rwRefsBootstrapDeferHandle = null;
+        const idle = this._rwRefsBootstrapDeferIsIdle;
+        this._rwRefsBootstrapDeferIsIdle = false;
+        try {
+            if (idle && typeof cancelIdleCallback === 'function') cancelIdleCallback(h);
+        } catch (_) {}
+        try {
+            clearTimeout(h);
+        } catch (_) {}
+    }
+
+    /** Defer References `ensure` so install/save can paint before another `getAllCollections` / create pass. */
+    _scheduleReferencesBootstrapDeferred() {
+        if (this._rwRefsBootstrapComplete || this._rwRefsBootstrapPromise || this._rwRefsBootstrapDeferHandle != null) return;
+        const fire = () => {
+            this._rwRefsBootstrapDeferHandle = null;
+            this._rwRefsBootstrapDeferIsIdle = false;
+            if (this._rwRefsBootstrapComplete || this._rwRefsBootstrapPromise) return;
+            void this._bootstrapReferencesCollectionIfNeeded();
+        };
+        try {
+            if (typeof requestIdleCallback === 'function') {
+                this._rwRefsBootstrapDeferIsIdle = true;
+                this._rwRefsBootstrapDeferHandle = requestIdleCallback(fire, { timeout: 2200 });
+            } else {
+                this._rwRefsBootstrapDeferIsIdle = false;
+                this._rwRefsBootstrapDeferHandle = setTimeout(fire, 450);
+            }
+        } catch (_) {
+            this._rwRefsBootstrapDeferIsIdle = false;
+            this._rwRefsBootstrapDeferHandle = setTimeout(fire, 450);
+        }
+    }
 
     async _ensureRwCollections() {
+        if (!this._rwRefsBootstrapComplete) {
+            await this._bootstrapReferencesCollectionIfNeeded();
+        }
         let key = '';
         try {
             key = String(this.data.getActiveUsers?.()?.[0]?.workspaceGuid || '');
@@ -2514,6 +2911,7 @@ class Plugin extends AppPlugin {
 
     /** On load: create **References** if missing and merge schema (embedded `ThymerReadwiseReferencesColl`). Single-flight so overlapping callers share one `ensure`. */
     async _bootstrapReferencesCollectionIfNeeded() {
+        if (this._rwRefsBootstrapComplete) return;
         if (this._rwRefsBootstrapPromise) {
             this._rwDupDiagLog('references_bootstrap_coalesce', { reason: 'in-flight' });
             try {
@@ -2521,6 +2919,7 @@ class Plugin extends AppPlugin {
             } catch (_) {}
             return;
         }
+        this._cancelReferencesBootstrapDefer();
         const api = globalThis.ThymerReadwiseReferencesColl;
         if (!api || typeof api.ensure !== 'function') {
             console.warn('[Readwise Ref] References collection helper missing — redeploy full plugin.js from repo (embed-readwise-refs-coll).');
@@ -2530,6 +2929,7 @@ class Plugin extends AppPlugin {
         this._rwRefsBootstrapPromise = (async () => {
             try {
                 await api.ensure(this.data);
+                this._rwRefsBootstrapComplete = true;
             } catch (e) {
                 console.warn('[Readwise Ref] References collection setup failed', e);
             } finally {
@@ -2543,28 +2943,82 @@ class Plugin extends AppPlugin {
         }
     }
 
+    /** `registerPluginSlug` + `init` are heavy (Plugin Backend / worker); run after idle so other globals (e.g. Journal Header Suite) can mount first. */
+    async _rwRunDeferredPathB() {
+        try {
+            await new Promise((r) => {
+                try {
+                    if (typeof requestIdleCallback === 'function') {
+                        requestIdleCallback(() => r(), { timeout: 5000 });
+                    } else {
+                        setTimeout(r, 900);
+                    }
+                } catch (_) {
+                    setTimeout(r, 900);
+                }
+            });
+            if (this._rwUnloaded) return;
+            try {
+                await globalThis.ThymerPluginSettings?.registerPluginSlug?.(this.data, {
+                    slug: 'readwise-references',
+                    label: 'Readwise References',
+                });
+            } catch (_) {}
+            if (this._rwUnloaded) return;
+            await new Promise((r) => {
+                try {
+                    requestAnimationFrame(() => setTimeout(r, 0));
+                } catch (_) {
+                    setTimeout(r, 0);
+                }
+            });
+            if (this._rwUnloaded) return;
+            await (globalThis.ThymerPluginSettings?.init?.({
+                plugin: this,
+                pluginId: 'readwise-references',
+                modeKey: 'thymerext_ps_mode_readwise_references',
+                mirrorKeys: () => this._pathBMirrorKeys(),
+                label: 'Readwise References',
+                data: this.data,
+                ui: this.ui,
+            }) ?? (console.warn('[Readwise Ref] ThymerPluginSettings runtime missing (redeploy full plugin .js from repo).'), Promise.resolve()));
+            try {
+                this._scheduleReferencesBootstrapDeferred();
+            } catch (_) {}
+        } catch (e) {
+            try {
+                console.warn('[Readwise Ref] deferred Path B init', e);
+            } catch (_) {}
+        } finally {
+            try {
+                if (typeof this._rwPathBReadyResolve === 'function') this._rwPathBReadyResolve();
+            } catch (_) {}
+            this._rwPathBReadyResolve = null;
+        }
+    }
+
+    async _rwAwaitPathBReady() {
+        const p = this._rwPathBReadyPromise;
+        if (p) await p.catch(() => {});
+    }
+
     async onLoad() {
+        this._rwUnloaded = false;
         this._rwDupLoadSeq = (this._rwDupLoadSeq | 0) + 1;
         this._rwDupDiagLog('onLoad_enter', { loadSeq: this._rwDupLoadSeq });
-        try {
-            await globalThis.ThymerPluginSettings?.upgradeCollectionSchema?.(this.data);
-            await globalThis.ThymerPluginSettings?.registerPluginSlug?.(this.data, {
-                slug: 'readwise-references',
-                label: 'Readwise References',
-            });
-        } catch (_) {}
-        await (globalThis.ThymerPluginSettings?.init?.({
-            plugin: this,
-            pluginId: 'readwise-references',
-            modeKey: 'thymerext_ps_mode_readwise_references',
-            mirrorKeys: () => this._pathBMirrorKeys(),
-            label: 'Readwise References',
-            data: this.data,
-            ui: this.ui,
-        }) ?? (console.warn('[Readwise Ref] ThymerPluginSettings runtime missing (redeploy full plugin .js from repo).'), Promise.resolve()));
-        try {
-            await this._bootstrapReferencesCollectionIfNeeded();
-        } catch (_) {}
+        this._rwPathBReadyPromise = new Promise((resolve) => {
+            this._rwPathBReadyResolve = resolve;
+        });
+        // Let the host paint before Path B work. Avoid duplicate upgradeCollectionSchema here:
+        // registerPluginSlug already runs upgradePluginSettingsSchema (and may rewrite Plugin rows once).
+        await new Promise((r) => {
+            try {
+                requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(r, 0)));
+            } catch (_) {
+                setTimeout(r, 0);
+            }
+        });
+        void this._rwRunDeferredPathB();
         this._syncing = false;
         this._cmdSetToken = this.ui.addCommandPaletteCommand({
             label: 'Readwise Ref: Set Token',
@@ -2589,7 +3043,8 @@ class Plugin extends AppPlugin {
         this._cmdStorage = this.ui.addCommandPaletteCommand({
             label: 'Readwise Ref: Storage location…',
             icon: 'ti-database',
-            onSelected: () => {
+            onSelected: async () => {
+                await this._rwAwaitPathBReady();
                 globalThis.ThymerPluginSettings?.openStorageDialog?.({
                     plugin: this,
                     pluginId: 'readwise-references',
@@ -2631,9 +3086,17 @@ class Plugin extends AppPlugin {
         this._eventHandlerIds.push(this.events.on('panel.navigated', ev => this._deferHandlePanel(ev.panel)));
         this._eventHandlerIds.push(this.events.on('panel.focused',   ev => this._deferHandlePanel(ev.panel)));
         this._eventHandlerIds.push(this.events.on('panel.closed',    ev => this._disposePanel(ev.panel?.getId?.())));
-        this._eventHandlerIds.push(this.events.on('record.created',  () => {
+        this._eventHandlerIds.push(this.events.on('record.created', () => {
             this._clearFooterDataCaches();
-            this._refreshAll();
+            try {
+                if (this._rwRecordCreatedRefreshTimer) clearTimeout(this._rwRecordCreatedRefreshTimer);
+            } catch (_) {}
+            this._rwRecordCreatedRefreshTimer = setTimeout(() => {
+                this._rwRecordCreatedRefreshTimer = null;
+                try {
+                    this._refreshAll();
+                } catch (_) {}
+            }, RWR_RECORD_CREATED_DEBOUNCE_MS);
         }));
         /**
          * Journal Footer Suite calls with `{ panels: Panel[] }` so every journal view that has a
@@ -2660,7 +3123,7 @@ class Plugin extends AppPlugin {
                 const p = this.ui.getActivePanel?.() || this.ui.getCurrentPanel?.();
                 if (p?.getId) {
                     activeId = p.getId();
-                    requestAnimationFrame(() => this._handlePanel(p));
+                    this._deferHandlePanel(p);
                 }
             } catch (_) {}
             for (const [, s] of this._panelStates || []) {
@@ -2671,16 +3134,27 @@ class Plugin extends AppPlugin {
         globalThis.__thymerReadwiseJfsSuiteNotify = this._readwiseJfsNotifyBound;
         try {
             const p0 = this.ui.getActivePanel();
-            if (p0) requestAnimationFrame(() => this._handlePanel(p0));
+            if (p0) this._deferHandlePanel(p0);
         } catch (_) {}
         setTimeout(() => {
             const p = this.ui.getActivePanel();
-            if (p) this._handlePanel(p);
-        }, 120);
+            if (p) this._deferHandlePanel(p);
+        }, 900);
         /** Quote pool warms only when the shuffler populates (see `_populateShufflerSection`) — no journal-load scan. */
     }
 
     onUnload() {
+        this._rwUnloaded = true;
+        this._cancelReferencesBootstrapDefer();
+        try {
+            if (typeof this._rwPathBReadyResolve === 'function') this._rwPathBReadyResolve();
+        } catch (_) {}
+        this._rwPathBReadyResolve = null;
+        this._rwPathBReadyPromise = null;
+        try {
+            if (this._rwRecordCreatedRefreshTimer) clearTimeout(this._rwRecordCreatedRefreshTimer);
+        } catch (_) {}
+        this._rwRecordCreatedRefreshTimer = null;
         for (const id of (this._eventHandlerIds || [])) {
             try { this.events.off(id); } catch (_) {}
         }
@@ -3005,6 +3479,7 @@ class Plugin extends AppPlugin {
         if (this._syncing) { this._toast('Sync already in progress...'); return; }
         const token = localStorage.getItem(RWR_TOKEN_KEY);
         if (!token) { this._toast('No token. Run "Readwise Ref: Set Token" first.'); return; }
+        await this._rwAwaitPathBReady();
         this._syncing = true;
         this._toast(forceFullSync ? 'Readwise Ref full sync…' : 'Readwise Ref: syncing…');
         this._syncStatusShow(forceFullSync ? 'Full sync — checking token…' : 'Sync — checking token…');
@@ -3029,7 +3504,7 @@ class Plugin extends AppPlugin {
             console.error('[ReadwiseRef]', e);
             if (this._lastSyncDiag) {
                 this._lastSyncDiag.syncThrown = String(e && e.message ? e.message : e);
-                this._persistSyncDiag({ ok: false });
+                this._persistSyncDiag({ ok: false, syncPhase: 'failed' });
             }
             this._toast('Sync failed: ' + e.message);
         } finally {
@@ -3043,6 +3518,10 @@ class Plugin extends AppPlugin {
         let cursor = null;
         let retryCount = 0;
         const maxRetries = 3;
+        const listRowCap = rwrDebugMaxListRows();
+        if (listRowCap > 0) {
+            this._log('DEBUG: readwise_references_debug_max_list_rows=' + listRowCap + ' — Reader list will stop after this many rows (re-paste plugin.js if list keeps growing past the cap).');
+        }
         while (true) {
             let url = 'https://readwise.io/api/v3/list/?limit=100';
             if (since) url += '&updatedAfter=' + encodeURIComponent(since);
@@ -3051,8 +3530,9 @@ class Plugin extends AppPlugin {
             if (resp.status === 429) {
                 retryCount++;
                 if (retryCount > maxRetries) throw new Error('Rate limited too many times');
-                const wait = (120 * Math.pow(2, retryCount - 1)) * 1000;
-                this._log('Rate limited. Waiting ' + (wait / 1000) + 's...');
+                const fallback = (120 * Math.pow(2, retryCount - 1)) * 1000;
+                const wait = this._rwrRetryAfterMs(resp, fallback);
+                this._log('Rate limited (429). Waiting ' + Math.round(wait / 1000) + 's (Retry-After if present)…');
                 await this._sleep(wait);
                 continue;
             }
@@ -3062,10 +3542,16 @@ class Plugin extends AppPlugin {
             const results = data.results || [];
             allResults.push(...results);
             this._log('List page: +' + results.length + ' (total ' + allResults.length + ')');
+            if (listRowCap > 0 && allResults.length >= listRowCap) {
+                if (allResults.length > listRowCap) allResults.splice(listRowCap);
+                this._log('⚠️ DEBUG: readwise_references_debug_max_list_rows=' + listRowCap + ' — Reader list fetch truncated.');
+                if (this._lastSyncDiag) this._lastSyncDiag.debugMaxListRowsApplied = listRowCap;
+                break;
+            }
             if (!data.nextPageCursor) break;
             cursor = data.nextPageCursor;
-            /* Space requests to reduce 429; export uses a longer gap. */
-            await this._sleep(4500);
+            /* Space requests to reduce 429; tune via localStorage readwise_references_list_delay_ms */
+            await this._sleep(this._rwrListPageDelayMs());
         }
         return allResults;
     }
@@ -3087,12 +3573,378 @@ class Plugin extends AppPlugin {
         throw lastErr;
     }
 
-    async _fetchExportEnrichmentMap(token, since) {
+    _rwrListPageDelayMs() {
+        return rwrParseDelayMs('readwise_references_list_delay_ms', RWR_LIST_PAGE_DELAY_MS_DEFAULT);
+    }
+
+    _rwrExportPageDelayMs() {
+        return rwrParseDelayMs('readwise_references_export_delay_ms', RWR_EXPORT_PAGE_DELAY_MS_DEFAULT);
+    }
+
+    _rwrIncludeRss() {
+        return rwrIncludeRssFromStorage();
+    }
+
+    /**
+     * Merge Kindle / library highlights from v2 export with Reader list rows (union by highlight id).
+     */
+    _mergeHighlightRowArrays(a, b) {
+        const m = new Map();
+        const put = (h) => {
+            if (!h) return;
+            const k = String(h.id ?? h.external_id ?? '');
+            if (!k) return;
+            const cur = m.get(k);
+            if (!cur) {
+                m.set(k, h);
+                return;
+            }
+            const curBody = this._highlightBody(cur);
+            const nextBody = this._highlightBody(h);
+            const pick = (nextBody || '').length >= (curBody || '').length ? { ...cur, ...h } : { ...h, ...cur };
+            if ((nextBody || '').length >= (curBody || '').length) {
+                pick.text = h.text !== undefined ? h.text : pick.text;
+                pick.content = h.content !== undefined ? h.content : pick.content;
+            }
+            m.set(k, pick);
+        };
+        for (const x of (a || [])) put(x);
+        for (const x of (b || [])) put(x);
+        return Array.from(m.values());
+    }
+
+    _preferRicherDoc(listLike, exportLike) {
+        const a = listLike || {};
+        const b = exportLike || {};
+        const out = { ...a };
+        const bt = b.title || b.readable_title;
+        const at = a.title || a.readable_title;
+        if (bt && (!at || String(bt).trim().length > String(at || '').trim().length)) out.title = bt;
+        if (b.author && (!a.author || String(b.author).trim().length > String(a.author || '').trim().length)) {
+            out.author = b.author;
+        }
+        if (b.category && !a.category) out.category = b.category;
+        if (b.source && !a.source) out.source = b.source;
+        const bu = b.source_url || b.unique_url;
+        const au = a.source_url;
+        if (bu && (!au || String(au).trim().length < String(bu).trim().length)) out.source_url = bu;
+        if (b.cover_image_url || b.image_url) {
+            out.cover_image_url = b.cover_image_url || out.cover_image_url;
+            out.image_url = b.image_url || out.image_url;
+        }
+        if (b.created_at && !a.created_at) out.created_at = b.created_at;
+        return out;
+    }
+
+    _exportBookToDoc(book) {
+        const b = book || {};
+        const idVal = b.external_id != null && String(b.external_id).trim() !== ''
+            ? b.external_id
+            : b.user_book_id;
+        return {
+            id: idVal,
+            external_id: b.external_id != null ? b.external_id : null,
+            title: b.title || b.readable_title || '',
+            author: b.author || '',
+            category: b.category || '',
+            source: b.source || '',
+            source_url: b.source_url || b.unique_url || '',
+            created_at: b.created_at || b.updated_at || null,
+            image_url: b.cover_image_url || b.image_url || '',
+            cover_image_url: b.cover_image_url || '',
+        };
+    }
+
+    _exportHighlightToUnifiedRow(hl, book) {
+        const h = hl || {};
+        const b = book || {};
+        return {
+            id: h.id != null ? h.id : h.external_id,
+            external_id: h.external_id,
+            content: h.text,
+            text: h.text,
+            highlighted_at: h.highlighted_at || h.updated_at,
+            created_at: h.created_at,
+            note: h.note,
+            notes: h.notes,
+            readwise_url: h.readwise_url,
+            url: h.url,
+            highlight_url: h.highlight_url,
+            category: h.category || '',
+            parent_document_id: b.external_id,
+            document_title: b.title || b.readable_title,
+        };
+    }
+
+    /** Stable external_id for References row — matches legacy `readwise_${id}` when external_id present. */
+    _exportBookStableExtId(book) {
+        const b = book || {};
+        if (b.external_id != null && String(b.external_id).trim() !== '') {
+            return 'readwise_' + String(b.external_id).trim();
+        }
+        if (b.user_book_id != null) return 'readwise_ub_' + String(b.user_book_id);
+        const slug = String(b.title || b.readable_title || 'unknown').trim().slice(0, 48) || 'unknown';
+        return 'readwise_exp_' + slug.replace(/\s+/g, '_');
+    }
+
+    /**
+     * Reader list + export can both contain the *same* highlight with different `id` / `external_id`.
+     * `_mergeHighlightRowArrays` only merges identical ids — merge duplicates by Readwise open URL + fallbacks.
+     * Pass `exportByHlId` so list rows without URLs still resolve the same `readwise.io/open/…` as export rows.
+     */
+    _canonicalHighlightDedupeKey(h, exportByHlId) {
+        let ex = null;
+        if (exportByHlId && typeof exportByHlId.get === 'function' && h) {
+            if (h.id != null) ex = exportByHlId.get(String(h.id)) || null;
+            if (!ex && h.external_id != null) ex = exportByHlId.get(String(h.external_id)) || null;
+        }
+        const openUrl = this._readwiseHighlightOpenLink(h, ex);
+        const m = openUrl && String(openUrl).match(/readwise\.io\/open\/([^/?#]+)/i);
+        if (m) return 'open:' + decodeURIComponent(m[1]);
+        const id = h.id ?? h.external_id;
+        if (id != null && String(id).trim() !== '') return 'id:' + String(id).trim();
+        if (openUrl) return 'url:' + String(openUrl).split('?')[0];
+        const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        return 'fp:' + norm(this._highlightBody(h)).slice(0, 180) + '|' + norm(this._highlightNote(h)).slice(0, 100);
+    }
+
+    _preferRicherHighlightRow(a, b) {
+        const x = a || {};
+        const y = b || {};
+        const out = { ...x, ...y };
+        const bx = this._highlightBody(x);
+        const by = this._highlightBody(y);
+        if ((by || '').length > (bx || '').length) {
+            out.text = y.text !== undefined ? y.text : out.text;
+            out.content = y.content !== undefined ? y.content : out.content;
+        }
+        const nx = this._highlightNote(x);
+        const ny = this._highlightNote(y);
+        if (String(ny || '').trim().length > String(nx || '').trim().length) {
+            out.note = y.note !== undefined ? y.note : out.note;
+            out.notes = y.notes !== undefined ? y.notes : out.notes;
+        }
+        return out;
+    }
+
+    _dedupeHighlightRowsByCanonicalKey(rows, exportByHlId) {
+        if (!Array.isArray(rows) || rows.length < 2) return rows || [];
+        const order = [];
+        const byKey = new Map();
+        let merged = 0;
+        for (const h of rows) {
+            const key = this._canonicalHighlightDedupeKey(h, exportByHlId);
+            if (!byKey.has(key)) {
+                byKey.set(key, h);
+                order.push(key);
+            } else {
+                byKey.set(key, this._preferRicherHighlightRow(byKey.get(key), h));
+                merged++;
+            }
+        }
+        if (merged > 0 && this._lastSyncDiag) {
+            this._lastSyncDiag.duplicateHighlightRowsMerged = (this._lastSyncDiag.duplicateHighlightRowsMerged || 0) + merged;
+        }
+        return order.map((k) => byKey.get(k));
+    }
+
+    /**
+     * Same long quote + same note appearing twice (e.g. Reader vs export with mismatched open ids).
+     * Keeps first occurrence in list order.
+     */
+    _dedupeIdenticalLongQuoteRows(rows) {
+        if (!Array.isArray(rows) || rows.length < 2) return rows || [];
+        const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const minBody = 48;
+        const seen = new Set();
+        const out = [];
+        let dropped = 0;
+        for (const h of rows) {
+            const b = norm(this._highlightBody(h));
+            const n = norm(this._highlightNote(h));
+            if (b.length < minBody) {
+                out.push(h);
+                continue;
+            }
+            const key = b.slice(0, 500) + '\0' + n.slice(0, 280);
+            if (seen.has(key)) {
+                dropped++;
+                continue;
+            }
+            seen.add(key);
+            out.push(h);
+        }
+        if (dropped > 0 && this._lastSyncDiag) {
+            this._lastSyncDiag.duplicateQuoteBodyMerged = (this._lastSyncDiag.duplicateQuoteBodyMerged || 0) + dropped;
+        }
+        return out;
+    }
+
+    /**
+     * Drops Reader rows that echo another highlight's note as a standalone fake “quote” (duplicate loc URLs).
+     */
+    _dedupeRedundantNoteHighlightRows(rows) {
+        if (!Array.isArray(rows) || rows.length < 2) return rows || [];
+        const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const notesFromPeers = new Set();
+        for (const h of rows) {
+            const n = norm(this._highlightNote(h));
+            if (n) notesFromPeers.add(n);
+        }
+        const out = [];
+        let dropped = 0;
+        for (const h of rows) {
+            const body = norm(this._highlightBody(h));
+            const nt = norm(this._highlightNote(h));
+            const cat = String(h.category || '').toLowerCase();
+            const url = String(h.readwise_url || h.url || '');
+            let skip = false;
+            if (body && notesFromPeers.has(body)) {
+                const readerDup = /read\.readwise\.io\/read\//i.test(url);
+                const echoNoteOnly = !nt || body === nt;
+                const taggedNote = cat === 'note' || cat === 'reader_document_note';
+                /** Note-only URL (or other string) echoed as its own “highlight” row (often sequential open ids). */
+                const urlEchoBody = /^https?:\/\//i.test(body);
+                if (echoNoteOnly && (readerDup || taggedNote || urlEchoBody)) skip = true;
+            }
+            if (skip) dropped++;
+            else out.push(h);
+        }
+        if (dropped > 0 && this._lastSyncDiag) {
+            this._lastSyncDiag.noteRowsDeduped = (this._lastSyncDiag.noteRowsDeduped || 0) + dropped;
+        }
+        return out;
+    }
+
+    /**
+     * Reader list buckets + v2 export books → one entry per Reference (`extId`, `doc`, merged `docHL`).
+     */
+    _buildMergedReferenceEntries(allResults, exportBooks, exportByHlId) {
+        const pageDocs = (allResults || []).filter((i) => {
+            const p = i.parent_id ?? i.parent_document_id;
+            return p == null || p === '';
+        });
+        const pageHLs = (allResults || []).filter((i) => {
+            const p = i.parent_id ?? i.parent_document_id;
+            return p != null && String(p).length > 0;
+        });
+        const docByIdStr = new Map();
+        for (const d of pageDocs) {
+            docByIdStr.set(String(d.id), d);
+        }
+        const allRowsById = new Map();
+        for (const r of allResults || []) {
+            if (r && r.id != null) allRowsById.set(String(r.id), r);
+        }
+        const grouped = this._groupPageHLsByOwningDocument(pageHLs, docByIdStr, allRowsById);
+        const pageHLsByDoc = grouped.map;
+
+        const merged = new Map();
+        let syntheticParentCount = 0;
+
+        for (const [parentIdStr, docHLraw] of pageHLsByDoc.entries()) {
+            if (!docHLraw || docHLraw.length === 0) continue;
+            let doc = docByIdStr.get(parentIdStr);
+            let synth = 0;
+            if (!doc) {
+                const syn = this._syntheticParentDocFromHighlight(parentIdStr, docHLraw[0]);
+                const t0 = this._resolveDocTitle(syn);
+                if (/^(note|highlight)\s*\(untitled\)$/i.test(String(t0 || '').trim())) {
+                    if (this._lastSyncDiag) this._lastSyncDiag.skippedOrphans++;
+                    continue;
+                }
+                doc = syn;
+                synth = 1;
+                syntheticParentCount += synth;
+            }
+            const extId = 'readwise_' + String(doc.id);
+            const rows = docHLraw;
+            const prev = merged.get(extId);
+            if (prev) {
+                prev.docHL = this._mergeHighlightRowArrays(prev.docHL, rows);
+                prev.doc = this._preferRicherDoc(prev.doc, doc);
+                prev.synthFlag = prev.synthFlag || synth;
+            } else {
+                merged.set(extId, { extId, doc, docHL: rows, synthFlag: synth });
+            }
+        }
+
+        const books = Array.isArray(exportBooks) ? exportBooks : [];
+        if (this._lastSyncDiag) this._lastSyncDiag.exportBooksSeen = books.length;
+
+        for (const book of books) {
+            if (!book) continue;
+            const rss = String(book.category || '').toLowerCase() === 'rss';
+            if (rss && !this._rwrIncludeRss()) {
+                if (this._lastSyncDiag) this._lastSyncDiag.skippedRss++;
+                continue;
+            }
+            const exportDoc = this._exportBookToDoc(book);
+            const rawHl = [];
+            for (const hl of book.highlights || []) {
+                if (hl.is_deleted) continue;
+                rawHl.push(this._exportHighlightToUnifiedRow(hl, book));
+            }
+            if (rawHl.length === 0) continue;
+
+            const keysToTry = [];
+            if (book.external_id != null && String(book.external_id).trim() !== '') {
+                keysToTry.push('readwise_' + String(book.external_id).trim());
+            }
+            let hit = null;
+            for (const k of keysToTry) {
+                if (merged.has(k)) {
+                    hit = k;
+                    break;
+                }
+            }
+            if (!hit) {
+                const hlIds = new Set(rawHl.map((h) => String(h.id ?? h.external_id)));
+                for (const [eid, entry] of merged) {
+                    const overlap = entry.docHL.some((h) => hlIds.has(String(h.id ?? h.external_id)));
+                    if (overlap) {
+                        hit = eid;
+                        break;
+                    }
+                }
+            }
+            if (hit) {
+                const ent = merged.get(hit);
+                ent.docHL = this._mergeHighlightRowArrays(ent.docHL, rawHl);
+                ent.doc = this._preferRicherDoc(ent.doc, exportDoc);
+                ent.fromExport = true;
+            } else {
+                const extId = this._exportBookStableExtId(book);
+                merged.set(extId, { extId, doc: exportDoc, docHL: rawHl, synthFlag: 0, fromExport: true });
+            }
+        }
+
+        const exMap = exportByHlId && typeof exportByHlId.get === 'function' ? exportByHlId : null;
+        const entries = Array.from(merged.values())
+            .map((e) => {
+                if (!e || !e.docHL) return e;
+                let hl = this._dedupeHighlightRowsByCanonicalKey(e.docHL, exMap);
+                hl = this._dedupeIdenticalLongQuoteRows(hl);
+                hl = this._dedupeRedundantNoteHighlightRows(hl);
+                return Object.assign({}, e, { docHL: hl });
+            })
+            .filter((e) => e && e.docHL && e.docHL.length > 0);
+        return { entries, groupedMeta: grouped, pageDocsLen: pageDocs.length, pageHLsLen: pageHLs.length, syntheticParentCount };
+    }
+
+    /** v2 export: highlight enrichment + cover map + full book list (Kindle / library sources). */
+    async _fetchReadwiseExportPayload(token, since) {
         const highlightById = new Map();
         const coverByDocId = new Map();
+        const exportBooks = [];
         let cursor = null;
         let retryCount = 0;
         const maxRetries = 3;
+        const exportPageCap = rwrDebugMaxExportPages();
+        let exportPagesDone = 0;
+        if (exportPageCap > 0) {
+            this._log('DEBUG: readwise_references_debug_max_export_pages=' + exportPageCap + ' — export will stop after this many API pages (re-paste plugin.js if export keeps paging).');
+        }
         while (true) {
             const params = new URLSearchParams();
             if (since) params.append('updatedAfter', since);
@@ -3102,13 +3954,17 @@ class Plugin extends AppPlugin {
             if (resp.status === 429) {
                 retryCount++;
                 if (retryCount > maxRetries) throw new Error('Export rate limited');
-                await this._sleep((120 * Math.pow(2, retryCount - 1)) * 1000);
+                const fallback = (120 * Math.pow(2, retryCount - 1)) * 1000;
+                const wait = this._rwrRetryAfterMs(resp, fallback);
+                this._log('Export rate limited (429). Waiting ' + Math.round(wait / 1000) + 's…');
+                await this._sleep(wait);
                 continue;
             }
             if (!resp.ok) throw new Error('Export API error ' + resp.status);
             retryCount = 0;
             const data = await resp.json();
             for (const book of data.results || []) {
+                exportBooks.push(book);
                 if (book.external_id != null && book.cover_image_url) {
                     coverByDocId.set(String(book.external_id), book.cover_image_url);
                 }
@@ -3129,11 +3985,19 @@ class Plugin extends AppPlugin {
                     }
                 }
             }
+            exportPagesDone++;
+            if (exportPageCap > 0 && exportPagesDone >= exportPageCap) {
+                if (data.nextPageCursor) {
+                    this._log('⚠️ DEBUG: readwise_references_debug_max_export_pages=' + exportPageCap + ' — export fetch truncated (further pages skipped).');
+                }
+                if (this._lastSyncDiag) this._lastSyncDiag.debugMaxExportPagesApplied = exportPageCap;
+                break;
+            }
             if (!data.nextPageCursor) break;
             cursor = data.nextPageCursor;
-            await this._sleep(5000);
+            await this._sleep(this._rwrExportPageDelayMs());
         }
-        return { highlightById, coverByDocId };
+        return { highlightById, coverByDocId, exportBooks };
     }
 
     _persistSyncDiag(extra) {
@@ -3160,7 +4024,11 @@ class Plugin extends AppPlugin {
             const oa = o.skippedOrphans || 0;
             const rss = o.skippedRss || 0;
             const inc = o.incremental ? 'incremental' : 'full';
-            this._toast('Diagnostics logged (console). ' + inc + ' · unmapped HL: ' + h + ' · dateless in body: ' + d + ' · orphan skip: ' + oa + ' · rss skip: ' + rss);
+            const eb = o.exportBooksSeen != null ? o.exportBooksSeen : '—';
+            const nd = o.noteRowsDeduped != null ? o.noteRowsDeduped : '—';
+            const dh = o.duplicateHighlightRowsMerged != null ? o.duplicateHighlightRowsMerged : '—';
+            const dq = o.duplicateQuoteBodyMerged != null ? o.duplicateQuoteBodyMerged : '—';
+            this._toast('Diagnostics logged (console). ' + inc + ' · unmapped HL: ' + h + ' · dateless in body: ' + d + ' · orphan skip: ' + oa + ' · rss skip: ' + rss + ' · export books: ' + eb + ' · note dedupe: ' + nd + ' · HL dup merge: ' + dh + ' · same-quote merge: ' + dq);
         } catch (_) {
             this._toast('Diagnostics JSON is invalid.');
         }
@@ -3196,12 +4064,30 @@ class Plugin extends AppPlugin {
             updatedRef: 0,
             exportRowsApprox: 0,
             exportError: null,
+            exportBooksSeen: 0,
+            noteRowsDeduped: 0,
+            duplicateHighlightRowsMerged: 0,
+            duplicateQuoteBodyMerged: 0,
+            mergedSources: 0,
+            debugMaxSourcesApplied: null,
+            debugMaxListRowsApplied: null,
+            debugMaxExportPagesApplied: null,
+            readwiseCategoryRawHistogram: null,
+            readwiseCategoryMappedHistogram: null,
+            readwiseListApiCategoryHistogram: null,
+            readwiseListApiSourceHistogram: null,
+            readwiseListDocCategoryHistogram: null,
+            readwiseListHighlightCategoryHistogram: null,
+            readwiseExportBookCategoryHistogram: null,
+            readwiseExportBookSourceHistogram: null,
         };
 
         await this._ensureRwCollections();
         const refsColl = this._rwRefsColl;
         const peopleColl = this._rwPeopleColl;
         if (!refsColl) throw new Error('References collection not found');
+        /** So `readwise_references_last_sync_diag` is not mistaken for the previous run if the user refreshes mid-sync. */
+        this._persistSyncDiag({ ok: null, syncPhase: 'started' });
         this._log('References: true  People: ' + (!!peopleColl));
 
         const peopleByKey = new Map();
@@ -3226,58 +4112,106 @@ class Plugin extends AppPlugin {
         const allResults = await this._fetchReadwiseListAll(token, since);
         this._lastSyncDiag.listRows = allResults.length;
         this._log('List download complete: ' + allResults.length + ' rows.');
+        try {
+            const listDocsApi = (allResults || []).filter((i) => {
+                const p = i.parent_id ?? i.parent_document_id;
+                return p == null || p === '';
+            });
+            const listHlApi = (allResults || []).filter((i) => {
+                const p = i.parent_id ?? i.parent_document_id;
+                return p != null && String(p).length > 0;
+            });
+            const hListCat = this._readwiseHistogramStrings(allResults, (r) => r && r.category);
+            const hListSrc = this._readwiseHistogramStrings(allResults, (r) => r && r.source);
+            const hDocCat = this._readwiseHistogramStrings(listDocsApi, (r) => r && r.category);
+            const hHlCat = this._readwiseHistogramStrings(listHlApi, (r) => r && r.category);
+            if (this._lastSyncDiag) {
+                this._lastSyncDiag.readwiseListApiCategoryHistogram = hListCat;
+                this._lastSyncDiag.readwiseListApiSourceHistogram = hListSrc;
+                this._lastSyncDiag.readwiseListDocCategoryHistogram = hDocCat;
+                this._lastSyncDiag.readwiseListHighlightCategoryHistogram = hHlCat;
+            }
+            this._log('Reader API list — category (all rows): ' + JSON.stringify(hListCat));
+            this._log('Reader API list — source (all rows; epub/kindle often here): ' + JSON.stringify(hListSrc));
+            this._log('Reader API list — category (document rows only): ' + JSON.stringify(hDocCat));
+            this._log('Reader API list — category (highlight rows only): ' + JSON.stringify(hHlCat));
+        } catch (e) {
+            this._log('⚠️ List API histograms: ' + (e && e.message ? e.message : e));
+        }
         this._toast('Readwise list done. Fetching export + saving references…');
 
         let exportByHlId = new Map();
         let exportCoverByDocId = new Map();
-        if (allResults.length > 0) {
+        let exportBooks = [];
+        try {
+            this._syncStatusShow('Fetching Readwise export (v2, full library)…');
+            const enr = await this._fetchReadwiseExportPayload(token, since);
+            exportByHlId = enr.highlightById;
+            exportCoverByDocId = enr.coverByDocId;
+            exportBooks = enr.exportBooks || [];
+            this._lastSyncDiag.exportRowsApprox = exportByHlId.size;
+            this._lastSyncDiag.exportBooksSeen = exportBooks.length;
+            this._log('v2 export: ' + exportByHlId.size + ' highlight enrichments · ' + exportBooks.length + ' books/sources');
             try {
-                this._syncStatusShow('Fetching export enrichment (' + allResults.length + ' list rows)…');
-                const enr = await this._fetchExportEnrichmentMap(token, since);
-                exportByHlId = enr.highlightById;
-                exportCoverByDocId = enr.coverByDocId;
-                this._lastSyncDiag.exportRowsApprox = exportByHlId.size;
-                this._log('v2 export: ' + exportByHlId.size + ' highlights');
-            } catch (e) {
-                this._lastSyncDiag.exportError = String(e && e.message ? e.message : e);
-                this._log('⚠️ Export skipped: ' + e.message);
+                const hExpCat = this._readwiseHistogramStrings(exportBooks, (b) => b && b.category);
+                const hExpSrc = this._readwiseHistogramStrings(exportBooks, (b) => b && b.source);
+                if (this._lastSyncDiag) {
+                    this._lastSyncDiag.readwiseExportBookCategoryHistogram = hExpCat;
+                    this._lastSyncDiag.readwiseExportBookSourceHistogram = hExpSrc;
+                }
+                this._log('Export API books — category: ' + JSON.stringify(hExpCat));
+                this._log('Export API books — source: ' + JSON.stringify(hExpSrc));
+            } catch (e2) {
+                this._log('⚠️ Export histograms: ' + (e2 && e2.message ? e2.message : e2));
             }
+        } catch (e) {
+            this._lastSyncDiag.exportError = String(e && e.message ? e.message : e);
+            this._log('⚠️ Export skipped: ' + e.message);
         }
 
-        this._log('Writing Reference records (rows should appear in the References collection now).');
+        this._log('Merging Reader list + export sources…');
 
-        const pageDocs = allResults.filter(i => {
-            const p = i.parent_id ?? i.parent_document_id;
-            return p == null || p === '';
-        });
-        const pageHLs = allResults.filter(i => {
-            const p = i.parent_id ?? i.parent_document_id;
-            return p != null && String(p).length > 0;
-        });
-
-        const docByIdStr = new Map();
-        for (const d of pageDocs) {
-            docByIdStr.set(String(d.id), d);
+        const mergedPack = this._buildMergedReferenceEntries(allResults, exportBooks, exportByHlId);
+        try {
+            const rawHist = {};
+            const mappedHist = {};
+            for (const ent of mergedPack.entries || []) {
+                const rawKey = String(ent?.doc?.category ?? '').trim() || '(empty)';
+                rawHist[rawKey] = (rawHist[rawKey] || 0) + 1;
+                const mid = this._normalizeReadwiseCategoryChoiceId(ent?.doc?.category);
+                mappedHist[mid] = (mappedHist[mid] || 0) + 1;
+            }
+            if (this._lastSyncDiag) {
+                this._lastSyncDiag.readwiseCategoryRawHistogram = rawHist;
+                this._lastSyncDiag.readwiseCategoryMappedHistogram = mappedHist;
+            }
+            this._log('Readwise categories (raw counts): ' + JSON.stringify(rawHist));
+            this._log('Readwise categories (→ Books/Articles/Podcasts): ' + JSON.stringify(mappedHist));
+        } catch (e) {
+            this._log('⚠️ Category histogram: ' + (e && e.message ? e.message : e));
         }
-
-        const allRowsById = new Map();
-        for (const r of allResults) {
-            if (r && r.id != null) allRowsById.set(String(r.id), r);
+        let docEntries = mergedPack.entries;
+        const mergedTotal = docEntries.length;
+        const dbgCap = rwrDebugMaxSources();
+        if (dbgCap > 0 && docEntries.length > dbgCap) {
+            this._log('⚠️ DEBUG: readwise_references_debug_max_sources=' + dbgCap + ' — only first ' + dbgCap + ' of ' + mergedTotal + ' sources will be written this run.');
+            docEntries = docEntries.slice(0, dbgCap);
+            if (this._lastSyncDiag) this._lastSyncDiag.debugMaxSourcesApplied = dbgCap;
         }
+        this._lastSyncDiag.pageDocs = mergedPack.pageDocsLen;
+        this._lastSyncDiag.pageHLs = mergedPack.pageHLsLen;
+        this._lastSyncDiag.highlightsWithoutDocKey = mergedPack.groupedMeta.highlightsWithoutDocKey;
+        this._lastSyncDiag.parentBuckets = mergedPack.groupedMeta.map.size;
+        this._lastSyncDiag.mergedSources = mergedTotal;
 
-        const grouped = this._groupPageHLsByOwningDocument(pageHLs, docByIdStr, allRowsById);
-        const pageHLsByDoc = grouped.map;
-        this._lastSyncDiag.pageDocs = pageDocs.length;
-        this._lastSyncDiag.pageHLs = pageHLs.length;
-        this._lastSyncDiag.highlightsWithoutDocKey = grouped.highlightsWithoutDocKey;
-        this._lastSyncDiag.parentBuckets = pageHLsByDoc.size;
+        this._log('Grouped: ' + mergedPack.pageDocsLen + ' list docs, ' + mergedPack.pageHLsLen + ' list HL rows, '
+            + mergedPack.groupedMeta.map.size + ' list parents, '
+            + mergedPack.groupedMeta.highlightsWithoutDocKey + ' list HL rows with no document key · merged '
+            + mergedTotal + ' reference sources (Reader + export)'
+            + (docEntries.length !== mergedTotal ? ' · writing ' + docEntries.length + ' this run (debug cap)' : ''));
 
-        this._log('Grouped: ' + pageDocs.length + ' docs, ' + pageHLs.length + ' HL rows, ' + pageHLsByDoc.size + ' parents, '
-            + grouped.highlightsWithoutDocKey + ' highlight rows with no document key');
+        let syntheticParentCount = mergedPack.syntheticParentCount;
 
-        let syntheticParentCount = 0;
-
-        const docEntries = Array.from(pageHLsByDoc.entries()).filter(([, hl]) => hl && hl.length > 0);
         const docTotal = docEntries.length;
         this._lastSyncDiag.docEntriesToWrite = docTotal;
         if (docTotal > 0) {
@@ -3285,27 +4219,18 @@ class Plugin extends AppPlugin {
         }
         for (let bi = 0; bi < docEntries.length; bi += RWR_SYNC_CONCURRENCY) {
             const batch = docEntries.slice(bi, bi + RWR_SYNC_CONCURRENCY);
-            const batchOut = await Promise.all(batch.map(async ([parentIdStr, docHL]) => {
-                let doc = docByIdStr.get(parentIdStr);
-                let synthAdded = 0;
-                if (!doc) {
-                    const syn = this._syntheticParentDocFromHighlight(parentIdStr, docHL[0]);
-                    const t0 = this._resolveDocTitle(syn);
-                    if (/^(note|highlight)\s*\(untitled\)$/i.test(String(t0 || '').trim())) {
-                        this._log('Skipping orphan group ' + parentIdStr + ' (' + t0 + ') — could not resolve owning document');
-                        if (this._lastSyncDiag) this._lastSyncDiag.skippedOrphans++;
-                        return { created: 0, updated: 0, synth: 0, written: 0 };
-                    }
-                    doc = syn;
-                    synthAdded = 1;
-                }
-                if (doc.category === 'rss') {
+            const batchOut = await Promise.all(batch.map(async (entry) => {
+                const doc = entry.doc;
+                const docHL = entry.docHL;
+                const extId = entry.extId;
+                const synthAdded = entry.synthFlag || 0;
+
+                if (String(doc.category || '').toLowerCase() === 'rss' && !this._rwrIncludeRss()) {
                     if (this._lastSyncDiag) this._lastSyncDiag.skippedRss++;
                     return { created: 0, updated: 0, synth: 0, written: 0 };
                 }
 
                 const docTitle = this._resolveDocTitle(doc);
-                const extId = 'readwise_' + String(doc.id);
 
                 let captureDate = null;
                 if (doc.created_at) {
@@ -3315,11 +4240,17 @@ class Plugin extends AppPlugin {
                     } catch (_) { captureDate = null; }
                 }
 
-                let refBanner = this._coverImageUrlForDoc(doc) || exportCoverByDocId.get(String(doc.id)) || '';
+                let refBanner = this._coverImageUrlForDoc(doc)
+                    || exportCoverByDocId.get(String(doc.id))
+                    || exportCoverByDocId.get(String(doc.external_id || ''))
+                    || '';
                 let personForRef = null;
                 if (peopleColl) {
                     personForRef = await this._ensurePeopleRecord(peopleColl, doc.author || '', peopleByKey);
                 }
+
+                const catLabel = String(doc.category || '').trim();
+                const srcLabel = String(doc.source || '').trim();
 
                 const fields = {
                     external_id: extId,
@@ -3328,6 +4259,9 @@ class Plugin extends AppPlugin {
                     highlight_count: docHL.length,
                     synced_at: new Date(),
                 };
+                const catChoiceId = this._normalizeReadwiseCategoryChoiceId(catLabel);
+                if (catChoiceId) fields.source_category = catChoiceId;
+                fields.source_origin = this._normalizeReadwiseSourceOriginChoiceId(srcLabel);
                 if (personForRef && personForRef.guid) fields.source_author = personForRef;
                 if (refBanner) fields.banner = refBanner;
                 if (captureDate) fields.captured_at = captureDate;
@@ -3391,8 +4325,8 @@ class Plugin extends AppPlugin {
 
         this._lastSyncDiag.createdRef = createdRef;
         this._lastSyncDiag.updatedRef = updatedRef;
-        this._log('[ReadwiseRef] SYNC_DIAG ' + JSON.stringify(this._lastSyncDiag));
-        this._persistSyncDiag({ ok: true });
+        this._log('SYNC_DIAG ' + JSON.stringify(this._lastSyncDiag));
+        this._persistSyncDiag({ ok: true, syncPhase: 'complete' });
 
         this._syncStatusShow('Refreshing workspace…');
         await this._tryHostCollectionRefresh(refsColl);
@@ -3430,7 +4364,6 @@ class Plugin extends AppPlugin {
             return;
         }
 
-        await this._sleep(12);
         let items;
         try {
             items = await record.getLineItems();
@@ -3509,7 +4442,9 @@ class Plugin extends AppPlugin {
 
             let prevUnderDate = null;
             for (let hi = 0; hi < highlights.length; hi++) {
-                if (hi > 0 && hi % RWR_BODY_YIELD_EVERY_HIGHLIGHTS === 0) await this._sleep(0);
+                if (RWR_BODY_YIELD_EVERY_HIGHLIGHTS > 0 && hi > 0 && hi % RWR_BODY_YIELD_EVERY_HIGHLIGHTS === 0) {
+                    await this._sleep(0);
+                }
                 const h = highlights[hi];
                 const body = this._highlightBody(h);
                 const ex = exportByHlId.get(String(h.id)) || exportByHlId.get(String(h.external_id ?? ''));
@@ -3680,10 +4615,12 @@ class Plugin extends AppPlugin {
     }
 
     async _getRecordReady(guid) {
-        for (let i = 0; i < 20; i++) {
+        const attempts = 90;
+        const gapMs = 120;
+        for (let i = 0; i < attempts; i++) {
             const r = this.data?.getRecord?.(guid);
             if (r && typeof r.getLineItems === 'function' && typeof r.createLineItem === 'function') return r;
-            await this._sleep(100);
+            await this._sleep(gapMs);
         }
         return null;
     }
@@ -3807,9 +4744,12 @@ class Plugin extends AppPlugin {
             const u = tryUrl(h.readwise_url) || tryUrl(h.url) || tryUrl(h.highlight_url)
                 || tryUrl(h.reader_url) || tryUrl(h.location_url);
             if (u) return u;
-            const id = h.id;
-            if (id != null && String(id).length > 0) {
-                return 'https://readwise.io/open/' + encodeURIComponent(String(id));
+            /** Reader rows often use a ULID `id` while `external_id` is the classic numeric open id. */
+            const ext = h.external_id != null ? String(h.external_id).trim() : '';
+            const idv = h.id != null ? String(h.id).trim() : '';
+            const openId = (/^\d+$/.test(ext) && !/^\d+$/.test(idv)) ? ext : (idv || ext);
+            if (openId.length > 0) {
+                return 'https://readwise.io/open/' + encodeURIComponent(openId);
             }
         }
         return '';
@@ -3822,6 +4762,139 @@ class Plugin extends AppPlugin {
 
     _normalizePeopleKey(name) {
         return String(name || '').trim().toLowerCase().replace(/\s+/g, ' ');
+    }
+
+    /**
+     * Count distinct string values from API rows (`trim`; missing/blank → `(empty)`).
+     * Used for diagnostics: see raw Readwise **category** vs **source** (e.g. `epub`, `kindle` often appear on **source**).
+     */
+    _readwiseHistogramStrings(rows, pick) {
+        const h = Object.create(null);
+        for (const r of rows || []) {
+            let v = '';
+            try {
+                v = pick(r);
+            } catch (_) {
+                v = '';
+            }
+            const k = String(v ?? '').trim() || '(empty)';
+            h[k] = (h[k] || 0) + 1;
+        }
+        return h;
+    }
+
+    /**
+     * Map Readwise `category` strings to `source_category` choice ids: **books** | **articles** | **podcasts** | **video**.
+     * Defaults:
+     *  - `books`, `supplementals`, `supplemental_books`, `epub` → **books**
+     *  - `podcast`, `podcasts` → **podcasts**
+     *  - `video`, `videos` → **video**
+     *  - everything else (articles, article, email, rss, pdf, tweet, …) → **articles**
+     * Override per workspace: `localStorage.readwise_references_category_map` JSON (see `rwrCategoryMapOverride` JSDoc).
+     */
+    _normalizeReadwiseCategoryChoiceId(raw) {
+        const rawTrim = String(raw || '').trim();
+        const rawKey = rawTrim || '(empty)';
+        let k = rawTrim.toLowerCase().replace(/\s+/g, '_');
+        const aliases = {
+            supplementalbooks: 'supplemental_books',
+            supplementals: 'supplemental_books',
+            supplemental: 'supplemental_books',
+            podcast: 'podcasts',
+            videos: 'video',
+            reader_document: 'reader',
+            reader_documents: 'reader',
+            feed: 'rss',
+            feeds: 'rss',
+        };
+        if (aliases[k]) k = aliases[k];
+        const over = rwrCategoryMapOverride();
+        if (over) {
+            let spec = null;
+            if (over[rawKey] != null) spec = over[rawKey];
+            else if (k && over[k] != null) spec = over[k];
+            if (spec != null) {
+                const t = String(spec).trim().toLowerCase();
+                if (t === 'books' || t === 'articles' || t === 'podcasts' || t === 'video') return t;
+            }
+        }
+        if (k === 'books' || k === 'supplemental_books' || k === 'epub') return 'books';
+        if (k === 'podcasts') return 'podcasts';
+        if (k === 'video') return 'video';
+        return 'articles';
+    }
+
+    /** Label/id for footers & pool — `source_category` is a choice field. */
+    _readwiseSourceCategoryLabel(record) {
+        try {
+            if (record && typeof record.choice === 'function') {
+                const ch = record.choice('source_category');
+                if (ch == null) return '';
+                if (typeof ch === 'string') return ch;
+                return String(ch.label || ch.id || '').trim();
+            }
+        } catch (_) {}
+        return '';
+    }
+
+    /**
+     * Map Readwise `doc.source` to `source_origin` choice id.
+     * Empty / unknown source → `unknown`. Anything not aliased and not in `READWISE_SOURCE_ORIGIN_ALLOWED` → `other`.
+     * Override: `localStorage.readwise_references_source_map` (see `rwrSourceMapOverride`).
+     */
+    _normalizeReadwiseSourceOriginChoiceId(raw) {
+        const rawTrim = String(raw || '').trim();
+        const rawKey = rawTrim || '(empty)';
+        if (!rawTrim) return 'unknown';
+        let k = rawTrim.toLowerCase().replace(/\s+/g, '_').replace(/-/g, '_');
+        const aliases = {
+            /** Reader sub-channels — collapse extra suffixes Readwise sometimes appends. */
+            reader_mobile_app: 'reader_mobile',
+            reader_web_app: 'reader_web',
+            reader_share_sheet_android: 'reader_share_sheet',
+            reader_share_sheet_ios: 'reader_share_sheet',
+            reader_share_sheet_web: 'reader_share_sheet',
+            reader_in_app_link_save: 'reader_in_app_save',
+            reader_in_app_save: 'reader_in_app_save',
+            reader_add_from_import_url: 'reader_import_url',
+            reader_add_from_clipboard: 'reader_clipboard',
+            /** Readwise alone is the original Readwise (non-Reader) account ingest. */
+            readwise: 'reader',
+            readwise_reader: 'reader',
+            /** Uploads / files. */
+            file: 'upload',
+            files: 'upload',
+            file_upload: 'upload',
+            /** PDF as a Readwise book source = uploaded PDF. */
+            pdf: 'pdf_upload',
+        };
+        if (aliases[k]) k = aliases[k];
+        const over = rwrSourceMapOverride();
+        if (over) {
+            let spec = null;
+            if (over[rawKey] != null) spec = over[rawKey];
+            else if (over[rawTrim] != null) spec = over[rawTrim];
+            else if (k && over[k] != null) spec = over[k];
+            if (spec != null) {
+                const t = String(spec).trim().toLowerCase().replace(/\s+/g, '_').replace(/-/g, '_');
+                if (READWISE_SOURCE_ORIGIN_ALLOWED.has(t)) return t;
+            }
+        }
+        if (READWISE_SOURCE_ORIGIN_ALLOWED.has(k)) return k;
+        return 'other';
+    }
+
+    /** Label for `source_origin` choice field (chip / UI). */
+    _readwiseSourceOriginLabel(record) {
+        try {
+            if (record && typeof record.choice === 'function') {
+                const ch = record.choice('source_origin');
+                if (ch == null) return '';
+                if (typeof ch === 'string') return ch;
+                return String(ch.label || ch.id || '').trim();
+            }
+        } catch (_) {}
+        return '';
     }
 
     async _ensurePeopleRecord(peopleColl, rawName, peopleByKey) {
@@ -3951,7 +5024,20 @@ class Plugin extends AppPlugin {
         if (prev) clearTimeout(prev);
         this._navDeferTimers.set(panelId, setTimeout(() => {
             this._navDeferTimers.delete(panelId);
-            this._handlePanel(panel);
+            const run = () => {
+                try {
+                    this._handlePanel(panel);
+                } catch (_) {}
+            };
+            try {
+                if (typeof requestIdleCallback === 'function') {
+                    requestIdleCallback(run, { timeout: 1200 });
+                } else {
+                    requestAnimationFrame(() => requestAnimationFrame(run));
+                }
+            } catch (_) {
+                run();
+            }
         }, RWR_PANEL_DEBOUNCE_MS));
     }
 
@@ -4022,12 +5108,18 @@ class Plugin extends AppPlugin {
                 };
                 this._panelStates.set(panelId, state);
                 state._containerWatcher = new MutationObserver(() => {
-                    const c = this._findContainer(panelEl);
-                    if (c) {
-                        try { state._containerWatcher?.disconnect(); } catch (_) {}
-                        state._containerWatcher = null;
-                        this._handlePanel(panel);
-                    }
+                    try {
+                        if (state._cwTimer) clearTimeout(state._cwTimer);
+                    } catch (_) {}
+                    state._cwTimer = setTimeout(() => {
+                        state._cwTimer = null;
+                        const c = this._findContainer(panelEl);
+                        if (c) {
+                            try { state._containerWatcher?.disconnect(); } catch (_) {}
+                            state._containerWatcher = null;
+                            this._deferHandlePanel(panel);
+                        }
+                    }, RWR_MUTATION_OBS_DEBOUNCE_MS);
                 });
                 try {
                     state._containerWatcher.observe(panelEl, { childList: true, subtree: true });
@@ -4078,6 +5170,10 @@ class Plugin extends AppPlugin {
         } else {
             try { state._containerWatcher?.disconnect(); } catch (_) {}
             state._containerWatcher = null;
+            try {
+                if (state._cwTimer) clearTimeout(state._cwTimer);
+            } catch (_) {}
+            state._cwTimer = null;
             state.journalDate = journalDate;
             state.recordGuid = record.guid;
             state.panel = panel;
@@ -4110,6 +5206,14 @@ class Plugin extends AppPlugin {
         }
         const s = this._panelStates.get(panelId);
         if (!s) return;
+        try {
+            if (s._mutObsTimer) clearTimeout(s._mutObsTimer);
+        } catch (_) {}
+        s._mutObsTimer = null;
+        try {
+            if (s._cwTimer) clearTimeout(s._cwTimer);
+        } catch (_) {}
+        s._cwTimer = null;
         try { s.observer?.disconnect(); } catch (_) {}
         try { s._containerWatcher?.disconnect(); } catch (_) {}
         try { clearTimeout(s._navTimer); } catch (_) {}
@@ -4181,7 +5285,11 @@ class Plugin extends AppPlugin {
                 && state.observer);
         }
         if (fast) {
-            if (!state.observer) state.observer = this._createFooterObserver(state, panelEl);
+            if (!state.observer) {
+                state.observer = this._createFooterObserver(state, panelEl, container, {
+                    wide: !!(suiteHi || suiteSh),
+                });
+            }
             if (container) {
                 if (state.rootEl?.parentElement === container) this._ensureFooterBottom(state, container);
                 if (state.shufflerRootEl?.parentElement === container) this._ensureFooterBottom(state, container);
@@ -4193,6 +5301,10 @@ class Plugin extends AppPlugin {
             try { state.observer.disconnect(); } catch (_) {}
             state.observer = null;
         }
+        try {
+            if (state._mutObsTimer) clearTimeout(state._mutObsTimer);
+        } catch (_) {}
+        state._mutObsTimer = null;
         try { clearTimeout(state._navTimer); } catch (_) {}
 
         this._stripThJournalFooters(state.panelId, parents);
@@ -4231,7 +5343,9 @@ class Plugin extends AppPlugin {
             }
         }
 
-        state.observer = this._createFooterObserver(state, panelEl);
+        state.observer = this._createFooterObserver(state, panelEl, container, {
+            wide: !!(suiteHi || suiteSh),
+        });
         return true;
     }
 
@@ -4245,8 +5359,20 @@ class Plugin extends AppPlugin {
         }
     }
 
-    _createFooterObserver(state, panelEl) {
-        const obs = new MutationObserver(() => {
+    /**
+     * When footers mount under `.page-content` only (`wide:false`), observe that node with `subtree:false`
+     * so header / editor mutations do not fire this observer. JFS mounts (`suiteHi` / `suiteSh`) still use
+     * the full panel (wide) so we do not miss suite DOM.
+     */
+    _createFooterObserver(state, panelEl, containerEl, opts) {
+        const wide = !!(opts && opts.wide);
+        const obsRoot = wide
+            ? panelEl
+            : (containerEl && typeof containerEl.nodeType === 'number' && containerEl.nodeType === 1
+                ? containerEl
+                : panelEl);
+        const narrow = !wide && obsRoot === containerEl && !!containerEl;
+        const flush = () => {
             const lostHi = state.rootEl && !state.rootEl.isConnected;
             const lostSh = state.shufflerRootEl && !state.shufflerRootEl.isConnected;
             if (lostHi || lostSh) {
@@ -4254,8 +5380,8 @@ class Plugin extends AppPlugin {
                 state._navTimer = setTimeout(() => {
                     const stillLost = (state.rootEl && !state.rootEl.isConnected)
                         || (state.shufflerRootEl && !state.shufflerRootEl.isConnected);
-                    if (state.panel && stillLost) this._handlePanel(state.panel);
-                }, 300);
+                    if (state.panel && stillLost) this._deferHandlePanel(state.panel);
+                }, 800);
             }
             const container = this._findContainer(panelEl);
             if (container) {
@@ -4266,8 +5392,25 @@ class Plugin extends AppPlugin {
                     this._ensureFooterBottom(state, container);
                 }
             }
+        };
+        const obs = new MutationObserver(() => {
+            try {
+                if (state._mutObsTimer) clearTimeout(state._mutObsTimer);
+            } catch (_) {}
+            state._mutObsTimer = setTimeout(() => {
+                state._mutObsTimer = null;
+                try {
+                    flush();
+                } catch (_) {}
+            }, RWR_MUTATION_OBS_DEBOUNCE_MS);
         });
-        obs.observe(panelEl, { childList: true, subtree: true });
+        try {
+            obs.observe(obsRoot, narrow ? { childList: true, subtree: false } : { childList: true, subtree: true });
+        } catch (_) {
+            try {
+                obs.observe(panelEl, { childList: true, subtree: true });
+            } catch (_) {}
+        }
         return obs;
     }
 
@@ -4446,6 +5589,22 @@ class Plugin extends AppPlugin {
     // Data & rendering
     // =========================================================================
 
+    /** Let Thymer paint journal chrome (e.g. Journal Header Suite) before References I/O. */
+    async _yieldForJournalPaint() {
+        await new Promise((r) => {
+            try {
+                requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(r, 0)));
+            } catch (_) {
+                setTimeout(r, 0);
+            }
+        });
+        try {
+            if (typeof requestIdleCallback === 'function') {
+                await new Promise((r) => requestIdleCallback(() => r(), { timeout: 500 }));
+            }
+        } catch (_) {}
+    }
+
     async _populate(state) {
         if (state.loading) return;
         state.loading = true;
@@ -4473,6 +5632,7 @@ class Plugin extends AppPlugin {
         if (shBody) shBody.innerHTML = '<div class="th-loading">Loading quote library…</div>';
 
         try {
+            await this._yieldForJournalPaint();
             const jobs = [];
             if (hiBody) {
                 jobs.push(this._populateHighlightsSection(
@@ -4942,8 +6102,7 @@ class Plugin extends AppPlugin {
             for (let j = 0; j < chunk.length; j++) {
                 const record = chunk[j];
                 for (const row of parsed[j]) {
-                    let category = '';
-                    try { category = record.prop('category')?.choice?.() || ''; } catch (_) {}
+                    const category = this._readwiseSourceCategoryLabel(record);
                     const guid = record.guid;
                     results.push({
                         guid,
@@ -5029,8 +6188,7 @@ class Plugin extends AppPlugin {
             for (let j = 0; j < chunk.length; j++) {
                 const record = chunk[j];
                 for (const row of parsed[j]) {
-                    let category = '';
-                    try { category = record.prop('category')?.choice?.() || ''; } catch (_) {}
+                    const category = this._readwiseSourceCategoryLabel(record);
                     results.push({
                         guid:          record.guid,
                         record,
@@ -5288,7 +6446,7 @@ class Plugin extends AppPlugin {
                     source_title: this._sourceTitleLabel(record),
                     source_author: this._authorLabel(record),
                     location:     record.text('location')     || '',
-                    category:     record.prop('category')?.choice() || '',
+                    category:     this._readwiseSourceCategoryLabel(record),
                 });
             }
             if (idx % 120 === 0) await this._sleep(0);
@@ -6036,9 +7194,80 @@ class Plugin extends AppPlugin {
         `);
     }
 
+    /**
+     * Readwise sends `Retry-After` on 429 (seconds as integer, or HTTP-date). Falls back to `fallbackMs`.
+     */
+    _rwrRetryAfterMs(resp, fallbackMs) {
+        const fb = Math.max(1000, Number(fallbackMs) || 60_000);
+        try {
+            const ra = resp && resp.headers && typeof resp.headers.get === 'function'
+                ? resp.headers.get('Retry-After')
+                : null;
+            if (ra == null || String(ra).trim() === '') return fb;
+            const t = String(ra).trim();
+            const sec = parseInt(t, 10);
+            if (Number.isFinite(sec) && sec > 0) return Math.min(sec * 1000, 600_000);
+            const when = Date.parse(t);
+            if (Number.isFinite(when)) {
+                const delta = when - Date.now();
+                if (delta > 500) return Math.min(delta, 600_000);
+            }
+        } catch (_) {}
+        return fb;
+    }
+
     _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
     _trunc(s, max) { return s && s.length > max ? s.slice(0, max - 1) + '...' : (s || ''); }
-    _log(msg) { console.log('[ReadwiseRef] ' + msg); }
+    /**
+     * Console output for sync / diagnostics. Default is `console.info` (visible when DevTools hides “Verbose” / `log`).
+     *
+     * `localStorage.readwise_references_console`:
+     *   - `info` (default) — `console.info`
+     *   - `log` — `console.log`
+     *   - `warn` — `console.warn` (hardest to miss)
+     *   - `both` — `log` + `info`
+     *
+     * `localStorage.readwise_references_console_mirror_top` = `1` — also emit from `window.top` (helps if the plugin runs in an iframe and your console context is “top”).
+     */
+    _log(msg) {
+        const line = '[ReadwiseRef] ' + msg;
+        let mode = 'info';
+        let mirrorTop = false;
+        try {
+            mode = String(localStorage.getItem('readwise_references_console') || 'info').toLowerCase();
+            const m = localStorage.getItem('readwise_references_console_mirror_top');
+            mirrorTop = m === '1' || m === 'true' || m === 'on';
+        } catch (_) {}
+
+        const topEmit = (fnName) => {
+            try {
+                const t = typeof window !== 'undefined' ? window.top : null;
+                if (!t || t === window || !t.console) return;
+                const c = t.console;
+                if (fnName === 'warn' && c.warn) c.warn(line);
+                else if (fnName === 'log' && c.log) c.log(line);
+                else if (c.info) c.info(line);
+            } catch (_) {}
+        };
+
+        if (mode === 'warn') {
+            try { console.warn(line); } catch (_) {}
+            if (mirrorTop) topEmit('warn');
+        } else if (mode === 'log') {
+            try { console.log(line); } catch (_) {}
+            if (mirrorTop) topEmit('log');
+        } else if (mode === 'both') {
+            try { console.log(line); } catch (_) {}
+            try { console.info(line); } catch (_) {}
+            if (mirrorTop) {
+                topEmit('log');
+                topEmit('info');
+            }
+        } else {
+            try { console.info(line); } catch (_) {}
+            if (mirrorTop) topEmit('info');
+        }
+    }
     /** Minimal HTML escape for status bar labels. */
     _syncStatusEscape(s) {
         return String(s || '')
