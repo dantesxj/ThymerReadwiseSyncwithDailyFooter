@@ -2636,8 +2636,8 @@
 /**
  * Readwise References (Option B) — one **References** record per Readwise source document.
  * All highlights live under `❣️ Highlights...` in the body, grouped by calendar day (see
- * `formatReadwiseRefDateHeading`). Notes and Readwise URLs are child blocks under each quote.
- *
+ * `formatReadwiseRefDateHeading`: weekday, month, day, and **year** so daily matching is unambiguous).
+ * Notes and Readwise URLs are child blocks under each quote.
  * **Today's Highlights:** Journal footer listing highlights for the open journal day (References
  * body parse, or legacy Highlights collection fallback).
  *
@@ -2689,7 +2689,7 @@ const RWR_UI_REFS_COLL_REFRESH_EVERY = 0;
 const RWR_PANEL_DEBOUNCE_MS = 650;
 /** Coalesce MutationObserver callbacks — subtree:true sees every header/journal DOM tick; without this Readwise fights Journal Header Suite. */
 const RWR_MUTATION_OBS_DEBOUNCE_MS = 450;
-/** Coalesce `record.created` → `_refreshAll` (habit logs etc. can fire in bursts). */
+/** Coalesce `record.created` → `await _ensureRwCollections()` then cache clear + `_refreshAll` only if References may be affected (SDK: `ev.collectionGuid`; empty pending = conservative refresh). */
 const RWR_RECORD_CREATED_DEBOUNCE_MS = 1500;
 
 /**
@@ -2804,21 +2804,53 @@ const READWISE_REF_QUOTE_SEPARATOR_TEXT = '\u2500'.repeat(28);
 /** Separator between calendar-day groups (sibling lines under the Highlights section). */
 const READWISE_REF_BETWEEN_DATE_DIVIDER_TEXT = '\u2500'.repeat(36);
 
+/** Month abbrev → 0–11 for parsing `Mon May 11, 2026` style headings. */
+const READWISE_REF_MONTH_ABBREV = {
+    Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11,
+};
+
 /**
- * Canonical date line under each day group (e.g. "Sat Apr 18"). Used by sync and journal footer parser.
+ * Parse plain date heading text with explicit year → `YYYYMMDD` or null.
+ * Accepts the canonical format from {@link formatReadwiseRefDateHeading}.
+ * @param {string} plain
+ */
+function parseReadwiseRefDateHeadingYmd(plain) {
+    const s = String(plain || '').trim();
+    const m = /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat)\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),\s*(\d{4})$/.exec(s);
+    if (!m) return null;
+    const mo = READWISE_REF_MONTH_ABBREV[m[2]];
+    if (mo === undefined) return null;
+    const d = parseInt(m[3], 10);
+    const y = parseInt(m[4], 10);
+    if (d < 1 || d > 31 || y < 1970 || y > 2100) return null;
+    const dt = new Date(y, mo, d);
+    if (isNaN(dt.getTime())) return null;
+    if (dt.getFullYear() !== y || dt.getMonth() !== mo || dt.getDate() !== d) return null;
+    const wk = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    if (wk[dt.getDay()] !== m[1]) return null;
+    const mm = String(mo + 1).padStart(2, '0');
+    const dd = String(d).padStart(2, '0');
+    return `${y}${mm}${dd}`;
+}
+
+/**
+ * Canonical date line under each day group (e.g. "Sat Apr 18, 2026"). Used by sync and journal footer parser.
+ * The year is required so the same calendar month/day in different years does not collide in Today’s Highlights matching.
  * @param {Date} d
  */
 function formatReadwiseRefDateHeading(d) {
     if (!d || !(d instanceof Date) || isNaN(d.getTime())) return '';
     const wk = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
     const mo = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-    return wk[d.getDay()] + ' ' + mo[d.getMonth()] + ' ' + d.getDate();
+    return wk[d.getDay()] + ' ' + mo[d.getMonth()] + ' ' + d.getDate() + ', ' + d.getFullYear();
 }
 
 class Plugin extends AppPlugin {
     /** Workspace-scoped cache for named collections (one `getAllCollections` until cleared). */
     _rwCollsKey = null;
     _rwCollsResolved = false;
+    /** Cached References `collection.getGuid()` for `record.created` filtering (survives until workspace coll cache invalidates). */
+    _rwReferencesCollGuid = null;
     _rwRefsColl = null;
     _rwPeopleColl = null;
     _rwHighlightsColl = null;
@@ -2831,6 +2863,8 @@ class Plugin extends AppPlugin {
     _rwRefsBootstrapDeferIsIdle = false;
     /** Trailing debounce for `record.created` → footer refresh (cleared on unload). */
     _rwRecordCreatedRefreshTimer = null;
+    /** `collectionGuid` values seen during the current debounce window (for post-`ensure` filtering). */
+    _rwRecordCreatedPendingColls = new Set();
     /** Resolves after `registerPluginSlug` + `ThymerPluginSettings.init` finish (deferred off critical path). */
     _rwPathBReadyPromise = null;
     _rwPathBReadyResolve = null;
@@ -2883,6 +2917,11 @@ class Plugin extends AppPlugin {
         if (this._rwCollsKey === key && this._rwCollsResolved) return;
         const all = await this.data.getAllCollections();
         this._rwRefsColl = all.find((c) => c.getName() === 'References') || null;
+        try {
+            this._rwReferencesCollGuid = this._rwRefsColl?.getGuid?.() || null;
+        } catch (_) {
+            this._rwReferencesCollGuid = null;
+        }
         this._rwPeopleColl = all.find((c) => c.getName() === 'People') || null;
         this._rwHighlightsColl = all.find((c) => c.getName() === 'Highlights') || null;
         this._rwCollsKey = key;
@@ -2892,6 +2931,7 @@ class Plugin extends AppPlugin {
     _invalidateRwCollectionHandleCache() {
         this._rwCollsKey = null;
         this._rwCollsResolved = false;
+        this._rwReferencesCollGuid = null;
         this._rwRefsColl = null;
         this._rwPeopleColl = null;
         this._rwHighlightsColl = null;
@@ -3086,16 +3126,36 @@ class Plugin extends AppPlugin {
         this._eventHandlerIds.push(this.events.on('panel.navigated', ev => this._deferHandlePanel(ev.panel)));
         this._eventHandlerIds.push(this.events.on('panel.focused',   ev => this._deferHandlePanel(ev.panel)));
         this._eventHandlerIds.push(this.events.on('panel.closed',    ev => this._disposePanel(ev.panel?.getId?.())));
-        this._eventHandlerIds.push(this.events.on('record.created', () => {
-            this._clearFooterDataCaches();
+        this._eventHandlerIds.push(this.events.on('record.created', (ev) => {
+            const refsGuid = this._rwReferencesCollGuid;
+            const collGuid = ev?.collectionGuid ?? null;
+            if (refsGuid && collGuid && collGuid !== refsGuid) return;
+
+            if (collGuid) this._rwRecordCreatedPendingColls.add(collGuid);
+
             try {
                 if (this._rwRecordCreatedRefreshTimer) clearTimeout(this._rwRecordCreatedRefreshTimer);
             } catch (_) {}
             this._rwRecordCreatedRefreshTimer = setTimeout(() => {
                 this._rwRecordCreatedRefreshTimer = null;
-                try {
-                    this._refreshAll();
-                } catch (_) {}
+                const pending = this._rwRecordCreatedPendingColls;
+                this._rwRecordCreatedPendingColls = new Set();
+                void (async () => {
+                    if (this._rwUnloaded) return;
+                    try {
+                        await this._ensureRwCollections();
+                    } catch (_) {}
+                    if (this._rwUnloaded) return;
+                    const refs = this._rwReferencesCollGuid;
+                    if (!refs) return;
+                    if (pending.size > 0 && ![...pending].some((g) => g === refs)) return;
+                    try {
+                        this._clearFooterDataCaches();
+                    } catch (_) {}
+                    try {
+                        this._refreshAll();
+                    } catch (_) {}
+                })();
             }, RWR_RECORD_CREATED_DEBOUNCE_MS);
         }));
         /**
@@ -3155,6 +3215,9 @@ class Plugin extends AppPlugin {
             if (this._rwRecordCreatedRefreshTimer) clearTimeout(this._rwRecordCreatedRefreshTimer);
         } catch (_) {}
         this._rwRecordCreatedRefreshTimer = null;
+        try {
+            this._rwRecordCreatedPendingColls?.clear();
+        } catch (_) {}
         for (const id of (this._eventHandlerIds || [])) {
             try { this.events.off(id); } catch (_) {}
         }
@@ -6265,11 +6328,11 @@ class Plugin extends AppPlugin {
     }
 
     /**
-     * Date line may be plain text (legacy) or a ref to the journal record (Readwise References sync).
+     * Date line may be plain text or a ref to the journal record (Readwise References sync).
+     * Refs are checked first (exact calendar day). Plain text must include the year (new format) or parse to it;
+     * yearless labels matched the first same weekday+month+day block across years and mis-attributed highlights.
      */
     async _dateLineMatchesJournalDay(line, yyyymmdd, targetDateLabel) {
-        const plain = (await this._linePlainText(line)).trim();
-        if (plain === targetDateLabel) return true;
         const segs = await this._lineSegments(line);
         for (const seg of segs) {
             if (seg?.type !== 'ref' || !seg.text) continue;
@@ -6286,6 +6349,10 @@ class Plugin extends AppPlugin {
                 }
             } catch (_) {}
         }
+        const plain = (await this._linePlainText(line)).trim();
+        if (plain === targetDateLabel) return true;
+        const parsedYmd = parseReadwiseRefDateHeadingYmd(plain);
+        if (parsedYmd === yyyymmdd) return true;
         return false;
     }
 
