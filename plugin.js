@@ -1632,6 +1632,150 @@
     } catch (_) {}
   }
 
+  const LOCAL_MIRROR_META_PREFIX = 'thymerext_ps_local_meta_v1:';
+
+  function localMirrorMetaKey(pluginId) {
+    return LOCAL_MIRROR_META_PREFIX + encodeURIComponent(String(pluginId || 'unknown'));
+  }
+
+  function parseIsoMs(s) {
+    const n = Date.parse(String(s || ''));
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  function readLocalMirrorMeta(pluginId) {
+    try {
+      const raw = localStorage.getItem(localMirrorMetaKey(pluginId));
+      const parsed = raw ? JSON.parse(raw) : null;
+      if (parsed && typeof parsed === 'object') return parsed;
+    } catch (_) {}
+    return {};
+  }
+
+  function writeLocalMirrorMeta(pluginId, meta) {
+    try {
+      localStorage.setItem(localMirrorMetaKey(pluginId), JSON.stringify(meta || {}));
+    } catch (_) {}
+  }
+
+  function markLocalMirrorKeys(pluginId, keys, updatedAt) {
+    if (!pluginId || !Array.isArray(keys)) return;
+    const meta = readLocalMirrorMeta(pluginId);
+    const ts = updatedAt || new Date().toISOString();
+    let changed = false;
+    for (const k of keys) {
+      if (!k) continue;
+      let exists = false;
+      try {
+        exists = localStorage.getItem(k) !== null;
+      } catch (_) {}
+      if (!exists) continue;
+      meta[k] = { updatedAt: ts };
+      changed = true;
+    }
+    if (changed) writeLocalMirrorMeta(pluginId, meta);
+  }
+
+  function collectLocalMirrorPayload(keys) {
+    const payload = {};
+    if (!Array.isArray(keys)) return payload;
+    for (const k of keys) {
+      if (!k) continue;
+      try {
+        const v = localStorage.getItem(k);
+        if (v !== null) payload[k] = v;
+      } catch (_) {}
+    }
+    return payload;
+  }
+
+  function localPayloadMatchesRemote(keys, remote) {
+    if (!remote || !remote.payload || typeof remote.payload !== 'object') return false;
+    if (!Array.isArray(keys)) return true;
+    for (const k of keys) {
+      if (!k) continue;
+      let localValue = null;
+      try {
+        localValue = localStorage.getItem(k);
+      } catch (_) {}
+      const remoteValue = remote.payload[k];
+      if (localValue === null && typeof remoteValue !== 'string') continue;
+      if (localValue !== remoteValue) return false;
+    }
+    return true;
+  }
+
+  function applyRemoteMirrorPayload(pluginId, keys, remote) {
+    const result = { needsFlush: false };
+    if (!remote || !remote.payload || typeof remote.payload !== 'object') return result;
+    const meta = readLocalMirrorMeta(pluginId);
+    const remoteUpdatedAt = String(remote.updatedAt || '');
+    const remoteMs = parseIsoMs(remoteUpdatedAt);
+    let metaChanged = false;
+    for (const k of keys) {
+      if (!k) continue;
+      const remoteValue = remote.payload[k];
+      if (typeof remoteValue !== 'string') continue;
+
+      let localValue = null;
+      try {
+        localValue = localStorage.getItem(k);
+      } catch (_) {}
+
+      if (localValue === remoteValue) {
+        if (remoteUpdatedAt && (!meta[k] || !meta[k].updatedAt)) {
+          meta[k] = { updatedAt: remoteUpdatedAt };
+          metaChanged = true;
+        }
+        continue;
+      }
+
+      if (localValue === null) {
+        try {
+          localStorage.setItem(k, remoteValue);
+          if (remoteUpdatedAt) {
+            meta[k] = { updatedAt: remoteUpdatedAt };
+            metaChanged = true;
+          }
+        } catch (_) {}
+        continue;
+      }
+
+      const localMs = parseIsoMs(meta[k]?.updatedAt);
+      if (localMs && remoteMs && remoteMs > localMs + 1000) {
+        try {
+          localStorage.setItem(k, remoteValue);
+          meta[k] = { updatedAt: remoteUpdatedAt };
+          metaChanged = true;
+        } catch (_) {}
+        continue;
+      }
+
+      // When freshness is ambiguous, preserve the browser's current settings and let flushNow repair the vault row.
+      result.needsFlush = true;
+      if (!localMs) {
+        meta[k] = { updatedAt: new Date().toISOString() };
+        metaChanged = true;
+      }
+      console.warn('[ThymerPluginSettings] Kept local settings instead of overwriting with older/ambiguous synced payload', {
+        pluginId,
+        key: k,
+        localUpdatedAt: meta[k]?.updatedAt || null,
+        remoteUpdatedAt: remoteUpdatedAt || null,
+      });
+    }
+    if (metaChanged) writeLocalMirrorMeta(pluginId, meta);
+    return result;
+  }
+
+  function shouldFlushMirrorOnInit(keys, remote, applyResult) {
+    if (applyResult?.needsFlush) return true;
+    if (remote && remote.payload && typeof remote.payload === 'object') {
+      return !localPayloadMatchesRemote(keys, remote);
+    }
+    return Object.keys(collectLocalMirrorPayload(keys)).length > 0;
+  }
+
   async function listRows(data, { pluginSlug, recordKind } = {}) {
     const slug = (pluginSlug || '').trim();
     if (!slug) return [];
@@ -1818,20 +1962,18 @@
       plugin._pluginSettingsSyncMode = mode === 'synced' ? 'synced' : 'local';
       plugin._pluginSettingsPluginId = pluginId;
       const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+      let initFlushNeeded = false;
 
       if (plugin._pluginSettingsSyncMode === 'synced' && remote && remote.payload && typeof remote.payload === 'object') {
-        for (const k of keys) {
-          const v = remote.payload[k];
-          if (typeof v === 'string') {
-            try {
-              localStorage.setItem(k, v);
-            } catch (_) {}
-          }
-        }
+        const applyResult = applyRemoteMirrorPayload(pluginId, keys, remote);
+        initFlushNeeded = shouldFlushMirrorOnInit(keys, remote, applyResult);
+      } else if (plugin._pluginSettingsSyncMode === 'synced') {
+        initFlushNeeded = shouldFlushMirrorOnInit(keys, remote, null);
       }
 
-      if (plugin._pluginSettingsSyncMode === 'synced') {
+      if (plugin._pluginSettingsSyncMode === 'synced' && initFlushNeeded) {
         try {
+          markLocalMirrorKeys(pluginId, keys);
           await g.ThymerPluginSettings.flushNow(data, pluginId, keys);
         } catch (_) {}
       }
@@ -1840,6 +1982,7 @@
     scheduleFlush(plugin, mirrorKeys) {
       if (plugin._pluginSettingsSyncMode !== 'synced') return;
       const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+      markLocalMirrorKeys(plugin._pluginSettingsPluginId, keys);
       if (plugin._pluginSettingsFlushTimer) clearTimeout(plugin._pluginSettingsFlushTimer);
       plugin._pluginSettingsFlushTimer = setTimeout(() => {
         plugin._pluginSettingsFlushTimer = null;
@@ -1924,7 +2067,10 @@
       } catch (_) {}
       plugin._pluginSettingsSyncMode = pick === 'synced' ? 'synced' : 'local';
       const keyList = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
-      if (pick === 'synced') await g.ThymerPluginSettings.flushNow(data, pluginId, keyList);
+      if (pick === 'synced') {
+        markLocalMirrorKeys(pluginId, keyList);
+        await g.ThymerPluginSettings.flushNow(data, pluginId, keyList);
+      }
       ui.addToaster?.({
         title: label,
         message: pick === 'synced' ? 'Settings will sync across devices.' : 'Settings stay on this device only.',
