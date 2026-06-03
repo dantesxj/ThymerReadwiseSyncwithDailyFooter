@@ -251,13 +251,15 @@ localStorage.removeItem('readwise_references_debug_max_export_pages');
 
 ### RSS
 
-RSS feeds are **skipped by default**. To include them as References:
+Reader/Readwise sources with **`category: rss`** (common for Substack and other feed subscriptions) are **synced by default**, including highlighted archived articles — not just unhighlighted feed noise.
+
+To skip them (rare):
 
 ```js
-localStorage.setItem('readwise_references_include_rss', '1')
+localStorage.setItem('readwise_references_include_rss', '0')
 ```
 
-Reload the app / plugin after changing this.
+Reload the app / plugin after changing this. Remove the key to return to the default (include RSS).
 
 ### Notes / duplicate lines
 

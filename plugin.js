@@ -3185,13 +3185,14 @@ const RWR_LIST_PAGE_DELAY_MS_DEFAULT = 3000;
  */
 const RWR_EXPORT_PAGE_DELAY_MS_DEFAULT = 250;
 
-/** `localStorage.setItem('readwise_references_include_rss','1')` — sync RSS feeds as References (default off). */
+/** RSS-category sources sync by default. Opt out: `localStorage.setItem('readwise_references_include_rss','0')`. */
 function rwrIncludeRssFromStorage() {
     try {
         const o = localStorage.getItem('readwise_references_include_rss');
-        return o === '1' || o === 'true' || o === 'on';
+        if (o === '0' || o === 'false' || o === 'off') return false;
+        return true;
     } catch (_) {
-        return false;
+        return true;
     }
 }
 
