@@ -1,0 +1,204 @@
+{
+	"ver": 1,
+	"name": "People",
+	"icon": "ti-user",
+	"color": null,
+	"home": false,
+	"page_field_ids": [
+		"F6P3FJ4ACTZZZZ1",
+		"F31TEM8CGEG08F1",
+		"FFZBHK06BNB3WT8"
+	],
+	"item_name": "Person",
+	"description": "Intersecting Souls",
+	"show_sidebar_items": false,
+	"show_cmdpal_items": true,
+	"fields": [
+		{
+			"icon": "ti-abc",
+			"id": "title",
+			"label": "Title",
+			"many": false,
+			"read_only": false,
+			"active": true,
+			"type": "text"
+		},
+		{
+			"icon": "ti-clock-edit",
+			"id": "updated_at",
+			"label": "Modified",
+			"many": false,
+			"read_only": true,
+			"active": true,
+			"type": "datetime"
+		},
+		{
+			"icon": "ti-clock-plus",
+			"id": "created_at",
+			"label": "Created",
+			"many": false,
+			"read_only": true,
+			"active": true,
+			"type": "datetime"
+		},
+		{
+			"icon": "ti-photo",
+			"id": "banner",
+			"label": "Banner",
+			"many": false,
+			"read_only": false,
+			"active": true,
+			"type": "banner"
+		},
+		{
+			"id": "FZ6B5DR6MKJQKEZ",
+			"active": true,
+			"icon": "ti-photo",
+			"label": "Image",
+			"many": false,
+			"type": "image",
+			"read_only": false
+		},
+		{
+			"id": "F6P3FJ4ACTZZZZ1",
+			"active": true,
+			"icon": "ti-pencil",
+			"label": "Notes",
+			"many": false,
+			"type": "text",
+			"read_only": false
+		},
+		{
+			"id": "F31TEM8CGEG08F1",
+			"active": true,
+			"icon": "ti-tag",
+			"label": "Tags",
+			"many": true,
+			"type": "hashtag",
+			"read_only": false
+		},
+		{
+			"id": "FFZBHK06BNB3WT8",
+			"active": true,
+			"icon": "ti-users-group",
+			"label": "Group",
+			"many": false,
+			"type": "record",
+			"read_only": false,
+			"filter_colguid": "16QW52ZRPC1JRY9Q4JWYQC1EYP"
+		},
+		{
+			"icon": "ti-align-left",
+			"id": "icon",
+			"label": "Icon",
+			"many": false,
+			"read_only": false,
+			"active": true,
+			"type": "text"
+		},
+		{
+			"icon": "ti-folders",
+			"id": "collection",
+			"label": "Collection",
+			"many": false,
+			"read_only": false,
+			"active": true,
+			"type": "choice",
+			"choices": []
+		}
+	],
+	"sidebar_record_sort_dir": "desc",
+	"sidebar_record_sort_field_id": "updated_at",
+	"managed": {
+		"fields": false,
+		"views": false,
+		"sidebar": false
+	},
+	"custom": {},
+	"views": [
+		{
+			"id": "table",
+			"type": "gallery",
+			"icon": "ti-credit-card",
+			"label": "",
+			"description": "",
+			"read_only": false,
+			"shown": true,
+			"field_ids": [
+				"title",
+				"F6P3FJ4ACTZZZZ1",
+				"F31TEM8CGEG08F1",
+				"FFZBHK06BNB3WT8"
+			],
+			"sort_dir": "asc",
+			"sort_field_id": "title",
+			"group_by_field_id": null,
+			"opts": {
+				"gallery_style": "cover-books",
+				"cover_image_field_id": "FZ6B5DR6MKJQKEZ"
+			}
+		},
+		{
+			"id": "VP2CJTM1JG4HEWK",
+			"shown": true,
+			"icon": "ti-table",
+			"label": "",
+			"description": "",
+			"field_ids": [
+				"title",
+				"F6P3FJ4ACTZZZZ1",
+				"F31TEM8CGEG08F1",
+				"FFZBHK06BNB3WT8"
+			],
+			"type": "table",
+			"read_only": false,
+			"group_by_field_id": null,
+			"sort_dir": "desc",
+			"sort_field_id": "updated_at",
+			"opts": {}
+		},
+		{
+			"id": "VWJAA49S32AJCD7",
+			"shown": true,
+			"icon": "ti-users-group",
+			"label": "🌆",
+			"description": "",
+			"field_ids": [
+				"title",
+				"F6P3FJ4ACTZZZZ1",
+				"F31TEM8CGEG08F1",
+				"FFZBHK06BNB3WT8"
+			],
+			"type": "table",
+			"read_only": false,
+			"group_by_field_id": null,
+			"sort_dir": "desc",
+			"sort_field_id": null,
+			"opts": {},
+			"query": "@People.Tags = NYCNeighbors"
+		},
+		{
+			"id": "VREADWISEAUTHORS",
+			"shown": true,
+			"icon": "ti-book-2",
+			"label": "Readwise authors",
+			"description": "People rows tagged #ReadwiseAuthor by Readwise References sync",
+			"field_ids": [
+				"title",
+				"F6P3FJ4ACTZZZZ1",
+				"F31TEM8CGEG08F1",
+				"FFZBHK06BNB3WT8"
+			],
+			"type": "table",
+			"read_only": false,
+			"group_by_field_id": null,
+			"sort_dir": "asc",
+			"sort_field_id": "title",
+			"opts": {},
+			"query": "@People.Tags = ReadwiseAuthor"
+		}
+	],
+	"sidebar_display_mode": {
+		"mode": "hidden_records"
+	}
+}

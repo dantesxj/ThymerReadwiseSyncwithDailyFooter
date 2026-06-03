@@ -120,6 +120,48 @@ Each reference has **Category** as a **choice** field with four options — **Bo
 
 Reload Thymer after updating the plugin so **`SCHEMA_VER` 6** reapplies the collection field definition (`upgradeSchema`), then run **Readwise Ref: Full Sync** once so every existing reference row gets a fresh **Category** and **Source** choice. References are not deleted — sync updates rows by `external_id`.
 
+### Readwise author stubs in People (`#ReadwiseAuthor`)
+
+When sync creates or links a **References → Author** person, the plugin tags that People row with **`ReadwiseAuthor`** on your **Tags** field (`F31TEM8CGEG08F1` by default). Filter in a People table view:
+
+```text
+@People.Tags = ReadwiseAuthor
+```
+
+Add a view to `People.json` (copy an existing table view and set `"query"`):
+
+```json
+{
+  "id": "VREADWISEAUTHORS",
+  "shown": true,
+  "icon": "ti-book-2",
+  "label": "Readwise authors",
+  "field_ids": ["title", "F6P3FJ4ACTZZZZ1", "F31TEM8CGEG08F1", "FFZBHK06BNB3WT8"],
+  "type": "table",
+  "read_only": false,
+  "sort_dir": "asc",
+  "sort_field_id": "title",
+  "query": "@People.Tags = ReadwiseAuthor"
+}
+```
+
+Overrides (optional):
+
+```js
+localStorage.setItem('readwise_references_people_tags_field_id', 'F31TEM8CGEG08F1');
+localStorage.setItem('readwise_references_people_author_tag', 'ReadwiseAuthor');
+```
+
+On the next **Full Sync**, every author touched during the run gets the tag if missing (including existing stubs). Real contacts you link manually are not tagged unless they share an author name resolved during sync.
+
+**Author updates from Reader** (when a synced reference is written):
+
+- **Same person, new spelling** (normalized name unchanged, e.g. `Jane Clapp` → `Jane Q. Clapp`): updates the People **title** only for rows that look like Readwise stubs (`#ReadwiseAuthor`, or empty notes/tags/group) — not contacts with other tags, notes, or Group set.
+- **Author removed in Reader**: clears **References → Author** on that row.
+- **Author renamed to a different person** (normalized key changes): links to a different People row (or creates one); the old People stub is left in place unless you delete it.
+
+**Broken author links (“This document has been deleted”):** Often caused by sync reusing **soft-deleted** People rows still listed by `getAllRecords()` (Thymer may not expose “empty trash” for collection records — use permanent delete from the record menu when available). The plugin skips non-live People, seeds a minimal body on new author rows, and only adds `source_author.filter_colguid` when that field has none yet. Console spam `Link verify failed source_author` was a false alarm from an over-strict check (removed in current `plugin.js`).
+
 **See what Readwise sent:** after a sync, open last diagnostics (`readwise_references_last_sync_diag`). **`readwiseCategoryRawHistogram`** / **`readwiseCategoryMappedHistogram`** are counts **per merged reference** from the document’s **`category`** field (what drives the Books/Articles/Podcasts chip). To see **everything** the APIs return before mapping, use:
 
 | Diagnostic key | Meaning |
@@ -157,6 +199,16 @@ There is **no single magic number** in the response body: **429** means “you e
 - **Export** spacing **250 ms** — aligns with **240/min** for typical v2 traffic (`60_000 / 240 ≈ 250` ms). If export shares a stricter bucket and you 429, raise `readwise_references_export_delay_ms` or rely on `Retry-After`.
 
 **Why the app felt slow during sync (before):** the plugin was yielding to the UI and **refreshing the References collection** every N references — that can make **page transitions stall**. Defaults are now **no** mid-sync yields and **no** mid-sync collection refresh (progress stays in the status bar / console; a full refresh still runs **once** at the end of sync).
+
+**Why a first full sync can still take a long time:** after download, each reference **rebuilds its entire highlight body** (delete all lines, recreate every quote/note/loc as line items). That is thousands of Thymer operations for a large library. **Defaults now:**
+
+- **Skip unchanged bodies** on re-sync (`readwise_references_skip_unchanged_bodies` — on by default; set `'0'` to force rewrite every time).
+- **No journal footer refresh** while sync is running (`record.created` ignored during `_syncing`).
+- **End refresh** touches References only (not a full workspace fan-out).
+
+A **first** import of ~700 sources with highlights may still take **tens of minutes** depending on highlight count and machine — not hours. If sync stalls with `Please reload the app to continue`, reload and run **Readwise Ref: Sync** (incremental); already-written bodies with saved hashes skip the heavy step. To force all bodies to rebuild: `localStorage.removeItem('readwise_references_body_sigs_v1')` then Full Sync.
+
+**Tip:** Run large full syncs in a **dedicated Thymer tab** you can leave alone; opening new windows mid-sync can stress the same workspace sync worker.
 
 **Tuning (`localStorage`, milliseconds):**
 

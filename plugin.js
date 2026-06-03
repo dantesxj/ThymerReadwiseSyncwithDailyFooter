@@ -2376,6 +2376,7 @@
 
   g.thymerExtEnsureMobileLoadGrace = ensureMobileLoadGraceStarted;
   g.thymerExtInMobileLoadGrace = inMobileLoadGrace;
+  g.thymerExtPreferDeferredHeavyWork = preferDeferredHeavyWork;
   g.thymerExtShouldDeferPanelFooterWork = shouldDeferPanelFooterWork;
   g.thymerExtBumpMobileLoadGrace = bumpMobileLoadGrace;
   g.thymerExtPauseHeavyWorkQueue = pauseHeavyWorkQueue;
@@ -3100,6 +3101,26 @@ const RWR_TOKEN_KEY    = 'readwise_references_token';
 const RWR_LAST_RUN_KEY = 'readwise_references_last_run';
 /** JSON blob from the last sync — use "Readwise Ref: Log last sync diagnostics" to inspect. */
 const RWR_LAST_SYNC_DIAG_KEY = 'readwise_references_last_sync_diag';
+/** Per-`external_id` content hash — skip expensive body rebuild when highlights unchanged. */
+const RWR_BODY_SIGS_KEY = 'readwise_references_body_sigs_v1';
+
+/** People `Tags` field id for Readwise author stubs. Override: `readwise_references_people_tags_field_id`. */
+const RWR_PEOPLE_TAGS_FIELD_ID_DEFAULT = 'F31TEM8CGEG08F1';
+/** Hashtag value (no `#`) — filter with `@People.Tags = ReadwiseAuthor`. Override: `readwise_references_people_author_tag`. */
+const RWR_PEOPLE_READWISE_AUTHOR_TAG_DEFAULT = 'ReadwiseAuthor';
+/** People Notes / Group field ids (workspace defaults — match `People.json`). */
+const RWR_PEOPLE_NOTES_FIELD_ID_DEFAULT = 'F6P3FJ4ACTZZZZ1';
+const RWR_PEOPLE_GROUP_FIELD_ID_DEFAULT = 'FFZBHK06BNB3WT8';
+
+/** Touch/coarse-pointer deferral (from embedded Plugin Settings runtime on `globalThis`). */
+function rwrPreferDeferredHeavyWork() {
+    try {
+        if (typeof globalThis.thymerExtPreferDeferredHeavyWork === 'function') {
+            return !!globalThis.thymerExtPreferDeferredHeavyWork();
+        }
+    } catch (_) {}
+    return false;
+}
 
 /** Journal footer panels — persisted (localStorage + Path B when synced). */
 const TH_KEY_SHOW_HIGHLIGHTS   = 'th_panel_show_highlights';
@@ -3180,6 +3201,32 @@ function rwrParseDelayMs(key, defaultMs) {
         if (Number.isFinite(v) && v >= 0) return v;
     } catch (_) {}
     return defaultMs;
+}
+
+/** Default on — skip delete+rewrite of highlight bodies when API payload hash matches last sync. */
+function rwrSkipUnchangedBodiesFromStorage() {
+    try {
+        const o = localStorage.getItem('readwise_references_skip_unchanged_bodies');
+        if (o === '0' || o === 'false') return false;
+    } catch (_) {}
+    return true;
+}
+
+function rwrLoadBodySigMap() {
+    try {
+        const raw = localStorage.getItem(RWR_BODY_SIGS_KEY);
+        if (!raw) return Object.create(null);
+        const o = JSON.parse(raw);
+        return o && typeof o === 'object' ? o : Object.create(null);
+    } catch (_) {
+        return Object.create(null);
+    }
+}
+
+function rwrSaveBodySigMap(map) {
+    try {
+        localStorage.setItem(RWR_BODY_SIGS_KEY, JSON.stringify(map || {}));
+    } catch (_) {}
 }
 
 /** Dev only: `localStorage.setItem('readwise_references_debug_max_sources','25')` — cap merged sources written this run (clear key for full sync). */
@@ -3558,6 +3605,11 @@ class Plugin extends AppPlugin {
             icon: 'ti-stethoscope',
             onSelected: () => this._logLastSyncDiagnostics(),
         });
+        this._cmdStatusReport = this.ui.addCommandPaletteCommand({
+            label: 'Readwise Ref: Workspace status report',
+            icon: 'ti-stethoscope',
+            onSelected: () => this._readwiseRefStatusReport(),
+        });
         this._cmdStorage = this.ui.addCommandPaletteCommand({
             label: 'Readwise Ref: Storage location…',
             icon: 'ti-database',
@@ -3605,6 +3657,7 @@ class Plugin extends AppPlugin {
         this._eventHandlerIds.push(this.events.on('panel.focused',   ev => this._deferHandlePanel(ev.panel)));
         this._eventHandlerIds.push(this.events.on('panel.closed',    ev => this._disposePanel(ev.panel?.getId?.())));
         this._eventHandlerIds.push(this.events.on('record.created', (ev) => {
+            if (this._syncing) return;
             if (this._rwInColdStartGrace()) return;
             const refsGuid = this._rwReferencesCollGuid;
             const collGuid = ev?.collectionGuid ?? null;
@@ -3635,7 +3688,7 @@ class Plugin extends AppPlugin {
                         this._refreshAll();
                     } catch (_) {}
                 })();
-            }, preferDeferredHeavyWork()
+            }, rwrPreferDeferredHeavyWork()
                 ? RWR_RECORD_CREATED_DEBOUNCE_MOBILE_MS
                 : RWR_RECORD_CREATED_DEBOUNCE_MS);
         }));
@@ -3676,7 +3729,7 @@ class Plugin extends AppPlugin {
         globalThis.__thymerReadwiseJfsSuiteNotify = this._readwiseJfsNotifyBound;
         const wantLegacyFooterPanels = this._showHighlightsPanel() || this._showShufflerPanel();
         if (wantLegacyFooterPanels) {
-            const legacyMountMs = preferDeferredHeavyWork() ? 5200 : 900;
+            const legacyMountMs = rwrPreferDeferredHeavyWork() ? 5200 : 900;
             setTimeout(() => {
                 if (this._rwUnloaded || this._rwInColdStartGrace()) return;
                 try {
@@ -3732,6 +3785,7 @@ class Plugin extends AppPlugin {
         this._cmdSync?.remove();
         this._cmdFullSync?.remove();
         this._cmdSyncDiag?.remove();
+        this._cmdStatusReport?.remove();
         this._cmdStorage?.remove();
         this._cmdToggleHighlights?.remove();
         this._cmdToggleShuffler?.remove();
@@ -4576,10 +4630,104 @@ class Plugin extends AppPlugin {
             const nd = o.noteRowsDeduped != null ? o.noteRowsDeduped : '—';
             const dh = o.duplicateHighlightRowsMerged != null ? o.duplicateHighlightRowsMerged : '—';
             const dq = o.duplicateQuoteBodyMerged != null ? o.duplicateQuoteBodyMerged : '—';
-            this._toast('Diagnostics logged (console). ' + inc + ' · unmapped HL: ' + h + ' · dateless in body: ' + d + ' · orphan skip: ' + oa + ' · rss skip: ' + rss + ' · export books: ' + eb + ' · note dedupe: ' + nd + ' · HL dup merge: ' + dh + ' · same-quote merge: ' + dq);
+            const br = o.bodiesRebuilt != null ? o.bodiesRebuilt : '—';
+            const bs = o.bodiesSkippedUnchanged != null ? o.bodiesSkippedUnchanged : '—';
+            this._toast('Diagnostics logged (console). ' + inc + ' · bodies rebuilt: ' + br + ' · skipped unchanged: ' + bs + ' · unmapped HL: ' + h + ' · rss skip: ' + rss);
         } catch (_) {
             this._toast('Diagnostics JSON is invalid.');
         }
+    }
+
+    /**
+     * Survives refresh — logs workspace counts + last sync diag to console (`[ReadwiseRef]`).
+     * Command palette: Readwise Ref: Workspace status report
+     */
+    async _readwiseRefStatusReport() {
+        let diag = null;
+        try {
+            const raw = localStorage.getItem(RWR_LAST_SYNC_DIAG_KEY) || '';
+            if (raw.trim()) diag = JSON.parse(raw);
+        } catch (_) {}
+        const lastRun = localStorage.getItem(RWR_LAST_RUN_KEY);
+        const sigMap = rwrLoadBodySigMap();
+        const bodySigCount = Object.keys(sigMap || {}).length;
+
+        await this._ensureRwCollections();
+        const refsColl = this._rwRefsColl;
+        const peopleColl = this._rwPeopleColl;
+
+        let refCount = 0;
+        let janeRefs = [];
+        let sampleTitles = [];
+        if (refsColl) {
+            try {
+                const all = await refsColl.getAllRecords();
+                refCount = all.length;
+                for (const r of all) {
+                    const title = typeof r.getName === 'function' ? String(r.getName() || '') : '';
+                    const author = this._authorLabel(r);
+                    let ext = '';
+                    try { ext = r.text('external_id') || ''; } catch (_) {}
+                    if (/jane\s*clapp/i.test(author) || /jane\s*clapp/i.test(title)) {
+                        janeRefs.push({ title, author, external_id: ext });
+                    }
+                }
+                sampleTitles = all.slice(0, 5).map((r) => (typeof r.getName === 'function' ? r.getName() : ''));
+            } catch (e) {
+                this._log('⚠️ Status report refs: ' + (e && e.message ? e.message : e));
+            }
+        }
+
+        let readwiseAuthorPeople = 0;
+        if (peopleColl) {
+            try {
+                for (const p of await peopleColl.getAllRecords()) {
+                    if (this._hasReadwiseAuthorTag(p)) readwiseAuthorPeople++;
+                }
+            } catch (_) {}
+        }
+
+        const report = {
+            savedAt: new Date().toISOString(),
+            lastSuccessfulSync: lastRun || null,
+            syncCompleted: diag && diag.syncPhase === 'complete' && diag.ok === true,
+            syncPhase: diag && diag.syncPhase != null ? diag.syncPhase : null,
+            syncSavedAt: diag && diag.savedAt ? diag.savedAt : null,
+            referencesInWorkspace: refCount,
+            highlightBodiesCached: bodySigCount,
+            janeClappReferenceRows: janeRefs.length,
+            janeClappTitles: janeRefs.map((x) => x.title),
+            readwiseAuthorPeopleCount: readwiseAuthorPeople,
+            lastSyncDiagSummary: diag ? {
+                incremental: diag.incremental,
+                forceFullSync: diag.forceFullSync,
+                mergedSources: diag.mergedSources,
+                docEntriesToWrite: diag.docEntriesToWrite,
+                referencesWritten: diag.referencesWritten,
+                createdRef: diag.createdRef,
+                updatedRef: diag.updatedRef,
+                bodiesRebuilt: diag.bodiesRebuilt,
+                bodiesSkippedUnchanged: diag.bodiesSkippedUnchanged,
+                skippedFailedCreate: diag.skippedFailedCreate,
+                bodyRebuildErrors: diag.bodyRebuildErrors,
+                skippedRss: diag.skippedRss,
+                skippedOrphans: diag.skippedOrphans,
+                highlightsWithoutDocKey: diag.highlightsWithoutDocKey,
+                syncThrown: diag.syncThrown,
+                progressDone: diag.progressDone,
+                progressTotal: diag.progressTotal,
+            } : null,
+            sampleReferenceTitles: sampleTitles,
+        };
+
+        this._log('STATUS_REPORT ' + JSON.stringify(report, null, 2));
+        const finished = report.syncCompleted ? 'yes' : 'no';
+        this._toast(
+            'Status in console. Refs: ' + refCount
+            + ' · bodies cached: ' + bodySigCount
+            + ' · Jane rows: ' + janeRefs.length
+            + ' · last sync finished: ' + finished
+        );
     }
 
     async _sync(token, forceFullSync) {
@@ -4617,6 +4765,8 @@ class Plugin extends AppPlugin {
             duplicateHighlightRowsMerged: 0,
             duplicateQuoteBodyMerged: 0,
             mergedSources: 0,
+            bodiesRebuilt: 0,
+            bodiesSkippedUnchanged: 0,
             debugMaxSourcesApplied: null,
             debugMaxListRowsApplied: null,
             debugMaxExportPagesApplied: null,
@@ -4634,22 +4784,12 @@ class Plugin extends AppPlugin {
         const refsColl = this._rwRefsColl;
         const peopleColl = this._rwPeopleColl;
         if (!refsColl) throw new Error('References collection not found');
+        await this._ensureReferencesAuthorPeopleFilter(refsColl, peopleColl);
         /** So `readwise_references_last_sync_diag` is not mistaken for the previous run if the user refreshes mid-sync. */
         this._persistSyncDiag({ ok: null, syncPhase: 'started' });
         this._log('References: true  People: ' + (!!peopleColl));
 
-        const peopleByKey = new Map();
-        if (peopleColl) {
-            try {
-                for (const r of await peopleColl.getAllRecords()) {
-                    const n = typeof r.getName === 'function' ? r.getName() : '';
-                    const k = this._normalizePeopleKey(n);
-                    if (k) peopleByKey.set(k, r);
-                }
-            } catch (e) {
-                this._log('⚠️ People index: ' + e.message);
-            }
-        }
+        const peopleByKey = await this._buildPeopleByKeyIndex(peopleColl);
 
         const existingRef = await refsColl.getAllRecords();
         const refByExtId = new Map(existingRef.map(r => [r.text('external_id'), r]));
@@ -4762,6 +4902,8 @@ class Plugin extends AppPlugin {
 
         const docTotal = docEntries.length;
         this._lastSyncDiag.docEntriesToWrite = docTotal;
+        const bodySigMap = rwrSkipUnchangedBodiesFromStorage() ? rwrLoadBodySigMap() : Object.create(null);
+        let bodySigsDirty = false;
         if (docTotal > 0) {
             this._syncStatusShow('Saving references 0/' + docTotal + '…');
         }
@@ -4792,9 +4934,10 @@ class Plugin extends AppPlugin {
                     || exportCoverByDocId.get(String(doc.id))
                     || exportCoverByDocId.get(String(doc.external_id || ''))
                     || '';
+                const authorRaw = doc.author != null ? String(doc.author).trim() : '';
                 let personForRef = null;
-                if (peopleColl) {
-                    personForRef = await this._ensurePeopleRecord(peopleColl, doc.author || '', peopleByKey);
+                if (peopleColl && authorRaw) {
+                    personForRef = await this._ensurePeopleRecord(peopleColl, authorRaw, peopleByKey);
                 }
 
                 const catLabel = String(doc.category || '').trim();
@@ -4810,7 +4953,11 @@ class Plugin extends AppPlugin {
                 const catChoiceId = this._normalizeReadwiseCategoryChoiceId(catLabel);
                 if (catChoiceId) fields.source_category = catChoiceId;
                 fields.source_origin = this._normalizeReadwiseSourceOriginChoiceId(srcLabel);
-                if (personForRef && personForRef.guid) fields.source_author = personForRef;
+                if (personForRef && personForRef.guid) {
+                    fields.source_author = this._resolveLiveRecord(personForRef) || personForRef;
+                } else if (peopleColl && !authorRaw) {
+                    fields.source_author = null;
+                }
                 if (refBanner) fields.banner = refBanner;
                 if (captureDate) fields.captured_at = captureDate;
 
@@ -4838,15 +4985,35 @@ class Plugin extends AppPlugin {
 
                 let written = 0;
                 if (refRecord && refRecord.guid) {
-                    try {
-                        await this._rebuildReferenceHighlightsBody(refRecord, doc, docHL, exportByHlId);
-                    } catch (e) {
-                        this._log('⚠️ Body rebuild: ' + (e && e.message ? e.message : e));
-                        if (this._lastSyncDiag) this._lastSyncDiag.bodyRebuildErrors++;
+                    const bodySig = this._referenceHighlightBodySig(docHL, exportByHlId);
+                    const prevSig = bodySigMap[extId];
+                    const skipBody = rwrSkipUnchangedBodiesFromStorage()
+                        && updated === 1
+                        && prevSig
+                        && prevSig === bodySig;
+                    if (skipBody) {
+                        if (this._lastSyncDiag) this._lastSyncDiag.bodiesSkippedUnchanged++;
+                        written = 1;
+                        this._rwrWritten++;
+                        if (this._lastSyncDiag) this._lastSyncDiag.referencesWritten++;
+                    } else {
+                        try {
+                            await this._rebuildReferenceHighlightsBody(refRecord, doc, docHL, exportByHlId);
+                            bodySigMap[extId] = bodySig;
+                            bodySigsDirty = true;
+                            if (this._lastSyncDiag) this._lastSyncDiag.bodiesRebuilt++;
+                            if (this._lastSyncDiag.bodiesRebuilt % 20 === 0) {
+                                rwrSaveBodySigMap(bodySigMap);
+                                bodySigsDirty = false;
+                            }
+                        } catch (e) {
+                            this._log('⚠️ Body rebuild: ' + (e && e.message ? e.message : e));
+                            if (this._lastSyncDiag) this._lastSyncDiag.bodyRebuildErrors++;
+                        }
+                        written = 1;
+                        this._rwrWritten++;
+                        if (this._lastSyncDiag) this._lastSyncDiag.referencesWritten++;
                     }
-                    written = 1;
-                    this._rwrWritten++;
-                    if (this._lastSyncDiag) this._lastSyncDiag.referencesWritten++;
                     await this._yieldUi(refsColl);
                 }
                 return { created, updated, synth: synthAdded, written };
@@ -4860,8 +5027,20 @@ class Plugin extends AppPlugin {
             if (docTotal > 0) {
                 this._syncStatusShow('Saving references ' + done + '/' + docTotal + '…');
             }
+            if (done > 0 && done % 25 === 0) {
+                this._persistSyncDiag({
+                    syncPhase: 'writing',
+                    progressDone: done,
+                    progressTotal: docTotal,
+                    referencesWritten: this._rwrWritten,
+                    bodiesRebuilt: this._lastSyncDiag.bodiesRebuilt,
+                    bodiesSkippedUnchanged: this._lastSyncDiag.bodiesSkippedUnchanged,
+                });
+            }
             await this._sleep(0);
         }
+
+        if (bodySigsDirty) rwrSaveBodySigMap(bodySigMap);
 
         if (syntheticParentCount > 0) {
             this._log('Note: ' + syntheticParentCount + ' synthetic parent row(s).');
@@ -4877,7 +5056,7 @@ class Plugin extends AppPlugin {
         this._persistSyncDiag({ ok: true, syncPhase: 'complete' });
 
         this._syncStatusShow('Refreshing workspace…');
-        await this._tryHostCollectionRefresh(refsColl);
+        await this._tryRefreshRefsCollectionOnly(refsColl);
         this._clearFooterDataCaches();
 
         const parts = [
@@ -5163,3 +5342,3060 @@ class Plugin extends AppPlugin {
     }
 
     async _getRecordReady(guid) {
+        const attempts = this._syncing ? 35 : 90;
+        const gapMs = 120;
+        for (let i = 0; i < attempts; i++) {
+            const r = this.data?.getRecord?.(guid);
+            if (r && typeof r.getLineItems === 'function' && typeof r.createLineItem === 'function') return r;
+            await this._sleep(gapMs);
+        }
+        return null;
+    }
+
+    /** Thymer journal page for a calendar day (date headings link here when available). */
+    _journalGuidForLocalDate(dayDate) {
+        try {
+            if (!this.data || typeof this.data.getJournalForDate !== 'function') return null;
+            const jr = this.data.getJournalForDate(dayDate);
+            return jr?.guid || null;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    /**
+     * Group list rows under the Reader **document** id (walks parent chain; prefers parent_document_id).
+     * Highlights with no resolvable document key are counted in `highlightsWithoutDocKey` (otherwise silent drops).
+     */
+    _groupPageHLsByOwningDocument(pageHLs, docByIdStr, allRowsById) {
+        const pageHLsByDoc = new Map();
+        let highlightsWithoutDocKey = 0;
+        for (const h of pageHLs) {
+            const docKey = this._resolveDocKeyForListRow(h, docByIdStr, allRowsById);
+            if (docKey == null) {
+                highlightsWithoutDocKey++;
+                if (this._lastSyncDiag) {
+                    if (!this._lastSyncDiag.unmappedSampleIds) this._lastSyncDiag.unmappedSampleIds = [];
+                    if (this._lastSyncDiag.unmappedSampleIds.length < 25 && h && h.id != null) {
+                        this._lastSyncDiag.unmappedSampleIds.push(String(h.id));
+                    }
+                }
+                continue;
+            }
+            if (!pageHLsByDoc.has(docKey)) pageHLsByDoc.set(docKey, []);
+            pageHLsByDoc.get(docKey).push(h);
+        }
+        return { map: pageHLsByDoc, highlightsWithoutDocKey };
+    }
+
+    _resolveDocKeyForListRow(h, docByIdStr, allRowsById) {
+        const pd = h.parent_document_id ?? h.document_id ?? h.reader_document_id;
+        if (pd != null && String(pd).length > 0) {
+            const pds = String(pd);
+            if (docByIdStr.has(pds)) return pds;
+            const up = this._resolveOwningDocumentIdFromListRows(pds, docByIdStr, allRowsById);
+            if (up) return up;
+        }
+        const rawParent = h.parent_id ?? h.parent_document_id;
+        if (rawParent == null || String(rawParent).length === 0) return null;
+        const pid = String(rawParent);
+        if (docByIdStr.has(pid)) return pid;
+        const resolved = this._resolveOwningDocumentIdFromListRows(pid, docByIdStr, allRowsById);
+        return resolved || pid;
+    }
+
+    _resolveOwningDocumentIdFromListRows(startId, docByIdStr, byId) {
+        const sid = String(startId);
+        if (docByIdStr.has(sid)) return sid;
+        let cur = byId.get(sid);
+        for (let g = 0; g < 50 && cur; g++) {
+            const cid = String(cur.id);
+            if (docByIdStr.has(cid)) return cid;
+            const p = cur.parent_id ?? cur.parent_document_id;
+            if (p == null || p === '') return null;
+            const ps = String(p);
+            if (docByIdStr.has(ps)) return ps;
+            cur = byId.get(ps);
+        }
+        return null;
+    }
+
+    _syntheticParentDocFromHighlight(parentIdStr, h) {
+        const hl = h || {};
+        const title = hl.title != null ? hl.title : (hl.document_title != null ? hl.document_title : '');
+        return {
+            id: parentIdStr,
+            author: hl.author != null ? hl.author : '',
+            category: hl.category != null ? hl.category : '',
+            source_url: hl.source_url != null ? hl.source_url : '',
+            title: title,
+            created_at: hl.created_at != null ? hl.created_at : null,
+            image_url: hl.image_url != null ? hl.image_url : '',
+            cover_image_url: hl.cover_image_url != null ? hl.cover_image_url : '',
+        };
+    }
+
+    _resolveDocTitle(doc) {
+        if (!doc) return 'Untitled';
+        const t = doc.title != null && String(doc.title).trim();
+        if (t) return String(doc.title).trim();
+        const u = doc.source_url != null && String(doc.source_url).trim();
+        if (u) return String(doc.source_url).trim();
+        if (doc.category) return String(doc.category) + ' (untitled)';
+        return 'Untitled';
+    }
+
+    _highlightBody(h) {
+        const t = h.content ?? h.text;
+        return typeof t === 'string' ? t : '';
+    }
+
+    _rwrHashStr(s) {
+        const str = String(s || '');
+        let h = 5381;
+        for (let i = 0; i < str.length; i++) {
+            h = ((h << 5) + h) ^ str.charCodeAt(i);
+        }
+        return (h >>> 0).toString(36);
+    }
+
+    /** Stable hash of merged highlight payload — used to skip unchanged body rebuilds. */
+    _referenceHighlightBodySig(docHL, exportByHlId) {
+        const exMap = exportByHlId && typeof exportByHlId.get === 'function' ? exportByHlId : null;
+        const chunks = [];
+        for (const h of docHL || []) {
+            const ex = exMap
+                ? (exMap.get(String(h.id)) || exMap.get(String(h.external_id ?? '')))
+                : null;
+            let noteStr = this._highlightNote(h);
+            if (ex && ex.note != null && String(ex.note).trim() !== '') noteStr = String(ex.note);
+            chunks.push([
+                String(h.id ?? h.external_id ?? ''),
+                this._highlightBody(h),
+                noteStr,
+                String(h.highlighted_at || h.created_at || ''),
+                this._readwiseHighlightOpenLink(h, ex),
+            ].join('\x1e'));
+        }
+        chunks.sort();
+        return this._rwrHashStr(chunks.join('\x1f'));
+    }
+
+    _highlightNote(h) {
+        const n = h.note ?? h.notes;
+        if (n == null) return '';
+        return typeof n === 'string' ? n : String(n);
+    }
+
+    _readwiseHighlightOpenLink(h, ex) {
+        const tryUrl = (u) => {
+            if (u == null || u === '') return '';
+            let s = String(u).trim();
+            if (/^\/\//.test(s)) s = 'https:' + s;
+            return /^https?:\/\//i.test(s) ? s : '';
+        };
+        if (ex) {
+            const u = tryUrl(ex.readwise_url) || tryUrl(ex.url);
+            if (u) return u;
+        }
+        if (h) {
+            const u = tryUrl(h.readwise_url) || tryUrl(h.url) || tryUrl(h.highlight_url)
+                || tryUrl(h.reader_url) || tryUrl(h.location_url);
+            if (u) return u;
+            /** Reader rows often use a ULID `id` while `external_id` is the classic numeric open id. */
+            const ext = h.external_id != null ? String(h.external_id).trim() : '';
+            const idv = h.id != null ? String(h.id).trim() : '';
+            const openId = (/^\d+$/.test(ext) && !/^\d+$/.test(idv)) ? ext : (idv || ext);
+            if (openId.length > 0) {
+                return 'https://readwise.io/open/' + encodeURIComponent(openId);
+            }
+        }
+        return '';
+    }
+
+    _coverImageUrlForDoc(doc) {
+        if (!doc) return '';
+        return doc.image_url || doc.cover_image_url || '';
+    }
+
+    _normalizePeopleKey(name) {
+        return String(name || '').trim().toLowerCase().replace(/\s+/g, ' ');
+    }
+
+    _peopleTagsFieldId() {
+        try {
+            const o = localStorage.getItem('readwise_references_people_tags_field_id');
+            if (o && String(o).trim()) return String(o).trim();
+        } catch (_) {}
+        return RWR_PEOPLE_TAGS_FIELD_ID_DEFAULT;
+    }
+
+    _readwiseAuthorTagValue() {
+        try {
+            const o = localStorage.getItem('readwise_references_people_author_tag');
+            if (o && String(o).trim()) return String(o).trim().replace(/^#/, '');
+        } catch (_) {}
+        return RWR_PEOPLE_READWISE_AUTHOR_TAG_DEFAULT;
+    }
+
+    _peopleTagTexts(record) {
+        if (!record) return [];
+        const fieldId = this._peopleTagsFieldId();
+        try {
+            if (typeof record.texts === 'function') {
+                const all = record.texts(fieldId);
+                if (Array.isArray(all) && all.length) return all.map((t) => String(t || ''));
+            }
+        } catch (_) {}
+        try {
+            const prop = record.prop(fieldId);
+            if (prop && typeof prop.texts === 'function') {
+                const all = prop.texts();
+                if (Array.isArray(all)) return all.map((t) => String(t || ''));
+            }
+        } catch (_) {}
+        return [];
+    }
+
+    _hasReadwiseAuthorTag(record) {
+        const want = this._readwiseAuthorTagValue().toLowerCase();
+        if (!want) return false;
+        for (const t of this._peopleTagTexts(record)) {
+            if (String(t || '').trim().replace(/^#/, '').toLowerCase() === want) return true;
+        }
+        return false;
+    }
+
+    _peopleNotesFieldId() {
+        try {
+            const o = localStorage.getItem('readwise_references_people_notes_field_id');
+            if (o && String(o).trim()) return String(o).trim();
+        } catch (_) {}
+        return RWR_PEOPLE_NOTES_FIELD_ID_DEFAULT;
+    }
+
+    _peopleGroupFieldId() {
+        try {
+            const o = localStorage.getItem('readwise_references_people_group_field_id');
+            if (o && String(o).trim()) return String(o).trim();
+        } catch (_) {}
+        return RWR_PEOPLE_GROUP_FIELD_ID_DEFAULT;
+    }
+
+    /**
+     * Only rename People rows that look like Readwise stubs — not contacts with other tags, notes, or Group.
+     */
+    _shouldSyncPeopleTitleFromReadwise(record) {
+        if (!record) return false;
+        if (this._hasReadwiseAuthorTag(record)) return true;
+        const tagNorm = this._readwiseAuthorTagValue().toLowerCase();
+        const tags = this._peopleTagTexts(record);
+        const otherTags = tags.filter(
+            (t) => String(t || '').trim().replace(/^#/, '').toLowerCase() !== tagNorm
+        );
+        if (otherTags.length > 0) return false;
+        try {
+            const notes = record.text?.(this._peopleNotesFieldId()) || '';
+            if (String(notes).trim()) return false;
+        } catch (_) {}
+        try {
+            const groupGuid = record.reference?.(this._peopleGroupFieldId());
+            if (groupGuid) return false;
+        } catch (_) {}
+        return true;
+    }
+
+    /** Match Readwise display spelling when the normalized author key is unchanged. */
+    _syncPeopleDisplayTitle(record, rawName) {
+        const title = String(rawName || '').trim();
+        if (!record || !title || !this._shouldSyncPeopleTitleFromReadwise(record)) return false;
+        let current = '';
+        try {
+            current = typeof record.getName === 'function' ? String(record.getName() || '') : '';
+        } catch (_) {}
+        if (String(current).trim() === title) return false;
+        try {
+            const p = record.prop('title');
+            if (p && typeof p.set === 'function') {
+                p.set(title);
+                return true;
+            }
+        } catch (e) {
+            this._log('⚠️ People title: ' + (e && e.message ? e.message : e));
+        }
+        return false;
+    }
+
+    /** Tag People rows created/linked as Readwise authors (`#ReadwiseAuthor`). Idempotent. */
+    _ensureReadwiseAuthorTag(record) {
+        if (!record || this._hasReadwiseAuthorTag(record)) return false;
+        const fieldId = this._peopleTagsFieldId();
+        const tag = this._readwiseAuthorTagValue();
+        try {
+            const prop = record.prop(fieldId);
+            if (!prop) {
+                this._log('⚠️ People Tags field missing: ' + fieldId);
+                return false;
+            }
+            if (typeof prop.addValue === 'function') {
+                prop.addValue(tag);
+                return true;
+            }
+            if (typeof prop.set === 'function') {
+                const existing = this._peopleTagTexts(record);
+                const merged = existing.slice();
+                merged.push(tag);
+                prop.set(merged);
+                return true;
+            }
+        } catch (e) {
+            this._log('⚠️ People tag: ' + (e && e.message ? e.message : e));
+        }
+        return false;
+    }
+
+    /**
+     * Count distinct string values from API rows (`trim`; missing/blank → `(empty)`).
+     * Used for diagnostics: see raw Readwise **category** vs **source** (e.g. `epub`, `kindle` often appear on **source**).
+     */
+    _readwiseHistogramStrings(rows, pick) {
+        const h = Object.create(null);
+        for (const r of rows || []) {
+            let v = '';
+            try {
+                v = pick(r);
+            } catch (_) {
+                v = '';
+            }
+            const k = String(v ?? '').trim() || '(empty)';
+            h[k] = (h[k] || 0) + 1;
+        }
+        return h;
+    }
+
+    /**
+     * Map Readwise `category` strings to `source_category` choice ids: **books** | **articles** | **podcasts** | **video**.
+     * Defaults:
+     *  - `books`, `supplementals`, `supplemental_books`, `epub` → **books**
+     *  - `podcast`, `podcasts` → **podcasts**
+     *  - `video`, `videos` → **video**
+     *  - everything else (articles, article, email, rss, pdf, tweet, …) → **articles**
+     * Override per workspace: `localStorage.readwise_references_category_map` JSON (see `rwrCategoryMapOverride` JSDoc).
+     */
+    _normalizeReadwiseCategoryChoiceId(raw) {
+        const rawTrim = String(raw || '').trim();
+        const rawKey = rawTrim || '(empty)';
+        let k = rawTrim.toLowerCase().replace(/\s+/g, '_');
+        const aliases = {
+            supplementalbooks: 'supplemental_books',
+            supplementals: 'supplemental_books',
+            supplemental: 'supplemental_books',
+            podcast: 'podcasts',
+            videos: 'video',
+            reader_document: 'reader',
+            reader_documents: 'reader',
+            feed: 'rss',
+            feeds: 'rss',
+        };
+        if (aliases[k]) k = aliases[k];
+        const over = rwrCategoryMapOverride();
+        if (over) {
+            let spec = null;
+            if (over[rawKey] != null) spec = over[rawKey];
+            else if (k && over[k] != null) spec = over[k];
+            if (spec != null) {
+                const t = String(spec).trim().toLowerCase();
+                if (t === 'books' || t === 'articles' || t === 'podcasts' || t === 'video') return t;
+            }
+        }
+        if (k === 'books' || k === 'supplemental_books' || k === 'epub') return 'books';
+        if (k === 'podcasts') return 'podcasts';
+        if (k === 'video') return 'video';
+        return 'articles';
+    }
+
+    /** Label/id for footers & pool — `source_category` is a choice field. */
+    _readwiseSourceCategoryLabel(record) {
+        try {
+            if (record && typeof record.choice === 'function') {
+                const ch = record.choice('source_category');
+                if (ch == null) return '';
+                if (typeof ch === 'string') return ch;
+                return String(ch.label || ch.id || '').trim();
+            }
+        } catch (_) {}
+        return '';
+    }
+
+    /**
+     * Map Readwise `doc.source` to `source_origin` choice id.
+     * Empty / unknown source → `unknown`. Anything not aliased and not in `READWISE_SOURCE_ORIGIN_ALLOWED` → `other`.
+     * Override: `localStorage.readwise_references_source_map` (see `rwrSourceMapOverride`).
+     */
+    _normalizeReadwiseSourceOriginChoiceId(raw) {
+        const rawTrim = String(raw || '').trim();
+        const rawKey = rawTrim || '(empty)';
+        if (!rawTrim) return 'unknown';
+        let k = rawTrim.toLowerCase().replace(/\s+/g, '_').replace(/-/g, '_');
+        const aliases = {
+            /** Reader sub-channels — collapse extra suffixes Readwise sometimes appends. */
+            reader_mobile_app: 'reader_mobile',
+            reader_web_app: 'reader_web',
+            reader_share_sheet_android: 'reader_share_sheet',
+            reader_share_sheet_ios: 'reader_share_sheet',
+            reader_share_sheet_web: 'reader_share_sheet',
+            reader_in_app_link_save: 'reader_in_app_save',
+            reader_in_app_save: 'reader_in_app_save',
+            reader_add_from_import_url: 'reader_import_url',
+            reader_add_from_clipboard: 'reader_clipboard',
+            /** Readwise alone is the original Readwise (non-Reader) account ingest. */
+            readwise: 'reader',
+            readwise_reader: 'reader',
+            /** Uploads / files. */
+            file: 'upload',
+            files: 'upload',
+            file_upload: 'upload',
+            /** PDF as a Readwise book source = uploaded PDF. */
+            pdf: 'pdf_upload',
+        };
+        if (aliases[k]) k = aliases[k];
+        const over = rwrSourceMapOverride();
+        if (over) {
+            let spec = null;
+            if (over[rawKey] != null) spec = over[rawKey];
+            else if (over[rawTrim] != null) spec = over[rawTrim];
+            else if (k && over[k] != null) spec = over[k];
+            if (spec != null) {
+                const t = String(spec).trim().toLowerCase().replace(/\s+/g, '_').replace(/-/g, '_');
+                if (READWISE_SOURCE_ORIGIN_ALLOWED.has(t)) return t;
+            }
+        }
+        if (READWISE_SOURCE_ORIGIN_ALLOWED.has(k)) return k;
+        return 'other';
+    }
+
+    /** Label for `source_origin` choice field (chip / UI). */
+    _readwiseSourceOriginLabel(record) {
+        try {
+            if (record && typeof record.choice === 'function') {
+                const ch = record.choice('source_origin');
+                if (ch == null) return '';
+                if (typeof ch === 'string') return ch;
+                return String(ch.label || ch.id || '').trim();
+            }
+        } catch (_) {}
+        return '';
+    }
+
+    async _ensureReferencesAuthorPeopleFilter(refsColl, peopleColl) {
+        if (!refsColl || !peopleColl) return;
+        let peopleGuid = null;
+        try {
+            peopleGuid = peopleColl.getGuid?.() || peopleColl.guid || null;
+        } catch (_) {}
+        if (!peopleGuid) return;
+        try {
+            if (typeof refsColl.getConfiguration !== 'function' || typeof refsColl.saveConfiguration !== 'function') return;
+            const base = refsColl.getConfiguration() || {};
+            const fields = Array.isArray(base.fields) ? base.fields.map((f) => (f ? { ...f } : f)) : [];
+            const idx = fields.findIndex((f) => f && f.id === 'source_author');
+            if (idx < 0) return;
+            const cur = fields[idx];
+            const hasFilter = !!(cur.filter_colguid && String(cur.filter_colguid).trim());
+            const next = Object.assign({}, cur, { target_collection_id: 'People' });
+            if (!hasFilter) next.filter_colguid = peopleGuid;
+            if (cur.target_collection_id === next.target_collection_id && cur.filter_colguid === next.filter_colguid) return;
+            fields[idx] = next;
+            const merged = Object.assign({}, base, { fields });
+            const ok = await refsColl.saveConfiguration(merged);
+            if (ok !== false) {
+                this._log(hasFilter
+                    ? 'References Author field → target People (kept existing filter_colguid)'
+                    : 'References Author field → People collection guid');
+            }
+        } catch (e) {
+            this._log('⚠️ Author field filter_colguid: ' + (e && e.message ? e.message : e));
+        }
+    }
+
+    _resolveLiveRecord(recordOrGuid) {
+        const guid = recordOrGuid && typeof recordOrGuid === 'object'
+            ? recordOrGuid.guid
+            : recordOrGuid;
+        if (!guid) return null;
+        try {
+            const live = this.data?.getRecord?.(guid);
+            if (live && typeof live.getName === 'function') return live;
+        } catch (_) {}
+        return recordOrGuid && typeof recordOrGuid === 'object' ? recordOrGuid : null;
+    }
+
+    /** Skip trashed / stale snapshots from `getAllRecords` that break property backlinks. */
+    _peopleRecordIsAuthorLinkTarget(record) {
+        const live = this._resolveLiveRecord(record);
+        if (!live || !live.guid) return false;
+        try {
+            if (typeof live.getLineItems !== 'function' || typeof live.createLineItem !== 'function') return false;
+        } catch (_) {
+            return false;
+        }
+        return true;
+    }
+
+    _shouldPreferPeopleRecord(candidate, incumbent) {
+        if (!this._peopleRecordIsAuthorLinkTarget(incumbent)) return true;
+        if (!this._peopleRecordIsAuthorLinkTarget(candidate)) return false;
+        if (this._hasReadwiseAuthorTag(candidate) && !this._hasReadwiseAuthorTag(incumbent)) return true;
+        if (!this._hasReadwiseAuthorTag(candidate) && this._hasReadwiseAuthorTag(incumbent)) return false;
+        try {
+            const cAt = candidate.getCreatedAt?.()?.getTime?.() || 0;
+            const iAt = incumbent.getCreatedAt?.()?.getTime?.() || 0;
+            if (cAt !== iAt) return cAt > iAt;
+        } catch (_) {}
+        return false;
+    }
+
+    async _buildPeopleByKeyIndex(peopleColl) {
+        const peopleByKey = new Map();
+        if (!peopleColl) return peopleByKey;
+        try {
+            for (const r of await peopleColl.getAllRecords()) {
+                const n = typeof r.getName === 'function' ? r.getName() : '';
+                const k = this._normalizePeopleKey(n);
+                if (!k || !this._peopleRecordIsAuthorLinkTarget(r)) continue;
+                const prev = peopleByKey.get(k);
+                if (!prev || this._shouldPreferPeopleRecord(r, prev)) {
+                    peopleByKey.set(k, this._resolveLiveRecord(r) || r);
+                }
+            }
+        } catch (e) {
+            this._log('⚠️ People index: ' + e.message);
+        }
+        return peopleByKey;
+    }
+
+    async _ensurePeopleMinimalBody(record) {
+        const guid = record?.guid;
+        if (!guid) return false;
+        const ready = await this._getRecordReady(guid);
+        if (!ready) return false;
+        let items = [];
+        try {
+            items = await ready.getLineItems();
+        } catch (_) {
+            return false;
+        }
+        if (Array.isArray(items) && items.length > 0) return true;
+        const line = await this._createLine(ready, null, null, 'text');
+        if (!line) return false;
+        try {
+            await line.setSegments([{ type: 'text', text: '' }]);
+        } catch (_) {
+            try {
+                await line.setSegments([{ type: 'text', text: ' ' }]);
+            } catch (_) {}
+        }
+        return true;
+    }
+
+    /**
+     * Link a record-type property to `targetGuid`. Uses the same fallback chain as legacy Readwise.
+     * Does not use `prop.linkedRecord()` for verification — on read-only fields it often lags or
+     * returns null even when `record.reference()` is correct, which flooded the console and
+     * confused whether links were applied.
+     */
+    _linkRecordProperty(prop, targetGuid, fieldId, hostRecord) {
+        const guid = String(targetGuid || '').trim();
+        if (!prop || !guid) return false;
+        const live = this.data?.getRecord?.(guid);
+        const attempts = [];
+        if (live && typeof prop.linkRecord === 'function') {
+            attempts.push(() => prop.linkRecord(live));
+        }
+        if (live && typeof prop.link === 'function') {
+            attempts.push(() => prop.link(live));
+        }
+        if (live && typeof prop.setRecord === 'function') {
+            attempts.push(() => prop.setRecord(live));
+        }
+        if (typeof prop.set === 'function') {
+            attempts.push(() => prop.set(guid));
+        }
+        let lastErr = null;
+        for (let i = 0; i < attempts.length; i++) {
+            try {
+                attempts[i]();
+            } catch (e) {
+                lastErr = e;
+                continue;
+            }
+            if (hostRecord && typeof hostRecord.reference === 'function') {
+                try {
+                    const got = hostRecord.reference(fieldId);
+                    if (got && String(got).trim() === guid) return true;
+                } catch (_) {}
+            }
+            return true;
+        }
+        if (lastErr) {
+            this._log('⚠️ prop link ' + fieldId + ': ' + (lastErr && lastErr.message ? lastErr.message : lastErr));
+        }
+        return false;
+    }
+
+    async _ensurePeopleRecord(peopleColl, rawName, peopleByKey) {
+        if (!peopleColl || !peopleByKey) return null;
+        const key = this._normalizePeopleKey(rawName);
+        if (!key) return null;
+        let hit = peopleByKey.get(key);
+        if (hit && !this._peopleRecordIsAuthorLinkTarget(hit)) {
+            peopleByKey.delete(key);
+            hit = null;
+        }
+        if (hit) {
+            hit = this._resolveLiveRecord(hit) || hit;
+            this._syncPeopleDisplayTitle(hit, rawName);
+            this._ensureReadwiseAuthorTag(hit);
+            peopleByKey.set(key, hit);
+            return hit;
+        }
+        const title = String(rawName).trim() || 'Unknown';
+        const r = await this._createRecord(peopleColl, title);
+        if (r && r.guid) {
+            const live = this._resolveLiveRecord(r) || r;
+            await this._ensurePeopleMinimalBody(live);
+            this._ensureReadwiseAuthorTag(live);
+            peopleByKey.set(key, live);
+            return live;
+        }
+        return null;
+    }
+
+    _clearRecordField(record, fieldId) {
+        if (!record || !fieldId) return false;
+        try {
+            const prop = record.prop(fieldId);
+            if (!prop) return false;
+            if (typeof prop.unlink === 'function') {
+                prop.unlink();
+                return true;
+            }
+            if (typeof prop.set === 'function') {
+                try {
+                    prop.set(null);
+                    return true;
+                } catch (_) {}
+                try {
+                    prop.set('');
+                    return true;
+                } catch (_) {}
+            }
+            if (typeof prop.removeValue === 'function' && typeof prop.linkedRecord === 'function') {
+                const linked = prop.linkedRecord();
+                if (linked) {
+                    prop.removeValue(linked);
+                    return true;
+                }
+            }
+        } catch (e) {
+            this._log('⚠️ Clear field ' + fieldId + ': ' + (e && e.message ? e.message : e));
+        }
+        return false;
+    }
+
+    async _createRecord(coll, title) {
+        const guid = coll.createRecord(title);
+        if (!guid) {
+            this._log('⚠️ createRecord null: ' + this._trunc(title, 40));
+            return null;
+        }
+        for (let i = 0; i < 30; i++) {
+            await this._sleep(i < 5 ? 120 : 200);
+            try {
+                const all = await coll.getAllRecords();
+                const record = all.find(r => r.guid === guid);
+                if (record) return record;
+            } catch (_) {}
+        }
+        return null;
+    }
+
+    _setFields(record, fields) {
+        const failed = [];
+        for (const [id, val] of Object.entries(fields)) {
+            if (val === undefined) continue;
+            if (val === null) {
+                if (!this._clearRecordField(record, id)) failed.push(id + '(clear)');
+                continue;
+            }
+            try {
+                const prop = record.prop(id);
+                if (!prop) {
+                    failed.push(id);
+                    continue;
+                }
+                if (val && typeof val === 'object' && val.guid) {
+                    if (!this._linkRecordProperty(prop, val.guid, id, record)) failed.push(id + '(link)');
+                } else if (val instanceof Date) {
+                    if (!isNaN(val)) {
+                        const dt = DateTime.dateOnly(val.getFullYear(), val.getMonth(), val.getDate());
+                        prop.set(dt.value());
+                    }
+                } else if (typeof val === 'number') {
+                    prop.set(val);
+                } else if (typeof val === 'string') {
+                    if (id === 'banner') {
+                        try {
+                            prop.set({ imgUrl: val });
+                        } catch (_) {
+                            prop.set(val);
+                        }
+                    } else if (id === 'source_url') {
+                        prop.set(String(val).trim());
+                    } else {
+                        const ok = typeof prop.setChoice === 'function' ? prop.setChoice(val) : false;
+                        if (!ok) prop.set(val);
+                    }
+                }
+            } catch (e) {
+                failed.push(id + '(' + e.message + ')');
+            }
+        }
+        if (failed.length) this._log('⚠️ Fields: ' + failed.join(', '));
+    }
+
+    /** Cheap mid-sync: References collection only (does not fan out to all plugins). */
+    async _tryRefreshRefsCollectionOnly(refsColl) {
+        const names = ['refresh', 'reload', 'invalidate', 'notifyChange'];
+        for (const n of names) {
+            try {
+                if (refsColl && typeof refsColl[n] === 'function') await refsColl[n]();
+            } catch (_) {}
+        }
+    }
+
+    /**
+     * Full refresh: use at end of sync (or sparingly). Includes this.data / this.ui — expensive;
+     * triggers overview panels, Today's Notes, etc.
+     */
+    async _tryHostCollectionRefresh(refsColl) {
+        const tryOne = async (obj, names) => {
+            if (!obj) return;
+            for (const n of names) {
+                try {
+                    if (typeof obj[n] === 'function') await obj[n]();
+                } catch (_) {}
+            }
+        };
+        await this._tryRefreshRefsCollectionOnly(refsColl);
+        await this._sleep(0);
+        await tryOne(this.data, [
+            'refresh', 'refreshAll', 'refreshCollections', 'reloadCollections',
+            'invalidate', 'notifyDataChanged', 'notifyChange', 'sync',
+        ]);
+        await this._sleep(0);
+        await tryOne(this.ui, ['refresh', 'refreshActivePanel', 'refreshCollections']);
+    }
+
+    async _yieldUi(refsColl) {
+        if (RWR_UI_YIELD_EVERY > 0 && this._rwrWritten % RWR_UI_YIELD_EVERY === 0) {
+            await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+            await this._sleep(0);
+        }
+        if (this._rwrWritten > 0 && RWR_UI_REFS_COLL_REFRESH_EVERY > 0
+            && this._rwrWritten % RWR_UI_REFS_COLL_REFRESH_EVERY === 0) {
+            await this._tryRefreshRefsCollectionOnly(refsColl);
+            this._log('Progress: ' + this._rwrWritten + ' references written (References collection refresh only)');
+        }
+    }
+
+
+    _deferHandlePanel(panel) {
+        const panelId = panel?.getId?.();
+        if (!panelId) return;
+        const prev = this._navDeferTimers.get(panelId);
+        if (prev) clearTimeout(prev);
+        this._navDeferTimers.set(panelId, setTimeout(() => {
+            this._navDeferTimers.delete(panelId);
+            const run = () => {
+                try {
+                    this._handlePanel(panel);
+                } catch (_) {}
+            };
+            try {
+                if (typeof requestIdleCallback === 'function') {
+                    requestIdleCallback(run, { timeout: 1200 });
+                } else {
+                    requestAnimationFrame(() => requestAnimationFrame(run));
+                }
+            } catch (_) {
+                run();
+            }
+        }, RWR_PANEL_DEBOUNCE_MS));
+    }
+
+    /**
+     * Drop stale async footer work when navigation beats slow highlights/shuffler awaits.
+     * @param {HTMLElement|null} targetHiRoot — highlights `.th-journal-footer` (or combined single root)
+     * @param {HTMLElement|null} targetShRoot — shuffler mount root; combined mode uses same as hi root
+     */
+    _isPopulateStillCurrent(state, seq, targetJournal, targetHiRoot, targetShRoot, targetGuid) {
+        if (!state || state.populateSeq !== seq || state.journalDate !== targetJournal || state.recordGuid !== targetGuid) {
+            return false;
+        }
+        if (targetHiRoot) {
+            if (state.rootEl !== targetHiRoot || !state.rootEl?.isConnected) return false;
+        }
+        if (targetShRoot) {
+            const cur = state.shufflerRootEl || state.rootEl;
+            if (cur !== targetShRoot || !cur?.isConnected) return false;
+        }
+        return true;
+    }
+
+    // =========================================================================
+    // Panel lifecycle
+    // =========================================================================
+
+    _handlePanel(panel) {
+        const panelId = panel?.getId?.();
+        if (!panelId) return;
+
+        // Only show on normal pages — not custom panels
+        const navType = panel?.getNavigation?.()?.type || '';
+        if (navType === 'custom' || navType === 'custom_panel') {
+            this._disposePanel(panelId);
+            return;
+        }
+
+        const panelEl   = panel?.getElement?.();
+        if (!panelEl) { this._disposePanel(panelId); return; }
+
+        const suiteHi =
+            typeof globalThis.__thymerJfsReadwiseGetHighlightsMountEl === 'function'
+                ? globalThis.__thymerJfsReadwiseGetHighlightsMountEl(panelId)
+                : null;
+        const suiteSh =
+            typeof globalThis.__thymerJfsReadwiseGetShufflerMountEl === 'function'
+                ? globalThis.__thymerJfsReadwiseGetShufflerMountEl(panelId)
+                : null;
+
+        const container = this._findContainer(panelEl);
+        if (!container) {
+            let state = this._panelStates.get(panelId);
+            if (!state) {
+                state = {
+                    panelId,
+                    panel,
+                    recordGuid: null,
+                    journalDate: null,
+                    rootEl: null,
+                    shufflerRootEl: null,
+                    observer: null,
+                    loading: false,
+                    loaded: false,
+                    populateSeq: 0,
+                    _pendingPopulate: false,
+                    expandedSources: new Map(),
+                    _containerWatcher: null,
+                };
+                this._panelStates.set(panelId, state);
+                state._containerWatcher = new MutationObserver(() => {
+                    try {
+                        if (state._cwTimer) clearTimeout(state._cwTimer);
+                    } catch (_) {}
+                    state._cwTimer = setTimeout(() => {
+                        state._cwTimer = null;
+                        const c = this._findContainer(panelEl);
+                        if (c) {
+                            try { state._containerWatcher?.disconnect(); } catch (_) {}
+                            state._containerWatcher = null;
+                            this._deferHandlePanel(panel);
+                        }
+                    }, RWR_MUTATION_OBS_DEBOUNCE_MS);
+                });
+                try {
+                    state._containerWatcher.observe(panelEl, { childList: true, subtree: true });
+                } catch (_) {
+                    state._containerWatcher = null;
+                    this._disposePanel(panelId);
+                }
+            }
+            return;
+        }
+
+        const record = panel?.getActiveRecord?.();
+        if (!record)  { this._disposePanel(panelId); return; }
+
+        const journalDate = this._journalDateFromRecord(record);
+        if (!journalDate) { this._disposePanel(panelId); return; }
+
+        if (!suiteHi && !suiteSh && !this._showHighlightsPanel() && !this._showShufflerPanel()) {
+            this._disposePanel(panelId);
+            return;
+        }
+
+        let state = this._panelStates.get(panelId);
+        const wasPlaceholder =
+            state && (state.journalDate == null || state.recordGuid == null);
+        const dateChanged =
+            state != null && state.journalDate != null && state.journalDate !== journalDate;
+        const recordChanged =
+            state != null && state.recordGuid != null && state.recordGuid !== record.guid;
+
+        if (!state) {
+            state = {
+                panelId,
+                panel,
+                recordGuid: record.guid,
+                journalDate,
+                rootEl: null,
+                shufflerRootEl: null,
+                observer: null,
+                loading: false,
+                loaded: false,
+                populateSeq: 0,
+                _pendingPopulate: false,
+                expandedSources: new Map(),
+                _containerWatcher: null,
+            };
+            this._panelStates.set(panelId, state);
+        } else {
+            try { state._containerWatcher?.disconnect(); } catch (_) {}
+            state._containerWatcher = null;
+            try {
+                if (state._cwTimer) clearTimeout(state._cwTimer);
+            } catch (_) {}
+            state._cwTimer = null;
+            state.journalDate = journalDate;
+            state.recordGuid = record.guid;
+            state.panel = panel;
+            if (typeof state._pendingPopulate !== 'boolean') state._pendingPopulate = false;
+            if (typeof state.populateSeq !== 'number') state.populateSeq = 0;
+            if (dateChanged || recordChanged || wasPlaceholder) {
+                state.loaded = false;
+                state.expandedSources = new Map();
+            }
+        }
+
+        const rebuilt = this._mountFooter(state, panelEl, { suiteHi, suiteSh, container });
+        if (rebuilt) {
+            state.loading = false; // In-flight populate may target a removed root (same as Today's Notes)
+            state.expandedSources = new Map();
+        }
+        const needPopulate = dateChanged || recordChanged || !state.loaded || rebuilt;
+        if (needPopulate) {
+            if (state.loading) state._pendingPopulate = true;
+            else this._populate(state);
+        }
+    }
+
+    _disposePanel(panelId) {
+        if (!panelId) return;
+        const t = this._navDeferTimers?.get(panelId);
+        if (t) {
+            try { clearTimeout(t); } catch (_) {}
+            this._navDeferTimers.delete(panelId);
+        }
+        const s = this._panelStates.get(panelId);
+        if (!s) return;
+        try {
+            if (s._mutObsTimer) clearTimeout(s._mutObsTimer);
+        } catch (_) {}
+        s._mutObsTimer = null;
+        try {
+            if (s._cwTimer) clearTimeout(s._cwTimer);
+        } catch (_) {}
+        s._cwTimer = null;
+        try { s.observer?.disconnect(); } catch (_) {}
+        try { s._containerWatcher?.disconnect(); } catch (_) {}
+        try { clearTimeout(s._navTimer); } catch (_) {}
+        try { s.rootEl?.remove(); } catch (_) {}
+        try { s.shufflerRootEl?.remove(); } catch (_) {}
+        this._panelStates.delete(panelId);
+    }
+
+    _refreshAll() {
+        for (const [, s] of (this._panelStates || new Map())) {
+            s.loaded = false;
+            this._populate(s);
+        }
+    }
+
+    // =========================================================================
+    // DOM mounting
+    // =========================================================================
+
+    /** Remove Readwise footer wrappers owned by `panelId` from each parent (suite + page). */
+    _stripThJournalFooters(panelId, parents) {
+        const seen = new Set();
+        for (const par of parents) {
+            if (!par || seen.has(par)) continue;
+            seen.add(par);
+            for (const el of par.querySelectorAll(':scope > .th-journal-footer')) {
+                if (el.dataset?.panelId === panelId) {
+                    try { el.remove(); } catch (_) {}
+                }
+            }
+        }
+    }
+
+    // Returns true if the footer was (re)built — caller should re-populate and drop stale async work
+    _mountFooter(state, panelEl, { suiteHi, suiteSh, container }) {
+        const wantHi = !!suiteHi || this._showHighlightsPanel();
+        const wantSh = !!suiteSh || this._showShufflerPanel();
+        if (!wantHi && !wantSh) return false;
+
+        const hiParent = wantHi ? (suiteHi || container) : null;
+        const shParent = wantSh ? (suiteSh || container) : null;
+        const combined = !!(wantHi && wantSh && hiParent && shParent && hiParent === shParent);
+
+        const parents = [...new Set([container, suiteHi, suiteSh].filter(Boolean))];
+
+        let fast = false;
+        if (combined) {
+            fast = !!(state.rootEl?.isConnected
+                && state.rootEl.parentElement === hiParent
+                && !state.shufflerRootEl
+                && state.rootEl.querySelector('[data-panel-section="highlights"]')
+                && state.rootEl.querySelector('[data-panel-section="shuffler"]')
+                && state.observer);
+        } else if (wantHi && wantSh) {
+            fast = !!(state.rootEl?.isConnected
+                && state.rootEl.parentElement === hiParent
+                && state.shufflerRootEl?.isConnected
+                && state.shufflerRootEl.parentElement === shParent
+                && state.observer);
+        } else if (wantHi && !wantSh) {
+            fast = !!(state.rootEl?.isConnected
+                && state.rootEl.parentElement === hiParent
+                && !state.shufflerRootEl
+                && state.observer);
+        } else if (!wantHi && wantSh) {
+            fast = !!(!state.rootEl
+                && state.shufflerRootEl?.isConnected
+                && state.shufflerRootEl.parentElement === shParent
+                && state.observer);
+        }
+        if (fast) {
+            if (!state.observer) {
+                state.observer = this._createFooterObserver(state, panelEl, container, {
+                    wide: !!(suiteHi || suiteSh),
+                });
+            }
+            if (container) {
+                if (state.rootEl?.parentElement === container) this._ensureFooterBottom(state, container);
+                if (state.shufflerRootEl?.parentElement === container) this._ensureFooterBottom(state, container);
+            }
+            return false;
+        }
+
+        if (state.observer) {
+            try { state.observer.disconnect(); } catch (_) {}
+            state.observer = null;
+        }
+        try {
+            if (state._mutObsTimer) clearTimeout(state._mutObsTimer);
+        } catch (_) {}
+        state._mutObsTimer = null;
+        try { clearTimeout(state._navTimer); } catch (_) {}
+
+        this._stripThJournalFooters(state.panelId, parents);
+
+        state.rootEl = null;
+        state.shufflerRootEl = null;
+
+        if (combined) {
+            state.rootEl = this._buildShell(state, false);
+            if (state.rootEl) hiParent.appendChild(state.rootEl);
+            this._ensureFooterBottom(state, hiParent);
+        } else {
+            if (wantHi) {
+                let wrap;
+                if (suiteHi) {
+                    wrap = this._buildShell(state, true);
+                } else {
+                    wrap = document.createElement('div');
+                    wrap.className = 'th-journal-footer';
+                    wrap.dataset.panelId = state.panelId;
+                    wrap.appendChild(this._buildHighlightsPanel(state));
+                }
+                if (wrap && wrap.childElementCount) {
+                    hiParent.appendChild(wrap);
+                    state.rootEl = wrap;
+                }
+            }
+            if (wantSh) {
+                const wrapSh = document.createElement('div');
+                wrapSh.className = 'th-journal-footer';
+                wrapSh.dataset.panelId = state.panelId;
+                if (suiteSh) wrapSh.dataset.rwSuiteMount = 'shuffler';
+                wrapSh.appendChild(this._buildShufflerPanel(state));
+                shParent.appendChild(wrapSh);
+                if (!wantHi || hiParent !== shParent) state.shufflerRootEl = wrapSh;
+            }
+        }
+
+        state.observer = this._createFooterObserver(state, panelEl, container, {
+            wide: !!(suiteHi || suiteSh),
+        });
+        return true;
+    }
+
+    _ensureFooterBottom(state, container) {
+        if (!container) return;
+        if (state?.rootEl?.parentElement === container && state.rootEl.dataset?.rwSuiteMount !== 'highlights') {
+            if (container.lastElementChild !== state.rootEl) container.appendChild(state.rootEl);
+        }
+        if (state?.shufflerRootEl?.parentElement === container) {
+            if (container.lastElementChild !== state.shufflerRootEl) container.appendChild(state.shufflerRootEl);
+        }
+    }
+
+    /**
+     * When footers mount under `.page-content` only (`wide:false`), observe that node with `subtree:false`
+     * so header / editor mutations do not fire this observer. JFS mounts (`suiteHi` / `suiteSh`) still use
+     * the full panel (wide) so we do not miss suite DOM.
+     */
+    _createFooterObserver(state, panelEl, containerEl, opts) {
+        const wide = !!(opts && opts.wide);
+        const obsRoot = wide
+            ? panelEl
+            : (containerEl && typeof containerEl.nodeType === 'number' && containerEl.nodeType === 1
+                ? containerEl
+                : panelEl);
+        const narrow = !wide && obsRoot === containerEl && !!containerEl;
+        const flush = () => {
+            const lostHi = state.rootEl && !state.rootEl.isConnected;
+            const lostSh = state.shufflerRootEl && !state.shufflerRootEl.isConnected;
+            if (lostHi || lostSh) {
+                try { clearTimeout(state._navTimer); } catch (_) {}
+                state._navTimer = setTimeout(() => {
+                    const stillLost = (state.rootEl && !state.rootEl.isConnected)
+                        || (state.shufflerRootEl && !state.shufflerRootEl.isConnected);
+                    if (state.panel && stillLost) this._deferHandlePanel(state.panel);
+                }, 800);
+            }
+            const container = this._findContainer(panelEl);
+            if (container) {
+                if (state.rootEl?.parentElement === container && state.rootEl.dataset?.rwSuiteMount !== 'highlights') {
+                    this._ensureFooterBottom(state, container);
+                }
+                if (state.shufflerRootEl?.parentElement === container) {
+                    this._ensureFooterBottom(state, container);
+                }
+            }
+        };
+        const obs = new MutationObserver(() => {
+            try {
+                if (state._mutObsTimer) clearTimeout(state._mutObsTimer);
+            } catch (_) {}
+            state._mutObsTimer = setTimeout(() => {
+                state._mutObsTimer = null;
+                try {
+                    flush();
+                } catch (_) {}
+            }, RWR_MUTATION_OBS_DEBOUNCE_MS);
+        });
+        try {
+            obs.observe(obsRoot, narrow ? { childList: true, subtree: false } : { childList: true, subtree: true });
+        } catch (_) {
+            try {
+                obs.observe(panelEl, { childList: true, subtree: true });
+            } catch (_) {}
+        }
+        return obs;
+    }
+
+    /** Prefer the last matching node — after journal navigation Thymer may leave multiple layers; first match can be stale. */
+    _findContainer(panelEl) {
+        if (!panelEl) return null;
+        for (const sel of ['.page-content', '.editor-wrapper', '.editor-panel', '#editor']) {
+            if (panelEl.matches?.(sel)) return panelEl;
+            const all = panelEl.querySelectorAll?.(sel);
+            if (all && all.length) return all[all.length - 1];
+        }
+        return null;
+    }
+
+    /**
+     * Wrapper for one or more journal footer cards (highlights + quote shuffler).
+     * @param {boolean} suiteHighlightsOnly — Journal Footer Suite: mount only highlights into `.jfs-body`.
+     */
+    _buildShell(state, suiteHighlightsOnly) {
+        const root = document.createElement('div');
+        root.className       = 'th-journal-footer';
+        root.dataset.panelId = state.panelId;
+
+        if (suiteHighlightsOnly) {
+            root.dataset.rwSuiteMount = 'highlights';
+            root.appendChild(this._buildHighlightsPanel(state));
+            return root.childElementCount ? root : null;
+        }
+
+        if (this._showHighlightsPanel()) {
+            root.appendChild(this._buildHighlightsPanel(state));
+        }
+        if (this._showShufflerPanel()) {
+            root.appendChild(this._buildShufflerPanel(state));
+        }
+        if (!root.childElementCount) return null;
+        return root;
+    }
+
+    _buildHighlightsPanel(state) {
+        const root = document.createElement('div');
+        root.className              = 'th-footer th-footer--highlights';
+        root.dataset.panelSection   = 'highlights';
+
+        const header = document.createElement('div');
+        header.className = 'th-header';
+
+        const toggle = document.createElement('button');
+        toggle.className   = 'th-toggle button-none button-small button-minimal-hover';
+        toggle.type        = 'button';
+        toggle.title       = 'Collapse / expand';
+        toggle.textContent = this._collapsed ? '+' : '−';
+
+        const icon = document.createElement('span');
+        icon.className = 'th-title-icon';
+        this._rwrAppendSvgIcon(icon, 'books', 16);
+
+        const titleEl = document.createElement('div');
+        titleEl.className   = 'th-title';
+        titleEl.textContent = "Today's Highlights";
+
+        const countEl = document.createElement('div');
+        countEl.className    = 'th-count';
+        countEl.dataset.role = 'count';
+
+        header.appendChild(toggle);
+        header.appendChild(icon);
+        header.appendChild(titleEl);
+        header.appendChild(countEl);
+
+        const body = document.createElement('div');
+        body.dataset.role  = 'body';
+        body.className     = 'th-body';
+        body.style.display = this._collapsed ? 'none' : 'block';
+
+        toggle.addEventListener('click', () => {
+            this._collapsed    = !this._collapsed;
+            this._saveBool('th_footer_collapsed', this._collapsed);
+            toggle.textContent = this._collapsed ? '+' : '−';
+            body.style.display = this._collapsed ? 'none' : 'block';
+        });
+
+        root.appendChild(header);
+        root.appendChild(body);
+        return root;
+    }
+
+    /** Collapse/expand chrome + body for `.th-shuffler-shell` (Quote Shuffler). */
+    _syncShufflerShellLayout(shufflerRoot) {
+        if (!shufflerRoot?.classList?.contains?.('th-shuffler-shell')) return;
+        const c = !!this._shufflerCollapsed;
+        shufflerRoot.classList.toggle('th-shuffler-is-collapsed', c);
+        const toggle = shufflerRoot.querySelector('.th-shuffler-chrome .th-toggle');
+        const bodyEl = shufflerRoot.querySelector('.th-shuffler-body');
+        if (toggle) toggle.textContent = c ? '+' : '−';
+        if (bodyEl) bodyEl.style.display = c ? 'none' : 'block';
+    }
+
+    /** Hover-reveal collapse control (matches journal-header-suite random-memory row). */
+    _appendShufflerCollapseMini(leftContentEl, bodyEl) {
+        const topActions = document.createElement('div');
+        topActions.className = 'th-shuffler-top-actions';
+        const collapseMiniBtn = document.createElement('button');
+        collapseMiniBtn.type = 'button';
+        collapseMiniBtn.className = 'th-shuffler-collapse-mini button-none';
+        const inSuite = !!bodyEl.closest('[data-rw-suite-mount="shuffler"]');
+        collapseMiniBtn.title = inSuite
+            ? 'Hide Quote Shuffler (same as footer header quote icon)'
+            : 'Collapse Quote Shuffler';
+        collapseMiniBtn.innerHTML = '<i class="ti ti-chevron-up" aria-hidden="true"></i>';
+        collapseMiniBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (inSuite && typeof globalThis.__thymerJfsCloseQuoteShufflerDock === 'function') {
+                globalThis.__thymerJfsCloseQuoteShufflerDock();
+                return;
+            }
+            const shell = bodyEl.closest('.th-shuffler-shell');
+            if (!shell) return;
+            this._shufflerCollapsed = true;
+            this._saveBool(TH_KEY_SHUFFLER_COLLAPSED, true);
+            this._syncShufflerShellLayout(shell);
+        });
+        const hoverZone = document.createElement('div');
+        hoverZone.className = 'th-shuffler-quote-hover-zone';
+        hoverZone.appendChild(collapseMiniBtn);
+        hoverZone.appendChild(leftContentEl);
+        topActions.appendChild(hoverZone);
+        return topActions;
+    }
+
+    _buildShufflerPanel(state) {
+        const root = document.createElement('div');
+        root.className            = 'th-footer th-footer--shuffler th-shuffler-shell';
+        root.dataset.panelSection = 'shuffler';
+
+        const chrome = document.createElement('div');
+        chrome.className = 'th-shuffler-chrome';
+        chrome.dataset.role = 'sh-chrome';
+
+        const toggle = document.createElement('button');
+        toggle.className = 'th-toggle button-none button-small button-minimal-hover';
+        toggle.type = 'button';
+        toggle.title = 'Collapse / expand';
+        toggle.textContent = this._shufflerCollapsed ? '+' : '−';
+
+        const titleIcon = document.createElement('span');
+        titleIcon.className = 'th-title-icon th-shuffler-title-icon';
+        this._rwrAppendSvgIcon(titleIcon, 'quotes', 15);
+
+        const titleEl = document.createElement('div');
+        titleEl.className = 'th-title th-shuffler-panel-title';
+        titleEl.textContent = 'Quote Shuffler';
+
+        chrome.appendChild(toggle);
+        chrome.appendChild(titleIcon);
+        chrome.appendChild(titleEl);
+
+        const body = document.createElement('div');
+        body.dataset.role = 'body';
+        body.className = 'th-body th-shuffler-body';
+        body.style.display = this._shufflerCollapsed ? 'none' : 'block';
+
+        toggle.addEventListener('click', () => {
+            this._shufflerCollapsed = !this._shufflerCollapsed;
+            this._saveBool(TH_KEY_SHUFFLER_COLLAPSED, this._shufflerCollapsed);
+            this._syncShufflerShellLayout(root);
+        });
+        this._syncShufflerShellLayout(root);
+
+        root.appendChild(chrome);
+        root.appendChild(body);
+        return root;
+    }
+
+    // =========================================================================
+    // Data & rendering
+    // =========================================================================
+
+    /** Let Thymer paint journal chrome (e.g. Journal Header Suite) before References I/O. */
+    async _yieldForJournalPaint() {
+        await new Promise((r) => {
+            try {
+                requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(r, 0)));
+            } catch (_) {
+                setTimeout(r, 0);
+            }
+        });
+        try {
+            if (typeof requestIdleCallback === 'function') {
+                await new Promise((r) => requestIdleCallback(() => r(), { timeout: 500 }));
+            }
+        } catch (_) {}
+    }
+
+    async _populate(state) {
+        if (state.loading) return;
+        state.loading = true;
+        if (typeof state.populateSeq !== 'number') state.populateSeq = 0;
+        const seq = ++state.populateSeq;
+
+        const targetJournal = state.journalDate;
+        const targetGuid    = state.recordGuid;
+
+        const hiBody  = state.rootEl?.querySelector('[data-panel-section="highlights"] [data-role="body"]');
+        const hiCount = state.rootEl?.querySelector('[data-panel-section="highlights"] [data-role="count"]');
+        const shBody  = (state.shufflerRootEl || state.rootEl)?.querySelector('[data-panel-section="shuffler"] [data-role="body"]');
+
+        const targetHiRoot = hiBody ? state.rootEl : null;
+        const targetShRoot = shBody ? (state.shufflerRootEl || state.rootEl) : null;
+
+        if (!hiBody && !shBody) {
+            state.loaded = true;
+            state.loading = false;
+            this._flushPendingPopulate(state);
+            return;
+        }
+
+        if (hiBody) hiBody.innerHTML = '<div class="th-loading">Scanning highlights…</div>';
+        if (shBody) shBody.innerHTML = '<div class="th-loading">Loading quote library…</div>';
+
+        try {
+            await this._yieldForJournalPaint();
+            const jobs = [];
+            if (hiBody) {
+                jobs.push(this._populateHighlightsSection(
+                    state, hiBody, hiCount, targetJournal, targetHiRoot, targetShRoot, targetGuid, seq));
+            }
+            if (shBody) {
+                jobs.push(this._populateShufflerSection(
+                    state, shBody, targetJournal, targetHiRoot, targetShRoot, targetGuid, seq));
+            }
+            await Promise.all(jobs);
+
+            if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetHiRoot, targetShRoot, targetGuid)) {
+                state.loading = false;
+                this._flushPendingPopulate(state);
+                return;
+            }
+
+            state.loaded = true;
+        } catch (e) {
+            console.error('[ReadwiseRef|TH]', e);
+            if (this._isPopulateStillCurrent(state, seq, targetJournal, targetHiRoot, targetShRoot, targetGuid)) {
+                if (hiBody) {
+                    hiBody.innerHTML = '<div class="th-empty">Error loading highlights.</div>';
+                }
+                if (shBody) {
+                    shBody.innerHTML = '<div class="th-empty">Error loading quote.</div>';
+                }
+            }
+        }
+
+        state.loading = false;
+        this._flushPendingPopulate(state);
+    }
+
+    async _populateHighlightsSection(state, bodyEl, countEl, targetJournal, targetHiRoot, targetShRoot, targetGuid, seq) {
+        const reportHi = (msg) => {
+            if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetHiRoot, targetShRoot, targetGuid)) return;
+            const el = bodyEl.querySelector('.th-loading');
+            if (el) el.textContent = msg;
+        };
+        const highlights = await this._getHighlightsForDate(targetJournal, reportHi);
+        if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetHiRoot, targetShRoot, targetGuid)) return;
+
+        bodyEl.innerHTML = '';
+
+        if (highlights.length === 0) {
+            bodyEl.innerHTML = '<div class="th-empty">No highlights for this day.</div>';
+            if (countEl) countEl.textContent = '';
+        } else {
+            if (countEl) countEl.textContent = String(highlights.length);
+
+            const groups = new Map();
+            for (const h of highlights) {
+                const key = h.source_title || 'Unknown source';
+                if (!groups.has(key)) groups.set(key, []);
+                groups.get(key).push(h);
+            }
+
+            for (const [sourceTitle, items] of groups) {
+                bodyEl.appendChild(this._buildGroup(sourceTitle, items, state));
+            }
+        }
+    }
+
+    async _populateShufflerSection(state, shBody, targetJournal, targetHiRoot, targetShRoot, targetGuid, seq) {
+        const reportPool = (msg) => {
+            if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetHiRoot, targetShRoot, targetGuid)) return;
+            const el = shBody.querySelector('.th-loading');
+            if (el) el.textContent = msg;
+        };
+        await this._warmQuotePoolCache(reportPool);
+        if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetHiRoot, targetShRoot, targetGuid)) return;
+        const pool = Array.isArray(this._quotePoolCache) ? this._quotePoolCache : [];
+        const saved = this._loadDayShufflePick(targetJournal);
+        if (saved && saved.guid && String(saved.text || '').trim()) {
+            let pick = this._pickFromStored(saved);
+            const merged = this._mergeShufflePickWithPool(pick, pool);
+            if (merged !== pick) {
+                pick = merged;
+                this._persistDayShufflePick(targetJournal, pick);
+            }
+            this._renderShufflerQuoteCard(state, shBody, pick, targetJournal);
+        } else {
+            this._renderShufflerIdle(state, shBody, targetJournal);
+        }
+        if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetHiRoot, targetShRoot, targetGuid)) return;
+    }
+
+    _getShufflerDayMap() {
+        try {
+            const raw = localStorage.getItem(TH_KEY_SHUFFLER_QUOTES_BY_DAY);
+            if (!raw || !String(raw).trim()) return {};
+            const o = JSON.parse(raw);
+            return o && typeof o === 'object' && !Array.isArray(o) ? o : {};
+        } catch (_) {
+            return {};
+        }
+    }
+
+    _saveShufflerDayMap(map) {
+        try {
+            localStorage.setItem(TH_KEY_SHUFFLER_QUOTES_BY_DAY, JSON.stringify(map));
+        } catch (_) {}
+        this._scheduleShufflerDayMapPathBSync();
+    }
+
+    _scheduleShufflerDayMapPathBSync() {
+        if (this._pluginSettingsSyncMode !== 'synced') return;
+        if (this._shufflerDayMapSyncTimer) {
+            try { clearTimeout(this._shufflerDayMapSyncTimer); } catch (_) {}
+        }
+        this._shufflerDayMapSyncTimer = setTimeout(() => {
+            this._shufflerDayMapSyncTimer = null;
+            const ps = globalThis.ThymerPluginSettings;
+            if (!ps?.flushNow || !this.data || !this._pluginSettingsPluginId) return;
+            ps.flushNow(this.data, this._pluginSettingsPluginId, this._pathBMirrorKeys()).catch(() => {});
+        }, TH_SHUFFLER_DAYMAP_SYNC_IDLE_MS);
+    }
+
+    _loadDayShufflePick(yyyymmdd) {
+        if (!yyyymmdd) return null;
+        const m = this._getShufflerDayMap();
+        const v = m[yyyymmdd];
+        if (!v || typeof v !== 'object') return null;
+        return v;
+    }
+
+    _persistDayShufflePick(yyyymmdd, pick) {
+        if (!yyyymmdd || !pick) return;
+        const map = this._getShufflerDayMap();
+        map[yyyymmdd] = {
+            sig:            pick._sig || this._shuffleSignature(pick),
+            guid:           pick.guid,
+            text:           pick.text || '',
+            note:           pick.note || '',
+            location:       pick.location || '',
+            source_title:   pick.source_title || '',
+            source_author:  pick.source_author || '',
+        };
+        const keys = Object.keys(map).sort();
+        if (keys.length > 420) {
+            for (const k of keys.slice(0, keys.length - 400)) {
+                try { delete map[k]; } catch (_) {}
+            }
+        }
+        this._saveShufflerDayMap(map);
+    }
+
+    _pickFromStored(stored) {
+        return {
+            guid:          stored.guid,
+            text:          stored.text || '',
+            note:          stored.note || '',
+            location:      stored.location || '',
+            source_title:  stored.source_title || '',
+            source_author: stored.source_author || '',
+            _sig:          stored.sig || this._shuffleSignatureFromParts(stored.guid, stored.text),
+        };
+    }
+
+    /** How many leading characters of `a` and `b` match (byte-for-byte). */
+    _lcpPrefixMatchLen(a, b) {
+        const sa = String(a || '');
+        const sb = String(b || '');
+        const n = Math.min(sa.length, sb.length);
+        let i = 0;
+        while (i < n && sa.charCodeAt(i) === sb.charCodeAt(i)) i++;
+        return i;
+    }
+
+    /** Replace truncated per-day fields when the shuffle pool has a longer row (same guid + sig, prefix, or near-prefix). */
+    _mergeShufflePickWithPool(pick, pool) {
+        if (!pick?.guid || !Array.isArray(pool) || !pool.length) return pick;
+        const pt = String(pick.text || '');
+        let row = pool.find(c => c && c.guid === pick.guid && c._sig === pick._sig);
+        if (!row && pt) {
+            const strict = pool.filter(c => {
+                if (!c || c.guid !== pick.guid) return false;
+                const ct = String(c.text || '');
+                return ct.length > pt.length && ct.startsWith(pt);
+            });
+            if (strict.length) {
+                row = strict.reduce((a, b) =>
+                    (String(a.text || '').length >= String(b.text || '').length ? a : b));
+            }
+        }
+        if (!row && pt.length >= 32) {
+            const tailSlack = Math.max(36, Math.floor(pt.length * 0.06));
+            const minLcp = Math.max(32, pt.length - tailSlack);
+            let best = null;
+            let bestLen = 0;
+            for (const c of pool) {
+                if (!c || c.guid !== pick.guid) continue;
+                const ct = String(c.text || '');
+                if (ct.length <= pt.length + 3) continue;
+                const lcp = this._lcpPrefixMatchLen(pt, ct);
+                if (lcp >= minLcp) {
+                    if (ct.length > bestLen) {
+                        best = c;
+                        bestLen = ct.length;
+                    }
+                }
+            }
+            row = best;
+        }
+        if (!row) return pick;
+        let changed = false;
+        const out = { ...pick };
+        const takeLonger = (a, b) => {
+            const sa = String(a || '');
+            const sb = String(b || '');
+            if (sb.length > sa.length) { changed = true; return sb; }
+            return sa;
+        };
+        out.text = takeLonger(out.text, row.text);
+        out.note = takeLonger(out.note, row.note);
+        out.location = takeLonger(out.location, row.location);
+        out.source_title = takeLonger(out.source_title, row.source_title);
+        out.source_author = takeLonger(out.source_author, row.source_author);
+        if (changed) out._sig = row._sig || this._shuffleSignature(out);
+        return changed ? out : pick;
+    }
+
+    _renderShufflerIdle(state, bodyEl, journalDate) {
+        bodyEl.innerHTML = '';
+        const idle = document.createElement('div');
+        idle.className = 'th-shuffler-idle th-shuffler-idle--bare';
+
+        const iconBtn = document.createElement('button');
+        iconBtn.type = 'button';
+        iconBtn.className = 'th-shuffler-draw-btn button-none button-small button-minimal-hover';
+        iconBtn.title = 'Draw a random quote for this day';
+        this._rwrAppendSvgIcon(iconBtn, 'quote', 28);
+        iconBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            void this._drawRandomQuoteForDay(state, bodyEl, journalDate, true);
+        });
+
+        const cap = document.createElement('div');
+        cap.className = 'th-shuffler-idle-caption';
+        cap.textContent = 'Draw a quote for this day';
+
+        idle.appendChild(this._appendShufflerCollapseMini(iconBtn, bodyEl));
+        idle.appendChild(cap);
+        bodyEl.appendChild(idle);
+    }
+
+    /**
+     * @param {boolean} forceNew — true: new random (first draw or reshuffle). Avoids repeating the same quote for that day when possible.
+     */
+    async _drawRandomQuoteForDay(state, bodyEl, journalDate, forceNew) {
+        let pool;
+        try {
+            pool = await this._getQuoteShufflePoolFromReferences();
+        } catch (e) {
+            console.error('[ReadwiseRef|Shuffle]', e);
+            bodyEl.innerHTML = '<div class="th-empty">Could not load quotes.</div>';
+            return;
+        }
+
+        if (!(state.shufflerRootEl || state.rootEl)?.isConnected) return;
+
+        if (!pool.length) {
+            bodyEl.innerHTML = '<div class="th-empty">No highlights in References yet.</div>';
+            return;
+        }
+
+        let avoidSig = '';
+        if (forceNew) {
+            const cur = this._loadDayShufflePick(journalDate);
+            if (cur && cur.sig) avoidSig = cur.sig;
+        }
+
+        const picked = this._pickRandomShuffleCandidate(pool, avoidSig);
+        if (!picked) {
+            bodyEl.innerHTML = '<div class="th-empty">No quote available.</div>';
+            return;
+        }
+
+        this._persistDayShufflePick(journalDate, picked);
+        this._renderShufflerQuoteCard(state, bodyEl, picked, journalDate);
+    }
+
+    _renderShufflerQuoteCard(state, bodyEl, picked, journalDate) {
+        bodyEl.innerHTML = '';
+        const view = document.createElement('div');
+        view.className = 'th-shuffler-quote-view';
+
+        const body = document.createElement('div');
+        body.className = 'th-shuffler-quote-body';
+
+        const markWrap = document.createElement('div');
+        markWrap.className = 'th-shuffler-quote-mark';
+        markWrap.setAttribute('aria-hidden', 'true');
+        this._rwrAppendSvgIcon(markWrap, 'quote', 22);
+
+        const quoteEl = document.createElement('div');
+        quoteEl.className = 'th-shuffler-quote-display';
+        quoteEl.textContent = picked.text || '';
+
+        const markRow = this._appendShufflerCollapseMini(markWrap, bodyEl);
+        markRow.classList.add('th-shuffler-quote-mark-row');
+        body.appendChild(markRow);
+        body.appendChild(quoteEl);
+
+        const hasMeta = (picked.source_title && String(picked.source_title).trim())
+            || (picked.source_author && String(picked.source_author).trim() && !this._rwrLooksLikeOpaqueId(picked.source_author))
+            || (picked.note && String(picked.note).trim())
+            || (picked.location && String(picked.location).trim());
+        if (hasMeta) {
+            const divider = document.createElement('div');
+            divider.className = 'th-shuffler-ritual-divider';
+            body.appendChild(divider);
+        }
+
+        if (picked.source_title && String(picked.source_title).trim()) {
+            const src = document.createElement('div');
+            src.className = 'th-shuffler-source';
+            src.textContent = picked.source_title;
+            body.appendChild(src);
+        }
+        if (picked.source_author && String(picked.source_author).trim() && !this._rwrLooksLikeOpaqueId(picked.source_author)) {
+            const auth = document.createElement('div');
+            auth.className = 'th-shuffler-author';
+            auth.textContent = picked.source_author;
+            body.appendChild(auth);
+        }
+        if (picked.note && String(picked.note).trim()) {
+            const noteEl = document.createElement('div');
+            noteEl.className = 'th-shuffler-note';
+            noteEl.textContent = picked.note;
+            body.appendChild(noteEl);
+        }
+        if (picked.location && String(picked.location).trim()) {
+            const loc = document.createElement('div');
+            loc.className = 'th-shuffler-loc';
+            const locStr = String(picked.location).trim();
+            if (/^https?:\/\//i.test(locStr)) {
+                const a = document.createElement('a');
+                a.href = locStr;
+                a.textContent = locStr;
+                a.rel = 'noopener noreferrer';
+                a.target = '_blank';
+                a.className = 'th-shuffler-loc-link';
+                a.addEventListener('click', (e) => e.stopPropagation());
+                loc.appendChild(a);
+            } else {
+                loc.textContent = locStr;
+            }
+            body.appendChild(loc);
+        }
+
+        const reshuffleWrap = document.createElement('div');
+        reshuffleWrap.className = 'th-shuffler-quote-reshuffle-wrap';
+        const reshuffle = document.createElement('button');
+        reshuffle.type = 'button';
+        reshuffle.className = 'th-shuffler-quote-reshuffle button-none button-small button-minimal-hover';
+        reshuffle.title = 'Another random quote for this day';
+        this._rwrAppendSvgIcon(reshuffle, 'shuffle', 14);
+        reshuffle.addEventListener('click', (e) => {
+            e.stopPropagation();
+            void this._drawRandomQuoteForDay(state, bodyEl, journalDate, true);
+        });
+        reshuffleWrap.appendChild(reshuffle);
+        body.appendChild(reshuffleWrap);
+
+        body.addEventListener('click', () => {
+            const wsGuid = this.getWorkspaceGuid?.() || this.data?.getActiveUsers?.()[0]?.workspaceGuid;
+            if (!wsGuid || !picked.guid) return;
+            state.panel?.navigateTo({
+                workspaceGuid: wsGuid,
+                type:   'edit_panel',
+                rootId: picked.guid,
+                subId:  picked.guid,
+            });
+        });
+
+        view.appendChild(body);
+        bodyEl.appendChild(view);
+    }
+
+    _shuffleSignatureFromParts(guid, text) {
+        return (guid || '') + '\0' + String(text || '').slice(0, 280);
+    }
+
+    _shuffleSignature(h) {
+        return this._shuffleSignatureFromParts(h.guid, h.text);
+    }
+
+    /**
+     * All highlight quotes under a Reference body (every day under ❣️ Highlights), for shuffle pool.
+     */
+    async _extractAllHighlightsFromReferenceBody(record) {
+        let items;
+        try { items = await record.getLineItems(); } catch (_) { return []; }
+        if (!items || !items.length) return [];
+
+        const ordered = this._buildRecordDocumentOrder(record, items);
+        const recId = record.guid;
+
+        const roots = this._childrenInDocOrder(ordered, recId, recId);
+        let sectionLine = null;
+        for (const line of roots) {
+            const plain = await this._linePlainText(line);
+            if (this._isHighlightsSectionHeader(plain)) {
+                sectionLine = line;
+                break;
+            }
+        }
+        if (!sectionLine) return [];
+
+        const out = [];
+        const dateBlocks = this._childrenInDocOrder(ordered, recId, sectionLine.guid);
+        for (const dateLine of dateBlocks) {
+            if (dateLine?.type === 'br') continue;
+            const plainLo = (await this._linePlainText(dateLine)).trim();
+            if (!plainLo) continue;
+            if (plainLo === READWISE_REF_BETWEEN_DATE_DIVIDER_TEXT) continue;
+
+            const merged = await this._mergeQuoteLinesUnderDateGroup(record, ordered, recId, dateLine);
+            for (const row of merged) {
+                out.push({ text: row.text, note: row.note, loc: row.loc });
+            }
+        }
+        return out;
+    }
+
+    async _getQuoteShufflePoolFromReferences() {
+        if (Array.isArray(this._quotePoolCache) && this._quotePoolCache.length) {
+            if (this._isQuotePoolCacheStale()) void this._warmQuotePoolCache();
+            return this._quotePoolCache;
+        }
+        if (this._quotePoolBuildingPromise) return this._quotePoolBuildingPromise;
+
+        this._quotePoolBuildingPromise = this._rebuildQuoteShufflePoolFromReferences({ persist: true })
+            .finally(() => { this._quotePoolBuildingPromise = null; });
+        return this._quotePoolBuildingPromise;
+    }
+
+    async _rebuildQuoteShufflePoolFromReferences({ persist, onProgress }) {
+        await this._ensureRwCollections();
+        const refsColl = this._rwRefsColl;
+        if (!refsColl) {
+            this._quotePoolCache = [];
+            this._quotePoolCacheSavedAt = Date.now();
+            return this._quotePoolCache;
+        }
+
+        let records;
+        try { records = await refsColl.getAllRecords(); }
+        catch (_) {
+            this._quotePoolCache = [];
+            this._quotePoolCacheSavedAt = Date.now();
+            return this._quotePoolCache;
+        }
+
+        const results = [];
+        const total = records.length;
+        for (let i = 0; i < records.length; i += TH_SHUFFLER_POOL_CONCURRENCY) {
+            const chunk = records.slice(i, i + TH_SHUFFLER_POOL_CONCURRENCY);
+            if (onProgress) {
+                const upto = Math.min(i + chunk.length, total);
+                try { onProgress(`Scanning quote library… ${upto}/${total}`); } catch (_) {}
+            }
+            const parsed = await Promise.all(chunk.map((record) =>
+                this._extractAllHighlightsFromReferenceBody(record)));
+            for (let j = 0; j < chunk.length; j++) {
+                const record = chunk[j];
+                for (const row of parsed[j]) {
+                    const category = this._readwiseSourceCategoryLabel(record);
+                    const guid = record.guid;
+                    results.push({
+                        guid,
+                        record,
+                        text:          row.text,
+                        note:          row.note || '',
+                        source_title:  this._sourceTitleLabel(record),
+                        source_author: this._authorLabel(record),
+                        location:      row.loc || '',
+                        category,
+                        _sig: this._shuffleSignatureFromParts(guid, row.text),
+                    });
+                }
+            }
+            await this._sleep(0);
+        }
+
+        this._quotePoolCache = results;
+        this._quotePoolCacheSavedAt = Date.now();
+        if (persist) this._persistQuotePoolCache(results);
+        return results;
+    }
+
+    _pickRandomShuffleCandidate(pool, avoidSig) {
+        if (!pool || pool.length === 0) return null;
+        if (pool.length === 1) return pool[0];
+        const avoid = (avoidSig && String(avoidSig).trim()) ? String(avoidSig) : '';
+        for (let tries = 0; tries < 12; tries++) {
+            const idx = Math.floor(Math.random() * pool.length);
+            const c = pool[idx];
+            if (!avoid || c._sig !== avoid) return c;
+        }
+        return pool[Math.floor(Math.random() * pool.length)];
+    }
+
+    _flushPendingPopulate(state) {
+        if (state._pendingPopulate) {
+            state._pendingPopulate = false;
+            this._populate(state);
+        }
+    }
+
+    /** References collection takes precedence when present (Readwise References Option B). */
+    async _getHighlightsForDate(yyyymmdd, onProgress) {
+        await this._ensureRwCollections();
+        if (this._rwRefsColl) {
+            return await this._getHighlightsFromReferencesForDate(yyyymmdd, onProgress);
+        }
+        return await this._getHighlightsFromHighlightsCollection(yyyymmdd, onProgress);
+    }
+
+    /**
+     * Parse Reference record bodies: Highlights section → date heading → quote blocks (+ note/loc children).
+     */
+    async _getHighlightsFromReferencesForDate(yyyymmdd, onProgress) {
+        const hit = this._thRefQueryCache?.get(yyyymmdd);
+        if (hit) return hit;
+
+        const y = parseInt(yyyymmdd.slice(0, 4), 10);
+        const m = parseInt(yyyymmdd.slice(4, 6), 10) - 1;
+        const d = parseInt(yyyymmdd.slice(6, 8), 10);
+        const targetLabel = formatReadwiseRefDateHeading(new Date(y, m, d));
+
+        await this._ensureRwCollections();
+        const refsColl = this._rwRefsColl;
+        if (!refsColl) return [];
+
+        let records;
+        try { records = await refsColl.getAllRecords(); }
+        catch (_) { return []; }
+
+        const results = [];
+        const CONCURRENCY = 24;
+        const total = records.length;
+        for (let i = 0; i < records.length; i += CONCURRENCY) {
+            const chunk = records.slice(i, i + CONCURRENCY);
+            if (onProgress) {
+                const upto = Math.min(i + chunk.length, total);
+                try { onProgress(`Scanning highlights… ${upto}/${total}`); } catch (_) {}
+            }
+            const parsed = await Promise.all(chunk.map((record) =>
+                this._extractHighlightsFromReferenceBody(record, targetLabel, yyyymmdd)));
+            for (let j = 0; j < chunk.length; j++) {
+                const record = chunk[j];
+                for (const row of parsed[j]) {
+                    const category = this._readwiseSourceCategoryLabel(record);
+                    results.push({
+                        guid:          record.guid,
+                        record,
+                        text:          row.text,
+                        note:          row.note || '',
+                        source_title:  this._sourceTitleLabel(record),
+                        source_author: this._authorLabel(record),
+                        location:      row.loc || '',
+                        category,
+                    });
+                }
+            }
+            await this._sleep(0);
+        }
+
+        results.sort((a, b) => a.source_title.localeCompare(b.source_title));
+        try { this._thRefQueryCache.set(yyyymmdd, results); } catch (_) {}
+        return results;
+    }
+
+    async _extractHighlightsFromReferenceBody(record, targetDateLabel, yyyymmdd) {
+        let items;
+        try { items = await record.getLineItems(); } catch (_) { return []; }
+        if (!items || !items.length) return [];
+
+        const ordered = this._buildRecordDocumentOrder(record, items);
+        const recId = record.guid;
+
+        const roots = this._childrenInDocOrder(ordered, recId, recId);
+        let sectionLine = null;
+        for (const line of roots) {
+            const plain = await this._linePlainText(line);
+            if (this._isHighlightsSectionHeader(plain)) {
+                sectionLine = line;
+                break;
+            }
+        }
+        if (!sectionLine) return [];
+
+        const dateBlocks = this._childrenInDocOrder(ordered, recId, sectionLine.guid);
+        let targetDateLine = null;
+        for (const line of dateBlocks) {
+            if (line?.type === 'br') continue;
+            const plainLo = (await this._linePlainText(line)).trim();
+            if (!plainLo) continue;
+            if (plainLo === READWISE_REF_BETWEEN_DATE_DIVIDER_TEXT) continue;
+            if (await this._dateLineMatchesJournalDay(line, yyyymmdd, targetDateLabel)) {
+                targetDateLine = line;
+                break;
+            }
+        }
+        if (!targetDateLine) return [];
+
+        const merged = await this._mergeQuoteLinesUnderDateGroup(record, ordered, recId, targetDateLine);
+        const out = [];
+        for (const row of merged) {
+            out.push({ text: row.text, note: row.note, loc: row.loc });
+        }
+        return out;
+    }
+
+    _isHighlightsSectionHeader(plain) {
+        const t = String(plain || '').trim();
+        if (!t) return false;
+        if (/^❣️/.test(t) && /highlights/i.test(t)) return true;
+        return /highlights/i.test(t);
+    }
+
+    /** Between-quote separator from Readwise References (box-drawing / dash lines), not a highlight quote. */
+    _isReadwiseRefSeparatorLine(t) {
+        const s = String(t || '').trim();
+        if (s.length < 8) return false;
+        return /^[\u2500\u2501\u2014\u2013─\-\s·\u00B7]+$/.test(s);
+    }
+
+    /**
+     * Date line may be plain text or a ref to the journal record (Readwise References sync).
+     * Refs are checked first (exact calendar day). Plain text must include the year (new format) or parse to it;
+     * yearless labels matched the first same weekday+month+day block across years and mis-attributed highlights.
+     */
+    async _dateLineMatchesJournalDay(line, yyyymmdd, targetDateLabel) {
+        const segs = await this._lineSegments(line);
+        for (const seg of segs) {
+            if (seg?.type !== 'ref' || !seg.text) continue;
+            const g = typeof seg.text === 'string' ? seg.text : seg.text.guid;
+            if (!g) continue;
+            try {
+                const rec = this.data.getRecord(typeof g === 'string' ? g : g);
+                const jd = rec?.getJournalDetails?.();
+                if (jd?.date instanceof Date && !isNaN(jd.date.getTime())) {
+                    const y = jd.date.getFullYear();
+                    const m = String(jd.date.getMonth() + 1).padStart(2, '0');
+                    const day = String(jd.date.getDate()).padStart(2, '0');
+                    if (`${y}${m}${day}` === yyyymmdd) return true;
+                }
+            } catch (_) {}
+        }
+        const plain = (await this._linePlainText(line)).trim();
+        if (plain === targetDateLabel) return true;
+        const parsedYmd = parseReadwiseRefDateHeadingYmd(plain);
+        if (parsedYmd === yyyymmdd) return true;
+        return false;
+    }
+
+    async _parseNoteLocUnderQuote(record, ordered, quoteLine) {
+        let note = '';
+        let loc = '';
+        const kids = this._childrenInDocOrder(ordered, record.guid, quoteLine.guid);
+        for (const child of kids) {
+            const raw = await this._linePlainText(child);
+            const s = String(raw || '').trim();
+            if (/^📝\s*Note:/i.test(s) || /^Note:/i.test(s)) {
+                note = s.replace(/^📝\s*Note:\s*/i, '').replace(/^Note:\s*/i, '').trim();
+            } else if (/^🌎\s*Loc:/i.test(s) || /^https?:\/\//i.test(s)) {
+                loc = s.replace(/^🌎\s*Loc:\s*/i, '').trim();
+            }
+        }
+        return { note, loc };
+    }
+
+    /**
+     * Join consecutive sibling lines under one calendar heading until a quote-separator line.
+     * Thymer may split a long highlight across several top-level lines; the sync format inserts
+     * `READWISE_REF_QUOTE_SEPARATOR_TEXT` only between distinct highlights, not between fragments.
+     */
+    async _mergeQuoteLinesUnderDateGroup(record, ordered, recId, dateLine) {
+        const underDay = this._childrenInDocOrder(ordered, recId, dateLine.guid);
+        const out = [];
+        const group = [];
+
+        const emitGroup = () => {
+            if (!group.length) return;
+            const text = group.map(g => g.t).join('\n\n');
+            let note = '';
+            let loc = '';
+            for (const g of group) {
+                if (g.note && String(g.note).trim()) note = String(g.note).trim();
+                if (g.loc && String(g.loc).trim()) loc = String(g.loc).trim();
+            }
+            out.push({ text, note, loc });
+            group.length = 0;
+        };
+
+        for (const line of underDay) {
+            if (line?.type === 'br') continue;
+            const t = (await this._linePlainText(line)).trim();
+            if (!t || t === '---') continue;
+
+            if (this._isReadwiseRefSeparatorLine(t)) {
+                emitGroup();
+                continue;
+            }
+
+            const { note, loc } = await this._parseNoteLocUnderQuote(record, ordered, line);
+            group.push({ t, note, loc });
+        }
+        emitGroup();
+        return out;
+    }
+
+    _childrenInDocOrder(ordered, recId, parentGuid) {
+        const out = [];
+        for (const item of ordered) {
+            const pg = typeof item.parent_guid === 'string' && item.parent_guid
+                ? item.parent_guid
+                : recId;
+            if (pg === parentGuid) out.push(item);
+        }
+        return out;
+    }
+
+    async _linePlainText(line) {
+        const segments = await this._lineSegments(line);
+        return this._segmentsToPlainText(segments);
+    }
+
+    async _lineSegments(line) {
+        if (!line) return [];
+        if (Array.isArray(line.segments) && line.segments.length) return line.segments;
+        if (typeof line.getSegments === 'function') {
+            try {
+                const s = await line.getSegments();
+                return Array.isArray(s) ? s : [];
+            } catch (_) {}
+        }
+        return [];
+    }
+
+    _segmentsToPlainText(segments) {
+        if (!Array.isArray(segments) || segments.length === 0) return '';
+        let out = '';
+        for (const seg of segments) {
+            if (!seg) continue;
+            if (seg.type === 'text' || seg.type === 'bold' || seg.type === 'italic' || seg.type === 'code' || seg.type === 'link') {
+                if (typeof seg.text === 'string') out += seg.text;
+                continue;
+            }
+            if (seg.type === 'linkobj') {
+                const link = seg.text?.link || '';
+                const title = seg.text?.title || link;
+                out += title;
+                continue;
+            }
+            if (seg.type === 'hashtag') {
+                const t = typeof seg.text === 'string' ? seg.text : '';
+                if (!t) continue;
+                out += t.startsWith('#') ? t : `#${t}`;
+                continue;
+            }
+            if (seg.type === 'ref') {
+                const guid = seg.text?.guid || null;
+                let title = seg.text?.title || '';
+                if (!title && guid) {
+                    try {
+                        const r = this.data.getRecord(guid);
+                        if (r && typeof r.getName === 'function') title = r.getName() || '';
+                    } catch (_) {}
+                }
+                out += title;
+                continue;
+            }
+            if (typeof seg.text === 'string') out += seg.text;
+        }
+        return out;
+    }
+
+    /** Legacy: one Highlight record per Readwise highlight. */
+    async _getHighlightsFromHighlightsCollection(yyyymmdd, onProgress) {
+        const y = parseInt(yyyymmdd.slice(0, 4), 10);
+        const m = parseInt(yyyymmdd.slice(4, 6), 10) - 1;
+        const d = parseInt(yyyymmdd.slice(6, 8), 10);
+        const dayStart = new Date(y, m, d,  0,  0,  0,   0);
+        const dayEnd   = new Date(y, m, d, 23, 59, 59, 999);
+
+        await this._ensureRwCollections();
+        const highlightsColl = this._rwHighlightsColl;
+        if (!highlightsColl) return [];
+
+        let records;
+        try { records = await highlightsColl.getAllRecords(); }
+        catch (_) { return []; }
+
+        const results = [];
+        const total = records.length;
+        let idx = 0;
+        for (const record of records) {
+            idx += 1;
+            if (onProgress && (idx === 1 || idx % 120 === 0 || idx === total)) {
+                try { onProgress(`Scanning highlights… ${idx}/${total}`); } catch (_) {}
+            }
+            const date = this._getDateValue(record, 'highlighted_at');
+            if (!date) continue;
+            if (date >= dayStart && date <= dayEnd) {
+                results.push({
+                    guid:         record.guid,
+                    record,
+                    text:         this._highlightQuoteLabel(record),
+                    note:         record.text('note')         || '',
+                    source_title: this._sourceTitleLabel(record),
+                    source_author: this._authorLabel(record),
+                    location:     record.text('location')     || '',
+                    category:     this._readwiseSourceCategoryLabel(record),
+                });
+            }
+            if (idx % 120 === 0) await this._sleep(0);
+        }
+
+        results.sort((a, b) => a.source_title.localeCompare(b.source_title));
+        return results;
+    }
+
+    _getDateValue(record, fieldId) {
+        try {
+            const prop = record.prop(fieldId);
+            if (!prop) return null;
+            if (typeof prop.date === 'function') {
+                const d = prop.date();
+                if (d instanceof Date && !isNaN(d)) return d;
+            }
+            const raw = prop.get();
+            if (!raw) return null;
+            if (raw instanceof Date && !isNaN(raw)) return raw;
+            if (typeof raw.toDate  === 'function') { const d = raw.toDate();     if (!isNaN(d)) return d; }
+            if (typeof raw.value   === 'function') { const d = new Date(raw.value()); if (!isNaN(d)) return d; }
+            if (typeof raw === 'number')           { const d = new Date(raw);    if (!isNaN(d)) return d; }
+            if (typeof raw === 'string' && raw.length >= 8) { const d = new Date(raw); if (!isNaN(d)) return d; }
+        } catch (_) {}
+        return null;
+    }
+
+    /**
+     * Quote text: legacy `text` field, else record name / `title` (Readwise stores full quote in title).
+     */
+    _highlightQuoteLabel(record) {
+        try {
+            const legacy = record.text('text');
+            if (legacy && String(legacy).trim()) return String(legacy).trim();
+        } catch (_) {}
+        try {
+            if (typeof record.getName === 'function') {
+                const n = record.getName();
+                if (n && String(n).trim()) return String(n).trim();
+            }
+        } catch (_) {}
+        try {
+            const p = record.prop('title');
+            if (p && typeof p.get === 'function') {
+                const g = p.get();
+                if (g != null && String(g).trim()) return String(g).trim();
+            }
+        } catch (_) {}
+        return '';
+    }
+
+    /** `source_author` as People link or legacy text. */
+    _authorLabel(record) {
+        try {
+            if (typeof record.reference === 'function') {
+                const guid = record.reference('source_author');
+                if (guid) {
+                    const pr = this.data.getRecord(guid);
+                    if (pr && typeof pr.getName === 'function') {
+                        const n = pr.getName();
+                        if (n && String(n).trim()) return String(n).trim();
+                    }
+                }
+            }
+        } catch (_) {}
+        try {
+            const t = record.text('source_author');
+            if (t && String(t).trim()) return String(t).trim();
+        } catch (_) {}
+        return '';
+    }
+
+    /**
+     * `source_title` may be `link_to_record` (GUID) or legacy plain text.
+     */
+    _sourceTitleLabel(record) {
+        try {
+            if (typeof record.reference === 'function') {
+                const guid = record.reference('source_title');
+                if (guid) {
+                    const cap = this.data.getRecord(guid);
+                    if (cap && typeof cap.getName === 'function') {
+                        const n = cap.getName();
+                        if (n && String(n).trim()) return String(n).trim();
+                    }
+                }
+            }
+        } catch (_) {}
+        const legacy = record.text('source_title');
+        if (legacy && String(legacy).trim()) return String(legacy).trim();
+        return 'Unknown';
+    }
+
+    // =========================================================================
+    // DOM — group rendering
+    // =========================================================================
+
+    _buildGroup(sourceTitle, items, state) {
+        const isExpanded = state.expandedSources.get(sourceTitle) ?? false;
+
+        const group = document.createElement('div');
+        group.className = 'th-group';
+        if (isExpanded) group.classList.add('th-group--expanded');
+
+        // ── Group header ─────────────────────────────────────────────────────
+        const groupHeader = document.createElement('div');
+        groupHeader.className = 'th-group-header';
+
+        const sourceEl = document.createElement('span');
+        sourceEl.className   = 'th-source-title th-source-title--link';
+        sourceEl.textContent = sourceTitle;
+        sourceEl.title       = 'Open reference';
+        if (items.length && items[0].guid) {
+            sourceEl.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const wsGuid = this.getWorkspaceGuid?.() || this.data?.getActiveUsers?.()[0]?.workspaceGuid;
+                if (!wsGuid) return;
+                state.panel?.navigateTo({
+                    workspaceGuid: wsGuid,
+                    type:   'edit_panel',
+                    rootId: items[0].guid,
+                    subId:  items[0].guid,
+                });
+            });
+        }
+
+        const hlCount = document.createElement('span');
+        hlCount.className   = 'th-group-count';
+        hlCount.textContent = items.length === 1 ? '1 highlight' : `${items.length} highlights`;
+
+        const expandBtn = document.createElement('button');
+        expandBtn.className = 'th-expand-btn button-none button-small button-minimal-hover';
+        expandBtn.type      = 'button';
+        expandBtn.title     = isExpanded ? 'Collapse' : 'Show highlights';
+        expandBtn.textContent = isExpanded ? '▼' : '▶';
+
+        groupHeader.appendChild(expandBtn);
+        groupHeader.appendChild(sourceEl);
+        groupHeader.appendChild(hlCount);
+
+        // ── Preview area ─────────────────────────────────────────────────────
+        const preview = document.createElement('div');
+        preview.className    = 'th-preview';
+        preview.style.display = isExpanded ? 'block' : 'none';
+
+        for (const h of items) {
+            preview.appendChild(this._buildHighlightRow(h, state));
+        }
+
+        // ── Toggle expand ─────────────────────────────────────────────────────
+        expandBtn.addEventListener('click', () => {
+            const nowExpanded = !state.expandedSources.get(sourceTitle);
+            state.expandedSources.set(sourceTitle, nowExpanded);
+            group.classList.toggle('th-group--expanded', nowExpanded);
+            preview.style.display = nowExpanded ? 'block' : 'none';
+            expandBtn.textContent = nowExpanded ? '▼' : '▶';
+            expandBtn.title       = nowExpanded ? 'Collapse' : 'Show highlights';
+        });
+
+        group.appendChild(groupHeader);
+        group.appendChild(preview);
+        return group;
+    }
+
+    _buildHighlightRow(h, state) {
+        const row = document.createElement('div');
+        row.className = 'th-highlight-row';
+
+        // Quote bar + text
+        const quoteEl = document.createElement('div');
+        quoteEl.className   = 'th-highlight-text';
+        quoteEl.textContent = h.text;
+
+        row.appendChild(quoteEl);
+
+        // Note (if present)
+        if (h.note && h.note.trim()) {
+            const noteEl = document.createElement('div');
+            noteEl.className   = 'th-highlight-note';
+            noteEl.textContent = '✎ ' + h.note;
+            row.appendChild(noteEl);
+        }
+
+        // Meta: location
+        if (h.location && h.location.trim()) {
+            const metaEl = document.createElement('div');
+            metaEl.className   = 'th-highlight-meta';
+            metaEl.textContent = h.location;
+            row.appendChild(metaEl);
+        }
+
+        // Click to navigate to the highlight record
+        row.addEventListener('click', () => {
+            const wsGuid = this.getWorkspaceGuid?.() || this.data?.getActiveUsers?.()[0]?.workspaceGuid;
+            if (!wsGuid) return;
+            state.panel?.navigateTo({
+                workspaceGuid: wsGuid,
+                type:   'edit_panel',
+                rootId: h.guid,
+                subId:  h.guid,
+            });
+        });
+
+        return row;
+    }
+
+    // =========================================================================
+    // Utilities
+    // =========================================================================
+
+    _journalDateFromGuid(guid) {
+        if (!guid || guid.length < 8) return null;
+        const suffix = guid.slice(-8);
+        if (!/^\d{8}$/.test(suffix)) return null;
+        const year  = parseInt(suffix.slice(0, 4), 10);
+        const month = parseInt(suffix.slice(4, 6), 10);
+        const day   = parseInt(suffix.slice(6, 8), 10);
+        if (year < 2000 || year > 2099) return null;
+        if (month < 1 || month > 12)    return null;
+        if (day < 1   || day > 31)      return null;
+        return suffix;
+    }
+
+    /** YYYYMMDD journal key from GUID suffix, or `getJournalDetails().date` when the host uses non-date GUIDs. */
+    _journalDateFromRecord(record) {
+        const fromGuid = this._journalDateFromGuid(record?.guid || '');
+        if (fromGuid) return fromGuid;
+        try {
+            const jd = record?.getJournalDetails?.();
+            const d = jd?.date;
+            if (d instanceof Date && !isNaN(d.getTime())) {
+                const y = d.getFullYear();
+                const m = String(d.getMonth() + 1).padStart(2, '0');
+                const day = String(d.getDate()).padStart(2, '0');
+                return `${y}${m}${day}`;
+            }
+        } catch (_) {}
+        return null;
+    }
+
+    getWorkspaceGuid() {
+        try { return this.data.getActiveUsers()[0]?.workspaceGuid; }
+        catch (_) { return null; }
+    }
+
+    _loadBool(key, def) {
+        try { const v = localStorage.getItem(key); return v === null ? def : v === 'true'; }
+        catch (_) { return def; }
+    }
+    _saveBool(key, val) {
+        try { localStorage.setItem(key, val ? 'true' : 'false'); } catch (_) {}
+        globalThis.ThymerPluginSettings?.scheduleFlush?.(this, () => this._pathBMirrorKeys());
+    }
+
+    /** Persist quickly when storage mode is synced (in addition to debounced flush). */
+    _flushPathBNowBestEffort() {
+        if (this._pluginSettingsSyncMode !== 'synced') return;
+        const ps = globalThis.ThymerPluginSettings;
+        if (!ps?.flushNow || !this.data || !this._pluginSettingsPluginId) return;
+        ps.flushNow(this.data, this._pluginSettingsPluginId, this._pathBMirrorKeys()).catch(() => {});
+    }
+
+    // =========================================================================
+    // CSS
+    // =========================================================================
+
+    _injectCSS() {
+        this.ui.injectCSS(`
+            /* ── Journal footer wrapper (one or two cards) ── */
+            .th-journal-footer {
+                margin-top: 16px;
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+            }
+            .th-journal-footer > .th-footer {
+                margin-top: 0;
+            }
+
+            /* Journal Footer Suite — one glass shell; highlights list only (no second title card). */
+            .th-journal-footer[data-rw-suite-mount="highlights"] {
+                margin-top: 0;
+                gap: 0;
+            }
+            .th-journal-footer[data-rw-suite-mount="highlights"] > .th-footer--highlights {
+                margin-top: 0;
+                padding: 0;
+                background: transparent !important;
+                border: none !important;
+                box-shadow: none !important;
+                border-radius: 0;
+            }
+            .th-journal-footer[data-rw-suite-mount="highlights"] .th-footer--highlights > .th-header {
+                display: none !important;
+            }
+            .th-journal-footer[data-rw-suite-mount="highlights"] .th-footer--highlights > .th-body {
+                display: block !important;
+                padding-bottom: 2px;
+            }
+
+            /* Journal Footer Suite — shuffler in dock / detached host (glass chrome stays in JFS header). */
+            .th-journal-footer[data-rw-suite-mount="shuffler"] {
+                margin-top: 0;
+            }
+            .th-journal-footer[data-rw-suite-mount="shuffler"] > .th-footer--shuffler {
+                margin-top: 0;
+                padding: 4px 2px 6px;
+                background: transparent !important;
+                border: none !important;
+                box-shadow: none !important;
+                border-radius: 0;
+            }
+
+            /* ── Outer card — matches Backreferences / Today's Notes ── */
+            .th-footer {
+                margin-top: 16px;
+                font-size: 13px;
+                color: #e8e0d0;
+                background-color: rgba(30, 30, 36, 0.60);
+                border: 1px solid rgba(255, 255, 255, 0.10);
+                border-radius: 10px;
+                padding: 12px 16px 10px;
+            }
+
+            /* ── Header row ── */
+            .th-header {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                min-height: 30px;
+                margin-bottom: 6px;
+            }
+            .th-toggle {
+                font-size: 13px;
+                line-height: 1;
+                color: #8a7e6a;
+                cursor: pointer;
+                padding: 0 4px;
+                min-width: 18px;
+                flex-shrink: 0;
+            }
+            .th-title-icon {
+                color: #8a7e6a;
+                font-size: 14px;
+                flex-shrink: 0;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+            }
+            .th-inline-svg-icon {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                line-height: 0;
+                color: inherit;
+            }
+            .th-inline-svg-icon svg {
+                display: block;
+            }
+            .th-title {
+                font-weight: 600;
+                font-size: 13px;
+                flex: 1;
+                white-space: nowrap;
+            }
+            .th-count {
+                color: #8a7e6a;
+                font-size: 12px;
+                white-space: nowrap;
+                font-variant-numeric: tabular-nums;
+            }
+
+            /* ── Body ── */
+            .th-body { padding-bottom: 4px; }
+
+            .th-loading, .th-empty {
+                font-size: 12px;
+                color: #8a7e6a;
+                padding: 4px 0 6px;
+                font-style: italic;
+            }
+
+            /* ── Group (one per source_title) ── */
+            .th-group {
+                border-top: 1px solid rgba(255,255,255,0.06);
+                padding-top: 6px;
+                margin-top: 6px;
+            }
+            .th-group:first-child {
+                border-top: none;
+                margin-top: 0;
+                padding-top: 2px;
+            }
+            .th-group-header {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                padding: 3px 0;
+            }
+            .th-source-title {
+                font-weight: 600;
+                font-size: 13px;
+                color: #e8e0d0;
+                flex: 1;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                min-width: 0;
+            }
+            .th-source-title--link {
+                cursor: pointer;
+            }
+            .th-source-title--link:hover {
+                color: #f5efe4;
+                text-decoration: underline;
+            }
+            .th-group-count {
+                font-size: 11px;
+                color: #8a7e6a;
+                white-space: nowrap;
+                flex-shrink: 0;
+            }
+            .th-expand-btn {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 12px;
+                color: #8a7e6a;
+                cursor: pointer;
+                padding: 0;
+                margin: 0;
+                background: none;
+                border: none;
+                font-weight: 600;
+                line-height: 1;
+                flex-shrink: 0;
+                transition: color 0.1s;
+                min-width: 14px;
+                height: 16px;
+            }
+            .th-expand-btn:hover {
+                color: #e8e0d0;
+            }
+
+            /* ── Expandable highlight list ── */
+            .th-preview {
+                margin-top: 4px;
+                padding-left: 10px;
+                border-left: 2px solid rgba(255,255,255,0.10);
+                margin-left: 2px;
+            }
+
+            /* ── Individual highlight row ── */
+            .th-highlight-row {
+                padding: 6px 8px;
+                border-radius: 5px;
+                margin: 2px -8px;
+                cursor: pointer;
+                transition: background 0.1s;
+            }
+            .th-highlight-row:hover {
+                background: rgba(255,255,255,0.05);
+            }
+            .th-highlight-text {
+                font-size: 13px;
+                color: #c8bfaf;
+                line-height: 1.5;
+                /* subtle left bar to signal "quote" */
+            }
+            .th-highlight-note {
+                font-size: 12px;
+                color: #8a7e6a;
+                margin-top: 3px;
+                font-style: italic;
+            }
+            .th-highlight-meta {
+                font-size: 11px;
+                color: #6a5f52;
+                margin-top: 2px;
+            }
+
+            /* Quote shuffler: collapsed = same header pattern as Today’s Highlights; expanded = float toggle only */
+            .th-footer.th-footer--shuffler {
+                position: relative;
+                padding: 10px 14px 12px;
+            }
+            .th-shuffler-chrome {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                min-height: 30px;
+                margin-bottom: 6px;
+            }
+            .th-shuffler-shell:not(.th-shuffler-is-collapsed) .th-shuffler-chrome {
+                position: relative;
+                min-height: 0;
+                height: 0;
+                margin: 0;
+                padding: 0;
+                overflow: visible;
+            }
+            .th-shuffler-shell:not(.th-shuffler-is-collapsed) .th-shuffler-chrome .th-shuffler-title-icon,
+            .th-shuffler-shell:not(.th-shuffler-is-collapsed) .th-shuffler-chrome .th-shuffler-panel-title {
+                display: none !important;
+            }
+            /* Expanded: collapse via hover chevron beside quote icon (see .th-shuffler-top-actions), not a floating −. */
+            .th-shuffler-shell:not(.th-shuffler-is-collapsed) .th-shuffler-chrome .th-toggle {
+                display: none !important;
+            }
+            .th-shuffler-shell.th-shuffler-is-collapsed .th-shuffler-chrome .th-toggle {
+                position: static;
+            }
+            .th-shuffler-shell.th-shuffler-is-collapsed {
+                min-height: 34px;
+            }
+            .th-shuffler-body {
+                text-align: center;
+                padding: 12px 8px 6px;
+            }
+            .th-shuffler-shell.th-shuffler-is-collapsed .th-shuffler-body {
+                padding-top: 0;
+            }
+
+            /* Idle: no inner card — only panel background + centered prompt */
+            .th-shuffler-idle {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                gap: 14px;
+                max-width: 36em;
+                margin: 0 auto;
+            }
+            .th-shuffler-idle--bare {
+                border: none;
+                background: none;
+                padding: 10px 8px 8px;
+                border-radius: 0;
+            }
+            .th-shuffler-idle-caption {
+                font-family: var(--font-sans, system-ui, sans-serif);
+                font-size: 13px;
+                line-height: 1.65;
+                color: var(--color-text-100, #eceff4);
+                opacity: 0.42;
+                text-align: center;
+                max-width: 22em;
+            }
+            .th-shuffler-draw-btn {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                line-height: 0;
+                border: none;
+                background: none;
+                padding: 6px 8px;
+                color: var(--color-text-100, #eceff4);
+                opacity: 0.52;
+                cursor: pointer;
+                transition: opacity 0.12s;
+            }
+            .th-shuffler-draw-btn:hover {
+                opacity: 0.92;
+            }
+
+            /* Quote glyph centered in panel; chevron sits just left (off-axis). Hover only on icon band (+ slim bridge to chevron). */
+            .th-shuffler-top-actions {
+                width: 100%;
+                margin: 0 auto;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+            }
+            .th-shuffler-quote-hover-zone {
+                position: relative;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                padding: 2px 4px;
+            }
+            /* Invisible strip so moving pointer toward the chevron does not drop :hover before click */
+            .th-shuffler-quote-hover-zone::before {
+                content: '';
+                position: absolute;
+                right: 100%;
+                width: 20px;
+                top: 0;
+                bottom: 0;
+            }
+            .th-shuffler-collapse-mini {
+                position: absolute;
+                right: 100%;
+                margin-right: 5px;
+                top: 50%;
+                transform: translateY(-50%);
+                opacity: 0;
+                pointer-events: none;
+                transition: opacity 0.12s ease;
+                color: #8a7e6a;
+                cursor: pointer;
+                border: none;
+                background: transparent;
+                width: 18px;
+                height: 18px;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                padding: 0;
+                font-size: 10px;
+                line-height: 1;
+            }
+            .th-shuffler-collapse-mini .ti {
+                font-size: 14px;
+                line-height: 1;
+            }
+            .th-shuffler-quote-hover-zone:hover .th-shuffler-collapse-mini,
+            .th-shuffler-quote-hover-zone:focus-within .th-shuffler-collapse-mini {
+                opacity: 1;
+                pointer-events: auto;
+            }
+            .th-shuffler-collapse-mini:hover {
+                color: #e8e0d0;
+            }
+            .th-shuffler-quote-mark-row {
+                margin-bottom: 12px;
+            }
+            .th-shuffler-quote-mark-row .th-shuffler-quote-mark {
+                margin: 0;
+            }
+
+            /* Drawn quote: same surface as idle — no inner bordered card */
+            .th-shuffler-quote-view {
+                position: relative;
+                margin: 2px auto 0;
+                padding: 8px 6px 6px;
+                max-width: 36em;
+                border: none;
+                background: none;
+                border-radius: 0;
+            }
+            .th-shuffler-quote-reshuffle-wrap {
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                margin-top: 18px;
+                padding-top: 2px;
+            }
+            .th-shuffler-quote-reshuffle {
+                padding: 4px 6px;
+                line-height: 0;
+                border: none;
+                background: none;
+                border-radius: 0;
+                opacity: 0.48;
+                cursor: pointer;
+                color: var(--color-text-100, #eceff4);
+                transition: opacity 0.12s;
+            }
+            .th-shuffler-quote-reshuffle:hover {
+                opacity: 0.9;
+            }
+            .th-shuffler-quote-body {
+                cursor: pointer;
+                padding: 4px 8px 0 8px;
+                text-align: center;
+            }
+            .th-shuffler-quote-body:hover {
+                opacity: 0.97;
+            }
+            .th-shuffler-quote-mark {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                margin: 0 auto 12px;
+                line-height: 0;
+                color: var(--color-text-100, #eceff4);
+                opacity: 0.48;
+                pointer-events: none;
+            }
+            .th-shuffler-quote-display {
+                font-family: var(--font-sans, system-ui, sans-serif);
+                font-size: 15px;
+                line-height: 1.82;
+                color: var(--color-text-100, #eceff4);
+                opacity: 0.88;
+                font-style: normal;
+                letter-spacing: 0.01em;
+                text-align: center;
+                margin: 0 auto;
+            }
+            .th-shuffler-ritual-divider {
+                width: 32px;
+                height: 1px;
+                background: rgba(255,255,255,0.09);
+                margin: 20px auto 0;
+            }
+            .th-shuffler-source {
+                margin-top: 14px;
+                font-family: var(--font-sans, system-ui, sans-serif);
+                font-size: 14px;
+                font-weight: 600;
+                color: var(--color-text-100, #eceff4);
+                opacity: 0.78;
+                font-style: normal;
+                text-align: center;
+            }
+            .th-shuffler-author {
+                margin-top: 6px;
+                font-size: 12px;
+                color: var(--color-text-100, #eceff4);
+                opacity: 0.45;
+                font-style: normal;
+                text-align: center;
+            }
+            .th-shuffler-note {
+                margin-top: 14px;
+                font-size: 12px;
+                line-height: 1.55;
+                color: var(--color-text-100, #eceff4);
+                opacity: 0.48;
+                font-style: italic;
+                text-align: center;
+                max-width: 32em;
+                margin-left: auto;
+                margin-right: auto;
+            }
+            .th-shuffler-loc {
+                margin-top: 10px;
+                font-size: 11px;
+                color: var(--color-text-100, #eceff4);
+                opacity: 0.38;
+                word-break: break-all;
+                text-align: center;
+            }
+            .th-shuffler-loc-link {
+                color: var(--color-primary-400, #88c0d0);
+                opacity: 0.85;
+                text-decoration: none;
+            }
+            .th-shuffler-loc-link:hover {
+                text-decoration: underline;
+                opacity: 1;
+            }
+        `);
+    }
+
+    /**
+     * Readwise sends `Retry-After` on 429 (seconds as integer, or HTTP-date). Falls back to `fallbackMs`.
+     */
+    _rwrRetryAfterMs(resp, fallbackMs) {
+        const fb = Math.max(1000, Number(fallbackMs) || 60_000);
+        try {
+            const ra = resp && resp.headers && typeof resp.headers.get === 'function'
+                ? resp.headers.get('Retry-After')
+                : null;
+            if (ra == null || String(ra).trim() === '') return fb;
+            const t = String(ra).trim();
+            const sec = parseInt(t, 10);
+            if (Number.isFinite(sec) && sec > 0) return Math.min(sec * 1000, 600_000);
+            const when = Date.parse(t);
+            if (Number.isFinite(when)) {
+                const delta = when - Date.now();
+                if (delta > 500) return Math.min(delta, 600_000);
+            }
+        } catch (_) {}
+        return fb;
+    }
+
+    _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+    _trunc(s, max) { return s && s.length > max ? s.slice(0, max - 1) + '...' : (s || ''); }
+    /**
+     * Console output for sync / diagnostics. Default is `console.info` (visible when DevTools hides “Verbose” / `log`).
+     *
+     * `localStorage.readwise_references_console`:
+     *   - `info` (default) — `console.info`
+     *   - `log` — `console.log`
+     *   - `warn` — `console.warn` (hardest to miss)
+     *   - `both` — `log` + `info`
+     *
+     * `localStorage.readwise_references_console_mirror_top` = `1` — also emit from `window.top` (helps if the plugin runs in an iframe and your console context is “top”).
+     */
+    _log(msg) {
+        const line = '[ReadwiseRef] ' + msg;
+        let mode = 'info';
+        let mirrorTop = false;
+        try {
+            mode = String(localStorage.getItem('readwise_references_console') || 'info').toLowerCase();
+            const m = localStorage.getItem('readwise_references_console_mirror_top');
+            mirrorTop = m === '1' || m === 'true' || m === 'on';
+        } catch (_) {}
+
+        const topEmit = (fnName) => {
+            try {
+                const t = typeof window !== 'undefined' ? window.top : null;
+                if (!t || t === window || !t.console) return;
+                const c = t.console;
+                if (fnName === 'warn' && c.warn) c.warn(line);
+                else if (fnName === 'log' && c.log) c.log(line);
+                else if (c.info) c.info(line);
+            } catch (_) {}
+        };
+
+        if (mode === 'warn') {
+            try { console.warn(line); } catch (_) {}
+            if (mirrorTop) topEmit('warn');
+        } else if (mode === 'log') {
+            try { console.log(line); } catch (_) {}
+            if (mirrorTop) topEmit('log');
+        } else if (mode === 'both') {
+            try { console.log(line); } catch (_) {}
+            try { console.info(line); } catch (_) {}
+            if (mirrorTop) {
+                topEmit('log');
+                topEmit('info');
+            }
+        } else {
+            try { console.info(line); } catch (_) {}
+            if (mirrorTop) topEmit('info');
+        }
+    }
+    /** Minimal HTML escape for status bar labels. */
+    _syncStatusEscape(s) {
+        return String(s || '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+    _syncStatusShow(text) {
+        try {
+            if (typeof this.ui.addStatusBarItem !== 'function') return;
+            const safe = this._syncStatusEscape(text);
+            const html = '<span class="rwr-sync-status">' + safe + '</span>';
+            const tip = 'Readwise References — ' + String(text || '').trim();
+            if (!this._rwrSyncStatusItem) {
+                this._rwrSyncStatusItem = this.ui.addStatusBarItem({
+                    icon: 'ti-book-2',
+                    htmlLabel: html,
+                    tooltip: tip,
+                });
+            } else {
+                this._rwrSyncStatusItem.setHtmlLabel?.(html);
+                this._rwrSyncStatusItem.setTooltip?.(tip);
+            }
+        } catch (_) {}
+    }
+    _syncStatusHide() {
+        try { this._rwrSyncStatusItem?.remove?.(); } catch (_) {}
+        this._rwrSyncStatusItem = null;
+    }
+    _toast(msg) {
+        this.ui.addToaster({ title: 'Readwise Ref', message: msg, dismissible: true, autoDestroyTime: 4000 });
+    }
+}
