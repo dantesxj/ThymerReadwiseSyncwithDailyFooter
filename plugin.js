@@ -7093,15 +7093,9 @@ class Plugin extends AppPlugin {
         reshuffleWrap.appendChild(reshuffle);
         body.appendChild(reshuffleWrap);
 
-        body.addEventListener('click', () => {
-            const wsGuid = this.getWorkspaceGuid?.() || this.data?.getActiveUsers?.()[0]?.workspaceGuid;
-            if (!wsGuid || !picked.guid) return;
-            state.panel?.navigateTo({
-                workspaceGuid: wsGuid,
-                type:   'edit_panel',
-                rootId: picked.guid,
-                subId:  picked.guid,
-            });
+        body.addEventListener('click', (e) => {
+            if (!picked.guid) return;
+            void this._openRecord(state.panel, picked.guid, null, e);
         });
 
         view.appendChild(body);
@@ -7640,6 +7634,116 @@ class Plugin extends AppPlugin {
     }
 
     // =========================================================================
+    // Record navigation (this panel / side panel)
+    // =========================================================================
+
+    _wantsSidePanel(e) {
+        if (!e || typeof e !== 'object') return false;
+        if (e.openInSide === true) return true;
+        if (e.openInSide === false) return false;
+        return !!(e.metaKey || e.ctrlKey);
+    }
+
+    _navigatePanelToRecord(panel, recordGuid, lineGuid, workspaceGuid) {
+        if (!panel || !recordGuid) return Promise.resolve(false);
+        if (!lineGuid) {
+            panel.navigateTo({
+                type: 'edit_panel',
+                rootId: recordGuid,
+                subId: null,
+                workspaceGuid,
+            });
+            return Promise.resolve(true);
+        }
+        try {
+            const result = panel.navigateTo({ itemGuid: lineGuid, highlight: true });
+            if (result && typeof result.then === 'function') {
+                return result.then((found) => found !== false);
+            }
+            return Promise.resolve(result !== false);
+        } catch (_) {
+            return Promise.resolve(false);
+        }
+    }
+
+    _waitForPanelNavigationFrame() {
+        return new Promise((resolve) => {
+            if (typeof requestAnimationFrame === 'function') requestAnimationFrame(() => resolve());
+            else setTimeout(resolve, 0);
+        });
+    }
+
+    async _openRecord(panel, recordGuid, lineGuid, e) {
+        const workspaceGuid = this.getWorkspaceGuid?.() || null;
+        if (!workspaceGuid || !panel || !recordGuid) return;
+
+        if (this._wantsSidePanel(e)) {
+            try {
+                const newPanel = await this.ui.createPanel({ afterPanel: panel });
+                if (!newPanel) return;
+                this.ui.setActivePanel?.(newPanel);
+                await this._waitForPanelNavigationFrame();
+                await this._navigatePanelToRecord(newPanel, recordGuid, null, workspaceGuid);
+                if (lineGuid) {
+                    await this._navigatePanelToRecord(newPanel, recordGuid, lineGuid, workspaceGuid);
+                    await this._waitForPanelNavigationFrame();
+                    await this._waitForPanelNavigationFrame();
+                }
+            } catch (_) {}
+            return;
+        }
+
+        this._navigatePanelToRecord(panel, recordGuid, lineGuid || null, workspaceGuid);
+        this.ui.setActivePanel?.(panel);
+    }
+
+    _panelNavSvg(kind) {
+        const n = 14;
+        if (kind === 'side') {
+            return '<svg xmlns="http://www.w3.org/2000/svg" width="' + n + '" height="' + n + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="1.5" opacity="0.35"/><path d="M14 5v14"/><path d="M7 12h4"/><path d="m9 10 2 2-2 2"/></svg>';
+        }
+        return '<svg xmlns="http://www.w3.org/2000/svg" width="' + n + '" height="' + n + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17 17 7"/><path d="M7 7h10v10"/></svg>';
+    }
+
+    _appendPanelNavIcon(btn, kind) {
+        const wrap = document.createElement('span');
+        wrap.className = 'th-panel-nav-icon';
+        wrap.innerHTML = this._panelNavSvg(kind);
+        btn.appendChild(wrap);
+    }
+
+    _buildPanelNavActions(recordGuid, state, lineGuid = '') {
+        const wrap = document.createElement('div');
+        wrap.className = 'th-panel-nav-actions';
+
+        const here = document.createElement('button');
+        here.type = 'button';
+        here.className = 'th-panel-nav-btn button-none button-small button-minimal-hover tooltip';
+        here.title = 'Open in this panel';
+        here.setAttribute('aria-label', 'Open in this panel');
+        this._appendPanelNavIcon(here, 'here');
+        here.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            void this._openRecord(state.panel, recordGuid, lineGuid || null, { openInSide: false });
+        });
+
+        const side = document.createElement('button');
+        side.type = 'button';
+        side.className = 'th-panel-nav-btn button-none button-small button-minimal-hover tooltip';
+        side.title = 'Open in side panel';
+        side.setAttribute('aria-label', 'Open in side panel');
+        this._appendPanelNavIcon(side, 'side');
+        side.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            void this._openRecord(state.panel, recordGuid, lineGuid || null, { openInSide: true });
+        });
+
+        wrap.appendChild(here);
+        wrap.appendChild(side);
+        return wrap;
+    }
+
+    // =========================================================================
     // DOM — group rendering
     // =========================================================================
 
@@ -7657,20 +7761,19 @@ class Plugin extends AppPlugin {
         const sourceEl = document.createElement('span');
         sourceEl.className   = 'th-source-title th-source-title--link';
         sourceEl.textContent = sourceTitle;
-        sourceEl.title       = 'Open reference';
-        if (items.length && items[0].guid) {
+        sourceEl.title       = 'Open reference (⌘/Ctrl-click for side panel)';
+        const refGuid = items.length && items[0].guid ? items[0].guid : '';
+        if (refGuid) {
             sourceEl.addEventListener('click', (e) => {
                 e.stopPropagation();
-                const wsGuid = this.getWorkspaceGuid?.() || this.data?.getActiveUsers?.()[0]?.workspaceGuid;
-                if (!wsGuid) return;
-                state.panel?.navigateTo({
-                    workspaceGuid: wsGuid,
-                    type:   'edit_panel',
-                    rootId: items[0].guid,
-                    subId:  items[0].guid,
-                });
+                void this._openRecord(state.panel, refGuid, null, e);
             });
         }
+
+        const titleCluster = document.createElement('div');
+        titleCluster.className = 'th-source-title-cluster';
+        titleCluster.appendChild(sourceEl);
+        if (refGuid) titleCluster.appendChild(this._buildPanelNavActions(refGuid, state));
 
         const hlCount = document.createElement('span');
         hlCount.className   = 'th-group-count';
@@ -7683,7 +7786,7 @@ class Plugin extends AppPlugin {
         expandBtn.textContent = isExpanded ? '▼' : '▶';
 
         groupHeader.appendChild(expandBtn);
-        groupHeader.appendChild(sourceEl);
+        groupHeader.appendChild(titleCluster);
         groupHeader.appendChild(hlCount);
 
         // ── Preview area ─────────────────────────────────────────────────────
@@ -7719,7 +7822,11 @@ class Plugin extends AppPlugin {
         quoteEl.className   = 'th-highlight-text';
         quoteEl.textContent = h.text;
 
-        row.appendChild(quoteEl);
+        const topRow = document.createElement('div');
+        topRow.className = 'th-highlight-top';
+        topRow.appendChild(quoteEl);
+        if (h.guid) topRow.appendChild(this._buildPanelNavActions(h.guid, state));
+        row.appendChild(topRow);
 
         // Note (if present)
         if (h.note && h.note.trim()) {
@@ -7738,15 +7845,9 @@ class Plugin extends AppPlugin {
         }
 
         // Click to navigate to the highlight record
-        row.addEventListener('click', () => {
-            const wsGuid = this.getWorkspaceGuid?.() || this.data?.getActiveUsers?.()[0]?.workspaceGuid;
-            if (!wsGuid) return;
-            state.panel?.navigateTo({
-                workspaceGuid: wsGuid,
-                type:   'edit_panel',
-                rootId: h.guid,
-                subId:  h.guid,
-            });
+        row.addEventListener('click', (e) => {
+            if (!h.guid) return;
+            void this._openRecord(state.panel, h.guid, null, e);
         });
 
         return row;
@@ -7945,15 +8046,62 @@ class Plugin extends AppPlugin {
                 gap: 6px;
                 padding: 3px 0;
             }
+            .th-panel-nav-actions {
+                display: inline-flex;
+                align-items: center;
+                gap: 2px;
+                flex: 0 0 auto;
+                opacity: 0.72;
+                transition: opacity 0.1s;
+            }
+            .th-group-header:hover .th-panel-nav-actions,
+            .th-highlight-row:hover .th-panel-nav-actions,
+            .th-highlight-row:focus-within .th-panel-nav-actions {
+                opacity: 1;
+            }
+            .th-panel-nav-btn {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 22px;
+                height: 22px;
+                padding: 0;
+                border-radius: 5px;
+                color: #8a7e6a;
+                line-height: 1;
+            }
+            .th-panel-nav-icon {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 14px;
+                height: 14px;
+            }
+            .th-panel-nav-icon svg {
+                display: block;
+                width: 14px;
+                height: 14px;
+            }
+            .th-panel-nav-btn:hover {
+                color: #e8e0d0;
+                background: rgba(255,255,255,0.06);
+            }
+            .th-source-title-cluster {
+                display: inline-flex;
+                align-items: center;
+                gap: 4px;
+                flex: 1 1 auto;
+                min-width: 0;
+            }
             .th-source-title {
                 font-weight: 600;
                 font-size: 13px;
                 color: #e8e0d0;
-                flex: 1;
+                flex: 1 1 auto;
+                min-width: 0;
                 white-space: nowrap;
                 overflow: hidden;
                 text-overflow: ellipsis;
-                min-width: 0;
             }
             .th-source-title--link {
                 cursor: pointer;
@@ -8005,6 +8153,24 @@ class Plugin extends AppPlugin {
                 margin: 2px -8px;
                 cursor: pointer;
                 transition: background 0.1s;
+                display: flex;
+                flex-wrap: wrap;
+                align-items: flex-start;
+                gap: 4px;
+            }
+            .th-highlight-top {
+                display: flex;
+                align-items: flex-start;
+                gap: 4px;
+                width: 100%;
+            }
+            .th-highlight-top .th-highlight-text {
+                flex: 1 1 auto;
+                min-width: 0;
+            }
+            .th-highlight-row .th-highlight-note,
+            .th-highlight-row .th-highlight-meta {
+                flex: 1 1 100%;
             }
             .th-highlight-row:hover {
                 background: rgba(255,255,255,0.05);
