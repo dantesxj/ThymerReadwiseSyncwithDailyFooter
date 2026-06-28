@@ -68,12 +68,12 @@
   const MOBILE_GRACE_UNTIL_KEY = '__thymerExtMobileGraceUntil';
   const MOBILE_HIDDEN_AT_KEY = '__thymerExtMobileHiddenAt';
   const MOBILE_INTERACT_THROTTLE_AT_KEY = '__thymerExtMobileInteractThrottleAt';
-  /** Mobile: pause heavy-work queue briefly so navigation stays responsive. Desktop: no grace gate. */
-  const MOBILE_GRACE_MS = 32000;
-  const MOBILE_RESUME_GRACE_MS = 20000;
+  /** Mobile: brief bootstrap — end early on first user interaction (see endMobileLoadGrace). */
+  const MOBILE_GRACE_MS = 12000;
+  const MOBILE_RESUME_GRACE_MS = 12000;
   const MOBILE_RESUME_AWAY_MS = 15000;
   /** Interaction only pauses the heavy-work queue briefly — do not extend MOBILE_GRACE. */
-  const MOBILE_HEAVY_PAUSE_ON_INTERACT_MS = 8000;
+  const MOBILE_HEAVY_PAUSE_ON_INTERACT_MS = 5000;
   /** Desktop: brief heavy-work pause after first click during startup storm. */
   const DESKTOP_HEAVY_PAUSE_ON_INTERACT_MS = 6000;
   const MOBILE_INTERACTION_THROTTLE_MS = 2500;
@@ -81,7 +81,7 @@
 
   /** Cross-platform: defer vault scans / footer data populate while Thymer syncs; shells may still mount. */
   const STARTUP_STORM_UNTIL_KEY = '__thymerExtStartupStormUntil';
-  const STARTUP_STORM_MOBILE_MS = 38000;
+  const STARTUP_STORM_MOBILE_MS = 14000;
   const STARTUP_STORM_DESKTOP_MS = 14000;
 
   // Heavy work scheduler: many plugins "wake up" together after mobile grace ends.
@@ -142,10 +142,17 @@
     setTimeout(tick, pollMs);
   }
 
+  function endMobileLoadGrace() {
+    try {
+      g[MOBILE_GRACE_UNTIL_KEY] = 0;
+    } catch (_) {}
+  }
+
   function installStartupStormInteractionListener() {
     g.__thymerExtStormOnInteract = () => {
       try {
         endStartupStormWindow();
+        endMobileLoadGrace();
         pauseHeavyWorkQueue(
           preferDeferredHeavyWork() ? MOBILE_HEAVY_PAUSE_ON_INTERACT_MS : DESKTOP_HEAVY_PAUSE_ON_INTERACT_MS
         );
@@ -176,6 +183,7 @@
       }
     } catch (_) {}
     installStartupStormInteractionListener();
+    installMobileInteractionGraceListener();
   }
 
   function inMobileLoadGrace() {
@@ -281,6 +289,7 @@
         if (now - prev < MOBILE_INTERACTION_THROTTLE_MS) return;
         g[MOBILE_INTERACT_THROTTLE_AT_KEY] = now;
         endStartupStormWindow();
+        endMobileLoadGrace();
         pauseHeavyWorkQueue(MOBILE_HEAVY_PAUSE_ON_INTERACT_MS);
       } catch (_) {}
     };
@@ -2490,6 +2499,7 @@
 
   g.thymerExtEnsureMobileLoadGrace = ensureMobileLoadGraceStarted;
   g.thymerExtInMobileLoadGrace = inMobileLoadGrace;
+  g.thymerExtEndMobileLoadGrace = endMobileLoadGrace;
   g.thymerExtPreferDeferredHeavyWork = preferDeferredHeavyWork;
   g.thymerExtShouldDeferPanelFooterWork = shouldDeferPanelFooterWork;
   g.thymerExtBumpMobileLoadGrace = bumpMobileLoadGrace;
@@ -3282,7 +3292,7 @@ const RWR_MUTATION_OBS_DEBOUNCE_MS = 450;
 const RWR_RECORD_CREATED_DEBOUNCE_MS = 2800;
 const RWR_RECORD_CREATED_DEBOUNCE_MOBILE_MS = 4200;
 /** After cold load, ignore `record.created` footer churn while Thymer syncs many unrelated rows. */
-const RWR_RECORD_CREATED_COLD_START_GRACE_MS = 60000;
+const RWR_RECORD_CREATED_COLD_START_GRACE_MS = 18000;
 
 /**
  * How many source documents to process concurrently during full sync.
@@ -3618,6 +3628,21 @@ class Plugin extends AppPlugin {
         return Number.isFinite(until) && until > 0 && Date.now() < until;
     }
 
+    _rwEnsurePathBReady() {
+        if (this._rwPathBReadyDone) return Promise.resolve();
+        if (this._rwPathBReadyPromise) return this._rwPathBReadyPromise;
+        this._rwPathBReadyPromise = this._rwRunDeferredPathB()
+            .then(() => {
+                this._rwPathBReadyDone = true;
+            })
+            .catch(() => {});
+        return this._rwPathBReadyPromise;
+    }
+
+    async _rwAwaitPathBReady() {
+        await this._rwEnsurePathBReady();
+    }
+
     async _rwRunDeferredPathB() {
         try {
             const idleTimeout = this._rwPreferSlowStart() ? 3500 : 5000;
@@ -3664,17 +3689,7 @@ class Plugin extends AppPlugin {
             try {
                 console.warn('[Readwise Ref] deferred Path B init', e);
             } catch (_) {}
-        } finally {
-            try {
-                if (typeof this._rwPathBReadyResolve === 'function') this._rwPathBReadyResolve();
-            } catch (_) {}
-            this._rwPathBReadyResolve = null;
         }
-    }
-
-    async _rwAwaitPathBReady() {
-        const p = this._rwPathBReadyPromise;
-        if (p) await p.catch(() => {});
     }
 
     onLoad() {
@@ -3687,10 +3702,6 @@ class Plugin extends AppPlugin {
         this._rwColdStartGraceUntil = Date.now() + RWR_RECORD_CREATED_COLD_START_GRACE_MS;
         this._rwDupLoadSeq = (this._rwDupLoadSeq | 0) + 1;
         this._rwDupDiagLog('onLoad_enter', { loadSeq: this._rwDupLoadSeq });
-        this._rwPathBReadyPromise = new Promise((resolve) => {
-            this._rwPathBReadyResolve = resolve;
-        });
-        void this._rwRunDeferredPathB();
         this._syncing = false;
         this._cmdSetToken = this.ui.addCommandPaletteCommand({
             label: 'Readwise Ref: Set Token',
@@ -6810,6 +6821,7 @@ class Plugin extends AppPlugin {
     }
 
     async _populate(state) {
+        await this._rwEnsurePathBReady();
         if (state.loading) return;
         state.loading = true;
         if (typeof state.populateSeq !== 'number') state.populateSeq = 0;
