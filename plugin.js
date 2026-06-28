@@ -69,8 +69,8 @@
   const MOBILE_HIDDEN_AT_KEY = '__thymerExtMobileHiddenAt';
   const MOBILE_INTERACT_THROTTLE_AT_KEY = '__thymerExtMobileInteractThrottleAt';
   /** Mobile: brief bootstrap — end early on first user interaction (see endMobileLoadGrace). */
-  const MOBILE_GRACE_MS = 12000;
-  const MOBILE_RESUME_GRACE_MS = 12000;
+  const MOBILE_GRACE_MS = 6000;
+  const MOBILE_RESUME_GRACE_MS = 6000;
   const MOBILE_RESUME_AWAY_MS = 15000;
   /** Interaction only pauses the heavy-work queue briefly — do not extend MOBILE_GRACE. */
   const MOBILE_HEAVY_PAUSE_ON_INTERACT_MS = 5000;
