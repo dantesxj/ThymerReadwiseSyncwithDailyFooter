@@ -68,28 +68,114 @@
   const MOBILE_GRACE_UNTIL_KEY = '__thymerExtMobileGraceUntil';
   const MOBILE_HIDDEN_AT_KEY = '__thymerExtMobileHiddenAt';
   const MOBILE_INTERACT_THROTTLE_AT_KEY = '__thymerExtMobileInteractThrottleAt';
-  /** Pause footer scans / Path B until host sidebar is up — keep short so navigation is not blocked for ~2 min. */
-  const MOBILE_GRACE_MS = 45000;
-  const MOBILE_RESUME_GRACE_MS = 35000;
+  /** Mobile: pause heavy-work queue briefly so navigation stays responsive. Desktop: no grace gate. */
+  const MOBILE_GRACE_MS = 32000;
+  const MOBILE_RESUME_GRACE_MS = 20000;
   const MOBILE_RESUME_AWAY_MS = 15000;
-  /** Interaction only pauses the heavy-work queue briefly — do not extend MOBILE_GRACE (that delayed page change until ~2 min). */
-  const MOBILE_HEAVY_PAUSE_ON_INTERACT_MS = 10000;
+  /** Interaction only pauses the heavy-work queue briefly — do not extend MOBILE_GRACE. */
+  const MOBILE_HEAVY_PAUSE_ON_INTERACT_MS = 8000;
+  /** Desktop: brief heavy-work pause after first click during startup storm. */
+  const DESKTOP_HEAVY_PAUSE_ON_INTERACT_MS = 6000;
   const MOBILE_INTERACTION_THROTTLE_MS = 2500;
   const HEAVY_QUEUE_PAUSED_UNTIL_KEY = '__thymerExtHeavyQueuePausedUntil';
+
+  /** Cross-platform: defer vault scans / footer data populate while Thymer syncs; shells may still mount. */
+  const STARTUP_STORM_UNTIL_KEY = '__thymerExtStartupStormUntil';
+  const STARTUP_STORM_MOBILE_MS = 38000;
+  const STARTUP_STORM_DESKTOP_MS = 14000;
 
   // Heavy work scheduler: many plugins "wake up" together after mobile grace ends.
   // Running them concurrently causes long-task storms that block navigation.
   const HEAVY_Q_KEY = '__thymerExtHeavyWorkQueue';
   const HEAVY_BUSY_KEY = '__thymerExtHeavyWorkBusy';
 
+  function ensureStartupStormWindow(extraMs) {
+    const ms =
+      extraMs > 0
+        ? extraMs
+        : preferDeferredHeavyWork()
+          ? STARTUP_STORM_MOBILE_MS
+          : STARTUP_STORM_DESKTOP_MS;
+    const until = Date.now() + ms;
+    try {
+      if (!g[STARTUP_STORM_UNTIL_KEY] || g[STARTUP_STORM_UNTIL_KEY] < until) {
+        g[STARTUP_STORM_UNTIL_KEY] = until;
+      }
+    } catch (_) {}
+    installStartupStormInteractionListener();
+  }
+
+  function inStartupStormWindow() {
+    try {
+      return Date.now() < (g[STARTUP_STORM_UNTIL_KEY] || 0);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function endStartupStormWindow() {
+    try {
+      g[STARTUP_STORM_UNTIL_KEY] = 0;
+    } catch (_) {}
+  }
+
+  function scheduleAfterStartupStorm(run, opts) {
+    if (typeof run !== 'function') return;
+    if (!inStartupStormWindow()) {
+      try {
+        run();
+      } catch (_) {}
+      return;
+    }
+    const pollMs = Math.max(120, Number(opts?.pollMs) || 400);
+    const maxWaitMs = Math.max(pollMs, Number(opts?.maxWaitMs) || 120000);
+    const started = Date.now();
+    const tick = () => {
+      if (!inStartupStormWindow() || Date.now() - started >= maxWaitMs) {
+        try {
+          run();
+        } catch (_) {}
+        return;
+      }
+      setTimeout(tick, pollMs);
+    };
+    setTimeout(tick, pollMs);
+  }
+
+  function installStartupStormInteractionListener() {
+    g.__thymerExtStormOnInteract = () => {
+      try {
+        endStartupStormWindow();
+        pauseHeavyWorkQueue(
+          preferDeferredHeavyWork() ? MOBILE_HEAVY_PAUSE_ON_INTERACT_MS : DESKTOP_HEAVY_PAUSE_ON_INTERACT_MS
+        );
+      } catch (_) {}
+    };
+    if (g.__thymerExtStormInteractInstalled) return;
+    g.__thymerExtStormInteractInstalled = true;
+    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
+    const onInteract = () => {
+      try {
+        g.__thymerExtStormOnInteract?.();
+      } catch (_) {}
+    };
+    for (const ev of ['pointerdown', 'touchstart', 'keydown']) {
+      try {
+        document.addEventListener(ev, onInteract, { passive: true, capture: true });
+      } catch (_) {}
+    }
+  }
+
   function ensureMobileLoadGraceStarted(extraMs) {
     if (!preferDeferredHeavyWork()) return;
+    ensureStartupStormWindow();
     const until = Date.now() + (extraMs > 0 ? extraMs : MOBILE_GRACE_MS);
     try {
       if (!g[MOBILE_GRACE_UNTIL_KEY] || g[MOBILE_GRACE_UNTIL_KEY] < until) {
         g[MOBILE_GRACE_UNTIL_KEY] = until;
       }
     } catch (_) {}
+    installStartupStormInteractionListener();
   }
 
   function inMobileLoadGrace() {
@@ -150,9 +236,36 @@
     }
   }
 
-  /** True during startup window: skip footer mount / panel scans so page navigation stays responsive. */
+  /**
+   * True during the brief startup window — use only to skip *background* sync scans,
+   * not user-initiated panel.navigated mounts (those should still schedule with debounce).
+   */
   function shouldDeferPanelFooterWork() {
     return inMobileLoadGrace();
+  }
+
+  /** Run `fn` now, or poll until mobile load grace ends (for one-shot startup scans that must not be dropped). */
+  function scheduleAfterMobileLoadGrace(run, opts) {
+    if (typeof run !== 'function') return;
+    if (!preferDeferredHeavyWork() || !inMobileLoadGrace()) {
+      try {
+        run();
+      } catch (_) {}
+      return;
+    }
+    const pollMs = Math.max(120, Number(opts?.pollMs) || 350);
+    const maxWaitMs = Math.max(pollMs, Number(opts?.maxWaitMs) || 90000);
+    const started = Date.now();
+    const tick = () => {
+      if (!inMobileLoadGrace() || Date.now() - started >= maxWaitMs) {
+        try {
+          run();
+        } catch (_) {}
+        return;
+      }
+      setTimeout(tick, pollMs);
+    };
+    setTimeout(tick, pollMs);
   }
 
   function installMobileInteractionGraceListener() {
@@ -167,6 +280,7 @@
         const prev = g[MOBILE_INTERACT_THROTTLE_AT_KEY] || 0;
         if (now - prev < MOBILE_INTERACTION_THROTTLE_MS) return;
         g[MOBILE_INTERACT_THROTTLE_AT_KEY] = now;
+        endStartupStormWindow();
         pauseHeavyWorkQueue(MOBILE_HEAVY_PAUSE_ON_INTERACT_MS);
       } catch (_) {}
     };
@@ -219,7 +333,7 @@
       g[HEAVY_BUSY_KEY] = false;
       // If we stopped due to grace, try again later.
       if (Array.isArray(g[HEAVY_Q_KEY]) && g[HEAVY_Q_KEY].length) {
-        setTimeout(() => runNextHeavyWork(), 1500);
+        setTimeout(() => runNextHeavyWork(), inMobileLoadGrace() ? 450 : 200);
       }
     }
   }
@@ -2212,7 +2326,7 @@
     installMobileResumeGraceListener,
 
     async init(opts) {
-      ensureMobileLoadGraceStarted();
+      ensureStartupStormWindow();
       installMobileResumeGraceListener();
       installMobileInteractionGraceListener();
       await yieldToHostBeforePathB();
@@ -2383,6 +2497,11 @@
   g.thymerExtInstallMobileResumeGrace = installMobileResumeGraceListener;
   g.thymerExtInstallMobileInteractionGrace = installMobileInteractionGraceListener;
   g.thymerExtEnqueueHeavyWork = enqueueHeavyWork;
+  g.thymerExtScheduleAfterMobileLoadGrace = scheduleAfterMobileLoadGrace;
+  g.thymerExtEnsureStartupStormWindow = ensureStartupStormWindow;
+  g.thymerExtInStartupStormWindow = inStartupStormWindow;
+  g.thymerExtEndStartupStormWindow = endStartupStormWindow;
+  g.thymerExtScheduleAfterStartupStorm = scheduleAfterStartupStorm;
 })(typeof globalThis !== 'undefined' ? globalThis : window);
 // @generated END thymer-plugin-settings
 
@@ -3163,7 +3282,7 @@ const RWR_MUTATION_OBS_DEBOUNCE_MS = 450;
 const RWR_RECORD_CREATED_DEBOUNCE_MS = 2800;
 const RWR_RECORD_CREATED_DEBOUNCE_MOBILE_MS = 4200;
 /** After cold load, ignore `record.created` footer churn while Thymer syncs many unrelated rows. */
-const RWR_RECORD_CREATED_COLD_START_GRACE_MS = 120000;
+const RWR_RECORD_CREATED_COLD_START_GRACE_MS = 60000;
 
 /**
  * How many source documents to process concurrently during full sync.
@@ -3495,18 +3614,13 @@ class Plugin extends AppPlugin {
     }
 
     _rwInColdStartGrace() {
-        try {
-            if (typeof globalThis.thymerExtInMobileLoadGrace === 'function' && globalThis.thymerExtInMobileLoadGrace()) {
-                return true;
-            }
-        } catch (_) {}
         const until = this._rwColdStartGraceUntil;
         return Number.isFinite(until) && until > 0 && Date.now() < until;
     }
 
     async _rwRunDeferredPathB() {
         try {
-            const idleTimeout = this._rwPreferSlowStart() ? 12000 : 5000;
+            const idleTimeout = this._rwPreferSlowStart() ? 3500 : 5000;
             await new Promise((r) => {
                 try {
                     if (typeof requestIdleCallback === 'function') {
@@ -3563,10 +3677,11 @@ class Plugin extends AppPlugin {
         if (p) await p.catch(() => {});
     }
 
-    async onLoad() {
+    onLoad() {
         this._rwUnloaded = false;
         try {
             globalThis.thymerExtEnsureMobileLoadGrace?.();
+            globalThis.thymerExtEnsureStartupStormWindow?.();
             globalThis.thymerExtInstallMobileResumeGrace?.();
         } catch (_) {}
         this._rwColdStartGraceUntil = Date.now() + RWR_RECORD_CREATED_COLD_START_GRACE_MS;
@@ -3574,15 +3689,6 @@ class Plugin extends AppPlugin {
         this._rwDupDiagLog('onLoad_enter', { loadSeq: this._rwDupLoadSeq });
         this._rwPathBReadyPromise = new Promise((resolve) => {
             this._rwPathBReadyResolve = resolve;
-        });
-        // Let the host paint before Path B work. Avoid duplicate upgradeCollectionSchema here:
-        // registerPluginSlug already runs upgradePluginSettingsSchema (and may rewrite Plugin rows once).
-        await new Promise((r) => {
-            try {
-                requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(r, 0)));
-            } catch (_) {
-                setTimeout(r, 0);
-            }
         });
         void this._rwRunDeferredPathB();
         this._syncing = false;
@@ -3730,9 +3836,9 @@ class Plugin extends AppPlugin {
         globalThis.__thymerReadwiseJfsSuiteNotify = this._readwiseJfsNotifyBound;
         const wantLegacyFooterPanels = this._showHighlightsPanel() || this._showShufflerPanel();
         if (wantLegacyFooterPanels) {
-            const legacyMountMs = rwrPreferDeferredHeavyWork() ? 5200 : 900;
+            const legacyMountMs = rwrPreferDeferredHeavyWork() ? 650 : 450;
             setTimeout(() => {
-                if (this._rwUnloaded || this._rwInColdStartGrace()) return;
+                if (this._rwUnloaded) return;
                 try {
                     const p = this.ui.getActivePanel();
                     if (p) this._deferHandlePanel(p);
@@ -3754,6 +3860,10 @@ class Plugin extends AppPlugin {
             if (this._rwRecordCreatedRefreshTimer) clearTimeout(this._rwRecordCreatedRefreshTimer);
         } catch (_) {}
         this._rwRecordCreatedRefreshTimer = null;
+        try {
+            if (this._rwPopulateStormTimer) clearTimeout(this._rwPopulateStormTimer);
+        } catch (_) {}
+        this._rwPopulateStormTimer = null;
         try {
             this._rwRecordCreatedPendingColls?.clear();
         } catch (_) {}
