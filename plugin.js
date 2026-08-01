@@ -3255,6 +3255,9 @@ function rwrPreferDeferredHeavyWork() {
 const TH_KEY_SHOW_HIGHLIGHTS   = 'th_panel_show_highlights';
 const TH_KEY_SHOW_SHUFFLER     = 'th_panel_show_shuffler';
 const TH_KEY_SHUFFLER_COLLAPSED = 'th_shuffler_collapsed';
+/** When true, Quote Shuffler mounts in its own glass shell below Today's Highlights (suite parity). */
+const TH_KEY_SHUFFLER_DETACHED = 'th_shuffler_detached';
+const TH_JFS_MIGRATED_KEY = 'jfs_config_v1__migrated_to_readwise';
 /** JSON object: { [YYYYMMDD]: { sig, guid, text, note, location, source_title, source_author } } */
 const TH_KEY_SHUFFLER_QUOTES_BY_DAY = 'th_shuffler_quotes_by_day';
 const TH_KEY_SHUFFLER_POOL_CACHE = 'th_shuffler_pool_cache_v4';
@@ -3754,6 +3757,11 @@ class Plugin extends AppPlugin {
             icon: 'ti-arrows-shuffle',
             onSelected: () => this._toggleShowShufflerPanel(),
         });
+        this._cmdToggleShufflerDetached = this.ui.addCommandPaletteCommand({
+            label: 'Readwise Ref: Toggle Quote Shuffler detached glass',
+            icon: 'ti-layout-bottombar',
+            onSelected: () => this._toggleShufflerDetached(),
+        });
         this._cmdShuffleQuote = this.ui.addCommandPaletteCommand({
             label: 'Readwise Ref: Shuffle Quote',
             icon: 'ti-arrows-shuffle',
@@ -3763,8 +3771,10 @@ class Plugin extends AppPlugin {
         this._panelStates = new Map();
         this._eventHandlerIds = [];
         this._navDeferTimers = new Map();
+        this._migrateJfsConfigIfNeeded();
         this._collapsed = this._loadBool('th_footer_collapsed', false);
         this._shufflerCollapsed = this._loadBool(TH_KEY_SHUFFLER_COLLAPSED, false);
+        this._shufflerDetached = this._loadBool(TH_KEY_SHUFFLER_DETACHED, true);
         this._thRefQueryCache = new Map();
         this._quotePoolCache = null;
         this._quotePoolCacheSavedAt = 0;
@@ -3911,6 +3921,7 @@ class Plugin extends AppPlugin {
         this._cmdStorage?.remove();
         this._cmdToggleHighlights?.remove();
         this._cmdToggleShuffler?.remove();
+        this._cmdToggleShufflerDetached?.remove();
         this._cmdShuffleQuote?.remove();
         document.getElementById('rwr-token-dialog')?.remove();
     }
@@ -3924,16 +3935,73 @@ class Plugin extends AppPlugin {
             TH_KEY_SHOW_HIGHLIGHTS,
             TH_KEY_SHOW_SHUFFLER,
             TH_KEY_SHUFFLER_COLLAPSED,
+            TH_KEY_SHUFFLER_DETACHED,
             TH_KEY_SHUFFLER_QUOTES_BY_DAY,
         ];
     }
 
+    /**
+     * One-time map from Journal Footer Suite chrome prefs → standalone keys
+     * so retiring the suite keeps Highlights / Shuffler / detach state.
+     */
+    _migrateJfsConfigIfNeeded() {
+        try {
+            if (localStorage.getItem(TH_JFS_MIGRATED_KEY)) return;
+        } catch (_) { return; }
+
+        let jfs = null;
+        try { jfs = JSON.parse(localStorage.getItem('jfs_config_v1') || 'null'); }
+        catch (_) { jfs = null; }
+        if (!jfs || typeof jfs !== 'object') return;
+
+        const applyIfUnset = (key, val) => {
+            try {
+                if (localStorage.getItem(key) !== null) return;
+            } catch (_) { return; }
+            this._saveBool(key, !!val);
+        };
+
+        const enabled = jfs.enabled && typeof jfs.enabled === 'object' ? jfs.enabled : null;
+        if (enabled) {
+            if (enabled.highlights !== undefined) applyIfUnset(TH_KEY_SHOW_HIGHLIGHTS, enabled.highlights !== false);
+            if (enabled.shuffler !== undefined) applyIfUnset(TH_KEY_SHOW_SHUFFLER, enabled.shuffler !== false);
+        }
+        if (typeof jfs.shufflerExpanded === 'boolean') {
+            applyIfUnset(TH_KEY_SHUFFLER_COLLAPSED, !jfs.shufflerExpanded);
+        }
+        if (typeof jfs.shufflerDetached === 'boolean') {
+            applyIfUnset(TH_KEY_SHUFFLER_DETACHED, jfs.shufflerDetached);
+        }
+        if (typeof jfs.collapsed === 'boolean') {
+            applyIfUnset('th_footer_collapsed', jfs.collapsed);
+        }
+
+        try { localStorage.setItem(TH_JFS_MIGRATED_KEY, '1'); } catch (_) {}
+    }
+
     _showHighlightsPanel() {
-        return this._loadBool(TH_KEY_SHOW_HIGHLIGHTS, false);
+        return this._loadBool(TH_KEY_SHOW_HIGHLIGHTS, true);
     }
 
     _showShufflerPanel() {
-        return this._loadBool(TH_KEY_SHOW_SHUFFLER, false);
+        return this._loadBool(TH_KEY_SHOW_SHUFFLER, true);
+    }
+
+    _showShufflerDetached() {
+        return this._loadBool(TH_KEY_SHUFFLER_DETACHED, true);
+    }
+
+    /** Whether this panel should receive a populate kick (suite mount and/or standalone flags). */
+    _rwPanelWantsPopulate(panelId) {
+        if (!panelId) return false;
+        try {
+            const hi = typeof globalThis.__thymerJfsReadwiseGetHighlightsMountEl === 'function'
+                && globalThis.__thymerJfsReadwiseGetHighlightsMountEl(panelId);
+            const sh = typeof globalThis.__thymerJfsReadwiseGetShufflerMountEl === 'function'
+                && globalThis.__thymerJfsReadwiseGetShufflerMountEl(panelId);
+            if (hi || sh) return true;
+        } catch (_) {}
+        return this._showHighlightsPanel() || this._showShufflerPanel();
     }
 
     /**
@@ -4042,6 +4110,14 @@ class Plugin extends AppPlugin {
         const next = !this._showShufflerPanel();
         this._saveBool(TH_KEY_SHOW_SHUFFLER, next);
         this._toast(next ? 'Quote Shuffler panel: on' : 'Quote Shuffler panel: off');
+        this._rebuildAllJournalFooters();
+    }
+
+    _toggleShufflerDetached() {
+        const next = !this._showShufflerDetached();
+        this._shufflerDetached = next;
+        this._saveBool(TH_KEY_SHUFFLER_DETACHED, next);
+        this._toast(next ? 'Quote Shuffler: detached glass' : 'Quote Shuffler: stacked under highlights');
         this._rebuildAllJournalFooters();
     }
 
@@ -6454,12 +6530,33 @@ class Plugin extends AppPlugin {
         for (const par of parents) {
             if (!par || seen.has(par)) continue;
             seen.add(par);
-            for (const el of par.querySelectorAll(':scope > .th-journal-footer')) {
+            for (const el of par.querySelectorAll(':scope > .th-journal-footer, :scope > .th-shuffler-detached-host')) {
                 if (el.dataset?.panelId === panelId) {
                     try { el.remove(); } catch (_) {}
                 }
             }
         }
+    }
+
+    _ensureDetachedShufflerHost(container, panelId) {
+        if (!container || !panelId) return null;
+        let host = null;
+        for (const el of container.querySelectorAll(':scope > .th-shuffler-detached-host')) {
+            if (el.dataset?.panelId === panelId) { host = el; break; }
+        }
+        if (!host) {
+            host = document.createElement('div');
+            host.className = 'th-shuffler-detached-host';
+            host.dataset.panelId = panelId;
+            container.appendChild(host);
+        }
+        let shell = host.querySelector(':scope > .th-shuffler-detached-shell');
+        if (!shell) {
+            shell = document.createElement('div');
+            shell.className = 'th-shuffler-detached-shell';
+            host.appendChild(shell);
+        }
+        return shell;
     }
 
     // Returns true if the footer was (re)built — caller should re-populate and drop stale async work
@@ -6468,9 +6565,15 @@ class Plugin extends AppPlugin {
         const wantSh = !!suiteSh || this._showShufflerPanel();
         if (!wantHi && !wantSh) return false;
 
+        this._shufflerDetached = this._showShufflerDetached();
+        // Suite still owns detach when present; otherwise use standalone detached glass.
+        const useDetached = !!(wantSh && !suiteSh && container && this._shufflerDetached !== false);
         const hiParent = wantHi ? (suiteHi || container) : null;
-        const shParent = wantSh ? (suiteSh || container) : null;
-        const combined = !!(wantHi && wantSh && hiParent && shParent && hiParent === shParent);
+        let shParent = wantSh ? (suiteSh || container) : null;
+        if (useDetached) {
+            shParent = this._ensureDetachedShufflerHost(container, state.panelId);
+        }
+        const combined = !!(wantHi && wantSh && hiParent && shParent && hiParent === shParent && !useDetached);
 
         const parents = [...new Set([container, suiteHi, suiteSh].filter(Boolean))];
 
@@ -6552,9 +6655,16 @@ class Plugin extends AppPlugin {
                 wrapSh.className = 'th-journal-footer';
                 wrapSh.dataset.panelId = state.panelId;
                 if (suiteSh) wrapSh.dataset.rwSuiteMount = 'shuffler';
+                if (useDetached) wrapSh.dataset.rwDetachedMount = 'shuffler';
                 wrapSh.appendChild(this._buildShufflerPanel(state));
                 shParent.appendChild(wrapSh);
                 if (!wantHi || hiParent !== shParent) state.shufflerRootEl = wrapSh;
+                if (useDetached && container) {
+                    const host = shParent.parentElement;
+                    if (host?.classList?.contains('th-shuffler-detached-host') && host.parentElement === container) {
+                        if (container.lastElementChild !== host) container.appendChild(host);
+                    }
+                }
             }
         }
 
@@ -6569,8 +6679,15 @@ class Plugin extends AppPlugin {
         if (state?.rootEl?.parentElement === container && state.rootEl.dataset?.rwSuiteMount !== 'highlights') {
             if (container.lastElementChild !== state.rootEl) container.appendChild(state.rootEl);
         }
-        if (state?.shufflerRootEl?.parentElement === container) {
-            if (container.lastElementChild !== state.shufflerRootEl) container.appendChild(state.shufflerRootEl);
+        const shRoot = state?.shufflerRootEl;
+        if (!shRoot) return;
+        const host = shRoot.closest?.('.th-shuffler-detached-host');
+        if (host?.parentElement === container) {
+            if (container.lastElementChild !== host) container.appendChild(host);
+            return;
+        }
+        if (shRoot.parentElement === container) {
+            if (container.lastElementChild !== shRoot) container.appendChild(shRoot);
         }
     }
 
@@ -6691,10 +6808,26 @@ class Plugin extends AppPlugin {
         countEl.className    = 'th-count';
         countEl.dataset.role = 'count';
 
+        const actions = document.createElement('div');
+        actions.className = 'th-header-actions';
+        const quoteBtn = document.createElement('button');
+        quoteBtn.type = 'button';
+        quoteBtn.className = 'th-action th-quote-toggle button-none button-small button-minimal-hover';
+        quoteBtn.title = this._showShufflerPanel() ? 'Hide Quote Shuffler' : 'Show Quote Shuffler';
+        quoteBtn.setAttribute('aria-label', quoteBtn.title);
+        quoteBtn.classList.toggle('is-active', this._showShufflerPanel());
+        this._rwrAppendSvgIcon(quoteBtn, 'quote', 15);
+        quoteBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this._toggleShowShufflerPanel();
+        });
+        actions.appendChild(quoteBtn);
+
         header.appendChild(toggle);
         header.appendChild(icon);
         header.appendChild(titleEl);
         header.appendChild(countEl);
+        header.appendChild(actions);
 
         const body = document.createElement('div');
         body.dataset.role  = 'body';
@@ -6732,14 +6865,19 @@ class Plugin extends AppPlugin {
         collapseMiniBtn.type = 'button';
         collapseMiniBtn.className = 'th-shuffler-collapse-mini button-none';
         const inSuite = !!bodyEl.closest('[data-rw-suite-mount="shuffler"]');
-        collapseMiniBtn.title = inSuite
-            ? 'Hide Quote Shuffler (same as footer header quote icon)'
+        const isDetached = !!bodyEl.closest('[data-rw-detached-mount="shuffler"]') || this._showShufflerDetached();
+        collapseMiniBtn.title = (inSuite || isDetached)
+            ? 'Hide Quote Shuffler'
             : 'Collapse Quote Shuffler';
         collapseMiniBtn.innerHTML = '<i class="ti ti-chevron-up" aria-hidden="true"></i>';
         collapseMiniBtn.addEventListener('click', (e) => {
             e.stopPropagation();
             if (inSuite && typeof globalThis.__thymerJfsCloseQuoteShufflerDock === 'function') {
                 globalThis.__thymerJfsCloseQuoteShufflerDock();
+                return;
+            }
+            if (isDetached) {
+                if (this._showShufflerPanel()) this._toggleShowShufflerPanel();
                 return;
             }
             const shell = bodyEl.closest('.th-shuffler-shell');
@@ -8082,15 +8220,56 @@ class Plugin extends AppPlugin {
                 border-radius: 0;
             }
 
-            /* ── Outer card — matches Backreferences / Today's Notes ── */
+            /* ── Outer card — Journal Footer Suite glass (JOURNAL_SUITE_GLASS_V1) ── */
             .th-footer {
                 margin-top: 16px;
                 font-size: 13px;
-                color: #e8e0d0;
-                background-color: rgba(30, 30, 36, 0.60);
-                border: 1px solid rgba(255, 255, 255, 0.10);
+                color: inherit;
+                isolation: isolate;
                 border-radius: 10px;
-                padding: 12px 16px 10px;
+                overflow: hidden;
+                padding: 10px 12px 8px;
+                background: rgba(22, 22, 28, 0.38);
+                background: color-mix(in srgb, var(--panel-bg-color, rgb(24, 23, 28)) 38%, transparent);
+                border: 1px solid rgba(255, 255, 255, 0.055);
+                box-shadow:
+                  inset 0 1px 0 rgba(255, 255, 255, 0.05),
+                  0 4px 28px rgba(0, 0, 0, 0.16);
+                -webkit-backdrop-filter: blur(22px) saturate(1.45);
+                backdrop-filter: blur(22px) saturate(1.45);
+            }
+
+            .th-shuffler-detached-host {
+                margin-top: 12px;
+            }
+            .th-shuffler-detached-shell {
+                padding: 10px 12px;
+                font-size: 13px;
+                color: inherit;
+                isolation: isolate;
+                border-radius: 10px;
+                overflow: hidden;
+                background: rgba(22, 22, 28, 0.38);
+                background: color-mix(in srgb, var(--panel-bg-color, rgb(24, 23, 28)) 38%, transparent);
+                border: 1px solid rgba(255, 255, 255, 0.055);
+                box-shadow:
+                  inset 0 1px 0 rgba(255, 255, 255, 0.05),
+                  0 4px 28px rgba(0, 0, 0, 0.16);
+                -webkit-backdrop-filter: blur(22px) saturate(1.45);
+                backdrop-filter: blur(22px) saturate(1.45);
+            }
+            .th-journal-footer[data-rw-detached-mount="shuffler"] {
+                margin-top: 0;
+            }
+            .th-journal-footer[data-rw-detached-mount="shuffler"] > .th-footer--shuffler {
+                margin-top: 0;
+                padding: 0;
+                background: transparent !important;
+                border: none !important;
+                box-shadow: none !important;
+                border-radius: 0;
+                backdrop-filter: none;
+                -webkit-backdrop-filter: none;
             }
 
             /* ── Header row ── */
@@ -8101,6 +8280,26 @@ class Plugin extends AppPlugin {
                 min-height: 30px;
                 margin-bottom: 6px;
             }
+            .th-header-actions {
+                margin-left: auto;
+                display: inline-flex;
+                align-items: center;
+                gap: 4px;
+            }
+            .th-action {
+                opacity: 0;
+                transition: opacity .12s, color .12s;
+                color: var(--text-muted, currentColor);
+                width: 24px;
+                height: 22px;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                padding: 0;
+            }
+            .th-footer:hover .th-action { opacity: 1; }
+            .th-action:hover { color: inherit; }
+            .th-action.is-active { color: inherit; opacity: 1; }
             .th-toggle {
                 font-size: 13px;
                 line-height: 1;
