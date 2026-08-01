@@ -3230,8 +3230,9 @@ const RWR_TOKEN_KEY    = 'readwise_references_token';
 const RWR_LAST_RUN_KEY = 'readwise_references_last_run';
 /** JSON blob from the last sync — use "Readwise Ref: Log last sync diagnostics" to inspect. */
 const RWR_LAST_SYNC_DIAG_KEY = 'readwise_references_last_sync_diag';
-/** Per-`external_id` content hash — skip expensive body rebuild when highlights unchanged. */
-const RWR_BODY_SIGS_KEY = 'readwise_references_body_sigs_v1';
+/** Per-`external_id` content hash — skip expensive body rebuild when highlights unchanged.
+ * v3: journal date headings prefer real `@ref` links (force one rebuild after linking fix). */
+const RWR_BODY_SIGS_KEY = 'readwise_references_body_sigs_v3';
 
 /** People `Tags` field id for Readwise author stubs. Override: `readwise_references_people_tags_field_id`. */
 const RWR_PEOPLE_TAGS_FIELD_ID_DEFAULT = 'F31TEM8CGEG08F1';
@@ -3261,8 +3262,15 @@ const TH_JFS_MIGRATED_KEY = 'jfs_config_v1__migrated_to_readwise';
 /** JSON object: { [YYYYMMDD]: { sig, guid, text, note, location, source_title, source_author } } */
 const TH_KEY_SHUFFLER_QUOTES_BY_DAY = 'th_shuffler_quotes_by_day';
 const TH_KEY_SHUFFLER_POOL_CACHE = 'th_shuffler_pool_cache_v4';
+/**
+ * Compact date→highlights index for Today's Highlights (avoids full References body scan).
+ * Shape: `{ v:1, updatedAt:number, entries:{ [guid]:{ st, sa, cat, d:{ [YYYYMMDD]:[[text,note,loc],...] } } } }`
+ * Mirrored via Path B when storage mode is synced. Pool cache stays device-local (too large).
+ */
+const TH_KEY_HIGHLIGHTS_BY_DAY = 'th_highlights_by_day_v1';
 /** Debounced cross-device sync for per-day shuffle picks (avoid workspace-wide flashes on every click). */
 const TH_SHUFFLER_DAYMAP_SYNC_IDLE_MS = 15000;
+const TH_DAY_INDEX_SYNC_IDLE_MS = 15000;
 const TH_SHUFFLER_POOL_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const TH_SHUFFLER_POOL_CONCURRENCY = 10;
 
@@ -3348,9 +3356,18 @@ function rwrSkipUnchangedBodiesFromStorage() {
 function rwrLoadBodySigMap() {
     try {
         const raw = localStorage.getItem(RWR_BODY_SIGS_KEY);
-        if (!raw) return Object.create(null);
-        const o = JSON.parse(raw);
-        return o && typeof o === 'object' ? o : Object.create(null);
+        if (raw) {
+            const o = JSON.parse(raw);
+            return o && typeof o === 'object' ? o : Object.create(null);
+        }
+        // Migrate v2 → v3 so a key bump does not force rewriting every Reference body.
+        const legacy = localStorage.getItem('readwise_references_body_sigs_v2');
+        if (legacy) {
+            try { localStorage.setItem(RWR_BODY_SIGS_KEY, legacy); } catch (_) {}
+            const o = JSON.parse(legacy);
+            return o && typeof o === 'object' ? o : Object.create(null);
+        }
+        return Object.create(null);
     } catch (_) {
         return Object.create(null);
     }
@@ -3478,6 +3495,8 @@ function formatReadwiseRefDateHeading(d) {
 }
 
 class Plugin extends AppPlugin {
+    /** Cached journal GUID prefix (`S-…-P000000000-0-`) for constructing day links. */
+    _journalGuidPrefix = null;
     /** Workspace-scoped cache for named collections (one `getAllCollections` until cleared). */
     _rwCollsKey = null;
     _rwCollsResolved = false;
@@ -3721,6 +3740,31 @@ class Plugin extends AppPlugin {
             icon: 'ti-book-2',
             onSelected: () => this._runSync(true),
         });
+        this._cmdCancelSync = this.ui.addCommandPaletteCommand({
+            label: 'Readwise Ref: Cancel / clear stuck sync status',
+            icon: 'ti-player-stop',
+            onSelected: () => this._cancelStuckSync(),
+        });
+        this._cmdRebuildThisBody = this.ui.addCommandPaletteCommand({
+            label: 'Readwise Ref: Rebuild body for this reference',
+            icon: 'ti-refresh',
+            onSelected: () => { void this._rebuildActiveReferenceBody(); },
+        });
+        this._cmdRelinkDates = this.ui.addCommandPaletteCommand({
+            label: 'Readwise Ref: Link date headings to journals',
+            icon: 'ti-calendar-link',
+            onSelected: () => { void this._relinkAllDateHeadings(); },
+        });
+        this._cmdRebuildDayIndex = this.ui.addCommandPaletteCommand({
+            label: 'Readwise Ref: Rebuild Today\'s Highlights index',
+            icon: 'ti-database',
+            onSelected: () => { void this._rebuildDayIndexFromBodies(); },
+        });
+        this._cmdDiagnoseRef = this.ui.addCommandPaletteCommand({
+            label: 'Readwise Ref: Diagnose this reference',
+            icon: 'ti-stethoscope',
+            onSelected: () => { void this._diagnoseActiveReference(); },
+        });
         this._cmdSyncDiag = this.ui.addCommandPaletteCommand({
             label: 'Readwise Ref: Log last sync diagnostics',
             icon: 'ti-stethoscope',
@@ -3772,14 +3816,17 @@ class Plugin extends AppPlugin {
         this._eventHandlerIds = [];
         this._navDeferTimers = new Map();
         this._migrateJfsConfigIfNeeded();
-        this._collapsed = this._loadBool('th_footer_collapsed', false);
+        this._collapsed = this._loadBool('th_footer_collapsed', true);
         this._shufflerCollapsed = this._loadBool(TH_KEY_SHUFFLER_COLLAPSED, false);
         this._shufflerDetached = this._loadBool(TH_KEY_SHUFFLER_DETACHED, true);
         this._thRefQueryCache = new Map();
         this._quotePoolCache = null;
         this._quotePoolCacheSavedAt = 0;
         this._quotePoolBuildingPromise = null;
+        this._highlightsDayIndex = null;
+        this._highlightsDayIndexDirty = false;
         this._hydrateQuotePoolCacheFromStorage();
+        this._hydrateHighlightsDayIndexFromStorage();
         this._injectCSS();
         this._eventHandlerIds.push(this.events.on('panel.navigated', ev => this._deferHandlePanel(ev.panel)));
         this._eventHandlerIds.push(this.events.on('panel.focused',   ev => this._deferHandlePanel(ev.panel)));
@@ -3905,6 +3952,10 @@ class Plugin extends AppPlugin {
             try { clearTimeout(this._shufflerDayMapSyncTimer); } catch (_) {}
             this._shufflerDayMapSyncTimer = null;
         }
+        if (this._dayIndexSyncTimer) {
+            try { clearTimeout(this._dayIndexSyncTimer); } catch (_) {}
+            this._dayIndexSyncTimer = null;
+        }
         this._syncStatusHide();
 
         if (globalThis.__thymerReadwiseJfsSuiteNotify === this._readwiseJfsNotifyBound) {
@@ -3916,6 +3967,11 @@ class Plugin extends AppPlugin {
         this._cmdSetToken?.remove();
         this._cmdSync?.remove();
         this._cmdFullSync?.remove();
+        this._cmdCancelSync?.remove();
+        this._cmdRebuildThisBody?.remove();
+        this._cmdRelinkDates?.remove();
+        this._cmdRebuildDayIndex?.remove();
+        this._cmdDiagnoseRef?.remove();
         this._cmdSyncDiag?.remove();
         this._cmdStatusReport?.remove();
         this._cmdStorage?.remove();
@@ -3937,6 +3993,7 @@ class Plugin extends AppPlugin {
             TH_KEY_SHUFFLER_COLLAPSED,
             TH_KEY_SHUFFLER_DETACHED,
             TH_KEY_SHUFFLER_QUOTES_BY_DAY,
+            TH_KEY_HIGHLIGHTS_BY_DAY,
         ];
     }
 
@@ -3994,13 +4051,6 @@ class Plugin extends AppPlugin {
     /** Whether this panel should receive a populate kick (suite mount and/or standalone flags). */
     _rwPanelWantsPopulate(panelId) {
         if (!panelId) return false;
-        try {
-            const hi = typeof globalThis.__thymerJfsReadwiseGetHighlightsMountEl === 'function'
-                && globalThis.__thymerJfsReadwiseGetHighlightsMountEl(panelId);
-            const sh = typeof globalThis.__thymerJfsReadwiseGetShufflerMountEl === 'function'
-                && globalThis.__thymerJfsReadwiseGetShufflerMountEl(panelId);
-            if (hi || sh) return true;
-        } catch (_) {}
         return this._showHighlightsPanel() || this._showShufflerPanel();
     }
 
@@ -4021,8 +4071,56 @@ class Plugin extends AppPlugin {
         if (kind === 'quotes') {
             return '<svg xmlns="http://www.w3.org/2000/svg" width="' + n + '" height="' + n + '" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 17h3l2-4V7H5v6h3zm8 0h3l2-4V7h-6v6h3z"/></svg>';
         }
-        /* “books” intent: open book silhouette, reads clearly at 16px */
-        return '<svg xmlns="http://www.w3.org/2000/svg" width="' + n + '" height="' + n + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>';
+        const stroke = (body, w) => '<svg xmlns="http://www.w3.org/2000/svg" width="' + n + '" height="' + n
+            + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="' + (w || 2)
+            + '" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + body + '</svg>';
+        /* Light chevron matching the Backreferences fold caret (rotate via CSS). */
+        if (kind === 'chevron') return stroke('<polyline points="9 6 15 12 9 18"/>', 1.75);
+        if (kind === 'cog') {
+            return stroke('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>', 1.75);
+        }
+        /* Per-category source glyphs (Readwise `source_category`). */
+        /* Tabler `book` — open book with three spines. */
+        if (kind === 'cat-book') {
+            return stroke('<path d="M3 19a9 9 0 0 1 9 0a9 9 0 0 1 9 0"/><path d="M3 6a9 9 0 0 1 9 0a9 9 0 0 1 9 0"/><path d="M3 6l0 13"/><path d="M12 6l0 13"/><path d="M21 6l0 13"/>');
+        }
+        if (kind === 'cat-article') {
+            return stroke('<rect x="3" y="4" width="18" height="16" rx="2"/><line x1="7" y1="9" x2="17" y2="9"/><line x1="7" y1="13" x2="17" y2="13"/><line x1="7" y1="17" x2="13" y2="17"/>');
+        }
+        if (kind === 'cat-podcast') {
+            return stroke('<rect x="9" y="2.5" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><line x1="12" y1="18" x2="12" y2="21.5"/>');
+        }
+        if (kind === 'cat-video') {
+            return stroke('<rect x="2.5" y="5" width="13.5" height="14" rx="2"/><path d="M16 10.5 21.5 7v10L16 13.5z"/>');
+        }
+        /* Default (highlights panel title): Tabler `quote`. */
+        return stroke('<path d="M10 11h-4a1 1 0 0 1 -1 -1v-3a1 1 0 0 1 1 -1h3a1 1 0 0 1 1 1v6c0 2.667 -1.333 4.333 -4 5"/><path d="M19 11h-4a1 1 0 0 1 -1 -1v-3a1 1 0 0 1 1 -1h3a1 1 0 0 1 1 1v6c0 2.667 -1.333 4.333 -4 5"/>');
+    }
+
+    /** Readwise `source_category` (choice id or label) → inline SVG icon kind. */
+    _rwrCategoryIconKind(category) {
+        const k = String(category || '').trim().toLowerCase();
+        if (!k) return '';
+        if (k.startsWith('book')) return 'cat-book';
+        if (k.startsWith('article') || k === 'rss' || k.startsWith('email')) return 'cat-article';
+        if (k.startsWith('podcast')) return 'cat-podcast';
+        if (k.startsWith('video') || k.startsWith('tweet')) return 'cat-video';
+        return '';
+    }
+
+    /** Light chevron that rotates down when expanded (no glyph swap). */
+    _rwrBuildChevron(expanded, extraClass) {
+        const el = document.createElement('span');
+        el.className = 'th-chevron' + (extraClass ? ' ' + extraClass : '');
+        el.innerHTML = this._rwrSvgIcon('chevron', 14);
+        el.setAttribute('aria-hidden', 'true');
+        this._rwrSyncChevron(el, expanded);
+        return el;
+    }
+
+    _rwrSyncChevron(el, expanded) {
+        if (!el?.classList) return;
+        el.classList.toggle('th-chevron--open', expanded === true);
     }
 
     _rwrAppendSvgIcon(parent, kind, sizePx) {
@@ -4049,6 +4147,136 @@ class Plugin extends AppPlugin {
         this._quotePoolBuildingPromise = null;
         try { localStorage.removeItem(TH_KEY_SHUFFLER_POOL_CACHE); } catch (_) {}
         this._invalidateRwCollectionHandleCache();
+        /* Day index is durable (sync-maintained + Path B); do not wipe here. */
+    }
+
+    _emptyHighlightsDayIndex() {
+        return { v: 1, updatedAt: 0, complete: false, entries: Object.create(null) };
+    }
+
+    _hydrateHighlightsDayIndexFromStorage() {
+        try {
+            const raw = localStorage.getItem(TH_KEY_HIGHLIGHTS_BY_DAY);
+            if (!raw) {
+                this._highlightsDayIndex = this._emptyHighlightsDayIndex();
+                return;
+            }
+            const parsed = JSON.parse(raw);
+            if (!parsed || parsed.v !== 1 || !parsed.entries || typeof parsed.entries !== 'object') {
+                this._highlightsDayIndex = this._emptyHighlightsDayIndex();
+                return;
+            }
+            this._highlightsDayIndex = parsed;
+        } catch (_) {
+            this._highlightsDayIndex = this._emptyHighlightsDayIndex();
+        }
+    }
+
+    _persistHighlightsDayIndex() {
+        const idx = this._highlightsDayIndex || this._emptyHighlightsDayIndex();
+        idx.updatedAt = Date.now();
+        this._highlightsDayIndex = idx;
+        try {
+            localStorage.setItem(TH_KEY_HIGHLIGHTS_BY_DAY, JSON.stringify(idx));
+        } catch (_) {}
+        this._highlightsDayIndexDirty = false;
+        this._scheduleDayIndexPathBSync();
+    }
+
+    _scheduleDayIndexPathBSync() {
+        if (this._pluginSettingsSyncMode !== 'synced') return;
+        if (this._dayIndexSyncTimer) {
+            try { clearTimeout(this._dayIndexSyncTimer); } catch (_) {}
+        }
+        this._dayIndexSyncTimer = setTimeout(() => {
+            this._dayIndexSyncTimer = null;
+            const ps = globalThis.ThymerPluginSettings;
+            if (!ps?.flushNow || !this.data || !this._pluginSettingsPluginId) return;
+            ps.flushNow(this.data, this._pluginSettingsPluginId, this._pathBMirrorKeys()).catch(() => {});
+        }, TH_DAY_INDEX_SYNC_IDLE_MS);
+    }
+
+    _dayIndexClear() {
+        this._highlightsDayIndex = this._emptyHighlightsDayIndex();
+        this._highlightsDayIndexDirty = true;
+    }
+
+    /**
+     * Replace all indexed highlights for one Reference guid from a highlight-row array
+     * (same shape as sync `docHL`).
+     */
+    _dayIndexReplaceGuid(guid, meta, docHL, exportByHlId) {
+        if (!guid) return;
+        if (!this._highlightsDayIndex) this._hydrateHighlightsDayIndexFromStorage();
+        const idx = this._highlightsDayIndex || this._emptyHighlightsDayIndex();
+        const days = Object.create(null);
+        const exMap = exportByHlId && typeof exportByHlId.get === 'function' ? exportByHlId : null;
+        const { byDay } = this._groupHighlightsByLocalDay(docHL || []);
+        for (const [isoKey, pack] of byDay.entries()) {
+            const ymd = String(isoKey || '').replace(/-/g, '');
+            if (!/^\d{8}$/.test(ymd)) continue;
+            const rows = [];
+            for (const h of pack.highlights || []) {
+                const text = this._highlightBody(h);
+                if (!String(text || '').trim()) continue;
+                const ex = exMap
+                    ? (exMap.get(String(h.id)) || exMap.get(String(h.external_id ?? '')))
+                    : null;
+                rows.push([
+                    String(text),
+                    String(this._highlightNote(h) || ''),
+                    String(this._readwiseHighlightOpenLink(h, ex) || ''),
+                ]);
+            }
+            if (rows.length) days[ymd] = rows;
+        }
+        if (Object.keys(days).length === 0) {
+            if (idx.entries[guid]) {
+                delete idx.entries[guid];
+                this._highlightsDayIndexDirty = true;
+            }
+        } else {
+            idx.entries[guid] = {
+                st: String(meta?.source_title || '').slice(0, 200),
+                sa: String(meta?.source_author || '').slice(0, 120),
+                cat: String(meta?.category || '').slice(0, 80),
+                d: days,
+            };
+            this._highlightsDayIndexDirty = true;
+        }
+        this._highlightsDayIndex = idx;
+    }
+
+    _dayIndexLookup(yyyymmdd) {
+        if (!yyyymmdd) return null;
+        if (!this._highlightsDayIndex) this._hydrateHighlightsDayIndexFromStorage();
+        const entries = this._highlightsDayIndex?.entries;
+        if (!entries || typeof entries !== 'object') return null;
+        const keys = Object.keys(entries);
+        if (!keys.length) return null;
+        const out = [];
+        for (const guid of keys) {
+            const ent = entries[guid];
+            const rows = ent?.d?.[yyyymmdd];
+            if (!Array.isArray(rows) || !rows.length) continue;
+            for (const row of rows) {
+                const text = Array.isArray(row) ? row[0] : row?.text;
+                if (!String(text || '').trim()) continue;
+                out.push({
+                    guid,
+                    text: String(text || ''),
+                    note: String((Array.isArray(row) ? row[1] : row?.note) || ''),
+                    location: String((Array.isArray(row) ? row[2] : row?.location) || ''),
+                    source_title: String(ent.st || 'Unknown'),
+                    source_author: String(ent.sa || ''),
+                    category: String(ent.cat || ''),
+                });
+            }
+        }
+        out.sort((a, b) => a.source_title.localeCompare(b.source_title));
+        /* Incomplete index (pre–full-sync): only trust positive hits; empty may be a miss. */
+        if (!this._highlightsDayIndex?.complete && out.length === 0) return null;
+        return out;
     }
 
     _hydrateQuotePoolCacheFromStorage() {
@@ -4109,6 +4337,13 @@ class Plugin extends AppPlugin {
     _toggleShowShufflerPanel() {
         const next = !this._showShufflerPanel();
         this._saveBool(TH_KEY_SHOW_SHUFFLER, next);
+        /*
+         * When the Journal Footer Suite owns a shuffler dock it re-offers a mount on every
+         * rebuild, so our flag alone cannot hide it — ask the suite to dismiss the dock too.
+         */
+        if (!next && typeof globalThis.__thymerJfsCloseQuoteShufflerDock === 'function') {
+            try { globalThis.__thymerJfsCloseQuoteShufflerDock(); } catch (_) {}
+        }
         this._toast(next ? 'Quote Shuffler panel: on' : 'Quote Shuffler panel: off');
         this._rebuildAllJournalFooters();
     }
@@ -4151,7 +4386,7 @@ class Plugin extends AppPlugin {
                 typeof globalThis.__thymerJfsReadwiseGetShufflerMountEl === 'function'
                     ? globalThis.__thymerJfsReadwiseGetShufflerMountEl(s.panelId)
                     : null;
-            if (!suiteHi && !suiteSh && !this._showHighlightsPanel() && !this._showShufflerPanel()) {
+            if (!this._showHighlightsPanel() && !this._showShufflerPanel()) {
                 this._disposePanel(s.panelId);
                 continue;
             }
@@ -4160,6 +4395,8 @@ class Plugin extends AppPlugin {
             if (!container && !suiteHi && !suiteSh) continue;
             s.loaded = false;
             s.expandedSources = new Map();
+            s.highlightsDataLoaded = false;
+            s.shufflerDataLoaded = false;
             const rebuilt = this._mountFooter(s, panelEl, { suiteHi, suiteSh, container });
             if (rebuilt) s.loading = false;
             this._populate(s);
@@ -4290,10 +4527,22 @@ class Plugin extends AppPlugin {
             });
             if (testResp.status === 401) throw new Error('Invalid token');
             if (testResp.status === 429) {
-                this._toast('Rate limited. Wait and retry.');
-                this._syncing = false;
-                this._syncStatusHide();
-                return;
+                const wait = this._rwrRetryAfterMs(testResp, 60000);
+                this._toast('Rate limited — waiting ' + Math.round(wait / 1000) + 's…');
+                this._syncStatusShow('Rate limited — waiting ' + Math.round(wait / 1000) + 's…');
+                await this._sleep(wait);
+                const retryResp = await fetch('https://readwise.io/api/v3/list/?limit=1', {
+                    headers: { 'Authorization': 'Token ' + token },
+                });
+                if (retryResp.status === 401) throw new Error('Invalid token');
+                if (retryResp.status === 429) {
+                    const wait2 = this._rwrRetryAfterMs(retryResp, 120000);
+                    this._toast('Still rate limited. Wait ~' + Math.round(wait2 / 1000) + 's and retry.');
+                    this._syncing = false;
+                    this._syncStatusHide();
+                    return;
+                }
+                if (!retryResp.ok) throw new Error('Readwise API error ' + retryResp.status);
             }
             const result = await this._sync(token, forceFullSync);
             this._toast('Done: ' + result.summary);
@@ -4309,8 +4558,10 @@ class Plugin extends AppPlugin {
             this._toast('Sync failed: ' + e.message);
         } finally {
             this._syncStatusHide();
+            this._syncing = false;
+            /* After sync flag clears — so footers load from the new day index, not "Syncing…". */
+            try { this._refreshAll(); } catch (_) {}
         }
-        this._syncing = false;
     }
 
     async _fetchReadwiseListAll(token, since) {
@@ -4965,6 +5216,14 @@ class Plugin extends AppPlugin {
             mergedSources: 0,
             bodiesRebuilt: 0,
             bodiesSkippedUnchanged: 0,
+            bodiesForcedEmptyRewrite: 0,
+            bodiesOrphanRepaired: 0,
+            bodiesOrphanFetchFailed: 0,
+            bodiesMergedIncremental: 0,
+            dayIndexUpdated: 0,
+            dateHeadingsLinked: 0,
+            dateHeadingsPlainFallback: 0,
+            dateHeadingsRelinked: 0,
             debugMaxSourcesApplied: null,
             debugMaxListRowsApplied: null,
             debugMaxExportPagesApplied: null,
@@ -5090,11 +5349,25 @@ class Plugin extends AppPlugin {
         this._lastSyncDiag.parentBuckets = mergedPack.groupedMeta.map.size;
         this._lastSyncDiag.mergedSources = mergedTotal;
 
+        /* Empty-body refs with highlight_count > 0 won't appear in an incremental updatedAfter
+         * window — repair from this run's export payload (and a bounded single-doc fetch). */
+        try {
+            const repaired = await this._collectEmptyBodyOrphanEntries(
+                token, existingRef, docEntries, exportBooks, exportByHlId);
+            if (repaired.length) {
+                docEntries = docEntries.concat(repaired);
+                this._log('Empty-body repair: queued ' + repaired.length + ' reference(s) missing Highlights content.');
+                if (this._lastSyncDiag) this._lastSyncDiag.bodiesOrphanRepaired = repaired.length;
+            }
+        } catch (e) {
+            this._log('⚠️ Empty-body orphan scan: ' + (e && e.message ? e.message : e));
+        }
+
         this._log('Grouped: ' + mergedPack.pageDocsLen + ' list docs, ' + mergedPack.pageHLsLen + ' list HL rows, '
             + mergedPack.groupedMeta.map.size + ' list parents, '
             + mergedPack.groupedMeta.highlightsWithoutDocKey + ' list HL rows with no document key · merged '
             + mergedTotal + ' reference sources (Reader + export)'
-            + (docEntries.length !== mergedTotal ? ' · writing ' + docEntries.length + ' this run (debug cap)' : ''));
+            + (docEntries.length !== mergedTotal ? ' · writing ' + docEntries.length + ' this run' : ''));
 
         let syntheticParentCount = mergedPack.syntheticParentCount;
 
@@ -5102,6 +5375,8 @@ class Plugin extends AppPlugin {
         this._lastSyncDiag.docEntriesToWrite = docTotal;
         const bodySigMap = rwrSkipUnchangedBodiesFromStorage() ? rwrLoadBodySigMap() : Object.create(null);
         let bodySigsDirty = false;
+        const incremental = !!since;
+        if (!incremental) this._dayIndexClear();
         if (docTotal > 0) {
             this._syncStatusShow('Saving references 0/' + docTotal + '…');
         }
@@ -5109,7 +5384,7 @@ class Plugin extends AppPlugin {
             const batch = docEntries.slice(bi, bi + RWR_SYNC_CONCURRENCY);
             const batchOut = await Promise.all(batch.map(async (entry) => {
                 const doc = entry.doc;
-                const docHL = entry.docHL;
+                let docHL = entry.docHL;
                 const extId = entry.extId;
                 const synthAdded = entry.synthFlag || 0;
 
@@ -5185,25 +5460,67 @@ class Plugin extends AppPlugin {
                 if (refRecord && refRecord.guid) {
                     const bodySig = this._referenceHighlightBodySig(docHL, exportByHlId);
                     const prevSig = bodySigMap[extId];
-                    const skipBody = rwrSkipUnchangedBodiesFromStorage()
+                    let skipBody = rwrSkipUnchangedBodiesFromStorage()
                         && updated === 1
                         && prevSig
                         && prevSig === bodySig;
+                    /* Count says highlights exist, but the body has no Highlights section —
+                     * usually a wipe+failed rewrite that still saved the body signature. */
+                    if (skipBody && Array.isArray(docHL) && docHL.length > 0) {
+                        try {
+                            if (await this._referenceBodyMissingHighlights(refRecord)) {
+                                skipBody = false;
+                                if (this._lastSyncDiag) {
+                                    this._lastSyncDiag.bodiesForcedEmptyRewrite =
+                                        (this._lastSyncDiag.bodiesForcedEmptyRewrite || 0) + 1;
+                                }
+                            }
+                        } catch (_) {}
+                    }
+                    const dayMeta = {
+                        source_title: docTitle,
+                        source_author: authorRaw || '',
+                        category: catChoiceId || '',
+                    };
+                    let writtenHL = docHL;
                     if (skipBody) {
                         if (this._lastSyncDiag) this._lastSyncDiag.bodiesSkippedUnchanged++;
                         written = 1;
                         this._rwrWritten++;
                         if (this._lastSyncDiag) this._lastSyncDiag.referencesWritten++;
+                        /* Full sync: API payload is complete — refresh day index even when body skipped. */
+                        if (!incremental) {
+                            this._dayIndexReplaceGuid(refRecord.guid, dayMeta, docHL, exportByHlId);
+                            if (this._lastSyncDiag) this._lastSyncDiag.dayIndexUpdated++;
+                        }
+                        /* Bodies skipped still may have plain-text date headings — upgrade to journal refs. */
+                        try {
+                            await this._ensureDateHeadingsLinked(refRecord);
+                        } catch (_) {}
                     } else {
                         try {
-                            await this._rebuildReferenceHighlightsBody(refRecord, doc, docHL, exportByHlId);
-                            bodySigMap[extId] = bodySig;
-                            bodySigsDirty = true;
+                            const bodyWasEmpty = await this._referenceBodyMissingHighlights(refRecord);
+                            const mergeExisting = incremental && updated === 1 && !bodyWasEmpty;
+                            writtenHL = await this._rebuildReferenceHighlightsBody(
+                                refRecord, doc, docHL, exportByHlId, { mergeExisting });
+                            if (!Array.isArray(writtenHL)) writtenHL = docHL;
+                            /* Only stamp the skip key when the Highlights section actually landed. */
+                            const stillMissing = await this._referenceBodyMissingHighlights(refRecord);
+                            if (!stillMissing) {
+                                bodySigMap[extId] = bodySig;
+                                bodySigsDirty = true;
+                                try { await this._ensureDateHeadingsLinked(refRecord); } catch (_) {}
+                            } else if (bodySigMap[extId]) {
+                                delete bodySigMap[extId];
+                                bodySigsDirty = true;
+                            }
                             if (this._lastSyncDiag) this._lastSyncDiag.bodiesRebuilt++;
                             if (this._lastSyncDiag.bodiesRebuilt % 20 === 0) {
                                 rwrSaveBodySigMap(bodySigMap);
                                 bodySigsDirty = false;
                             }
+                            this._dayIndexReplaceGuid(refRecord.guid, dayMeta, writtenHL, exportByHlId);
+                            if (this._lastSyncDiag) this._lastSyncDiag.dayIndexUpdated++;
                         } catch (e) {
                             this._log('⚠️ Body rebuild: ' + (e && e.message ? e.message : e));
                             if (this._lastSyncDiag) this._lastSyncDiag.bodyRebuildErrors++;
@@ -5239,6 +5556,11 @@ class Plugin extends AppPlugin {
         }
 
         if (bodySigsDirty) rwrSaveBodySigMap(bodySigMap);
+        if (!incremental && this._highlightsDayIndex) {
+            this._highlightsDayIndex.complete = true;
+            this._highlightsDayIndexDirty = true;
+        }
+        if (this._highlightsDayIndexDirty) this._persistHighlightsDayIndex();
 
         if (syntheticParentCount > 0) {
             this._log('Note: ' + syntheticParentCount + ' synthetic parent row(s).');
@@ -5280,13 +5602,17 @@ class Plugin extends AppPlugin {
     }
 
     /**
-     * Full rebuild of the Highlights section from API data (v1).
+     * Full rebuild of the Highlights section from API data.
+     * @param {{ mergeExisting?: boolean }} [opts] — when true (incremental update), union API
+     *   highlights with quotes already in the body so partial Reader deltas cannot wipe history.
+     * @returns {Promise<Array|null>} highlight rows actually written (for day index / body sig)
      */
-    async _rebuildReferenceHighlightsBody(refRecord, doc, docHL, exportByHlId) {
+    async _rebuildReferenceHighlightsBody(refRecord, doc, docHL, exportByHlId, opts) {
+        const mergeExisting = !!(opts && opts.mergeExisting);
         const record = await this._getRecordReady(refRecord.guid);
         if (!record) {
             if (this._lastSyncDiag) this._lastSyncDiag.body_getRecordReadyFail = (this._lastSyncDiag.body_getRecordReadyFail || 0) + 1;
-            return;
+            return null;
         }
 
         let items;
@@ -5294,13 +5620,33 @@ class Plugin extends AppPlugin {
             items = await record.getLineItems();
         } catch (e) {
             if (this._lastSyncDiag) this._lastSyncDiag.body_getLineItemsFail = (this._lastSyncDiag.body_getLineItemsFail || 0) + 1;
-            return;
+            return null;
+        }
+
+        let writeHL = Array.isArray(docHL) ? docHL.slice() : [];
+        if (mergeExisting) {
+            try {
+                const existingRows = await this._extractBodyHighlightsAsApiRows(record);
+                if (existingRows.length) {
+                    const before = writeHL.length;
+                    writeHL = this._dedupeHighlightRowsByCanonicalKey(
+                        (existingRows || []).concat(writeHL),
+                        exportByHlId);
+                    writeHL = this._dedupeIdenticalLongQuoteRows(writeHL);
+                    if (writeHL.length > before && this._lastSyncDiag) {
+                        this._lastSyncDiag.bodiesMergedIncremental =
+                            (this._lastSyncDiag.bodiesMergedIncremental || 0) + 1;
+                    }
+                }
+            } catch (e) {
+                this._log('⚠️ Incremental body merge skipped: ' + (e && e.message ? e.message : e));
+            }
         }
 
         await this._deleteAllLinesDeep(record);
 
         const sectionLine = await this._createLine(record, null, null, 'text');
-        if (!sectionLine) return;
+        if (!sectionLine) return writeHL;
         try {
             await sectionLine.setSegments([{ type: 'text', text: READWISE_REF_HIGHLIGHTS_HEADER }]);
         } catch (_) {
@@ -5308,7 +5654,7 @@ class Plugin extends AppPlugin {
         }
         await this._applyLineHeading(sectionLine, 2);
 
-        const { byDay, skippedNoDate } = this._groupHighlightsByLocalDay(docHL);
+        const { byDay, skippedNoDate } = this._groupHighlightsByLocalDay(writeHL);
         if (this._lastSyncDiag && skippedNoDate > 0) {
             this._lastSyncDiag.datelessHighlightsInBodies = (this._lastSyncDiag.datelessHighlightsInBodies || 0) + skippedNoDate;
         }
@@ -5352,12 +5698,15 @@ class Plugin extends AppPlugin {
                     } catch (_) {
                         await dateLine.setSegments([{ type: 'ref', text: jGuid }]);
                     }
+                    if (this._lastSyncDiag) this._lastSyncDiag.dateHeadingsLinked++;
                 } else {
                     await dateLine.setSegments([{ type: 'text', text: dateLabel }]);
+                    if (this._lastSyncDiag) this._lastSyncDiag.dateHeadingsPlainFallback++;
                 }
             } catch (_) {
                 try {
                     await dateLine.setSegments([{ type: 'text', text: dateLabel }]);
+                    if (this._lastSyncDiag) this._lastSyncDiag.dateHeadingsPlainFallback++;
                 } catch (_) {}
             }
             await this._applyLineHeading(dateLine, 3);
@@ -5425,6 +5774,448 @@ class Plugin extends AppPlugin {
                 }
             }
         }
+        return writeHL;
+    }
+
+    /**
+     * Parse existing Reference body into API-like highlight rows (for incremental merge).
+     * Dates come from day headings; Loc URLs become `readwise_url` so canonical dedupe can match.
+     */
+    async _extractBodyHighlightsAsApiRows(record) {
+        let items;
+        try { items = await record.getLineItems(); } catch (_) { return []; }
+        if (!items || !items.length) return [];
+
+        const ordered = this._buildRecordDocumentOrder(record, items);
+        const recId = record.guid;
+        const roots = this._childrenInDocOrder(ordered, recId, recId);
+        let sectionLine = null;
+        for (const line of roots) {
+            const plain = await this._linePlainText(line);
+            if (this._isHighlightsSectionHeader(plain)) {
+                sectionLine = line;
+                break;
+            }
+        }
+        if (!sectionLine) return [];
+
+        const out = [];
+        const dateBlocks = this._childrenInDocOrder(ordered, recId, sectionLine.guid);
+        for (const dateLine of dateBlocks) {
+            if (dateLine?.type === 'br') continue;
+            const plainLo = (await this._linePlainText(dateLine)).trim();
+            if (!plainLo) continue;
+            if (plainLo === READWISE_REF_BETWEEN_DATE_DIVIDER_TEXT) continue;
+
+            const ymd = await this._dateLineToYyyymmdd(dateLine);
+            if (!ymd) continue;
+            const y = parseInt(ymd.slice(0, 4), 10);
+            const m = parseInt(ymd.slice(4, 6), 10) - 1;
+            const d = parseInt(ymd.slice(6, 8), 10);
+            const iso = new Date(y, m, d, 12, 0, 0, 0).toISOString();
+
+            const merged = await this._mergeQuoteLinesUnderDateGroup(record, ordered, recId, dateLine);
+            for (const row of merged) {
+                const text = String(row.text || '').trim();
+                if (!text) continue;
+                out.push({
+                    id: 'body:' + this._rwrHashStr(ymd + '\0' + text.slice(0, 120)),
+                    content: text,
+                    text,
+                    note: row.note || '',
+                    highlighted_at: iso,
+                    created_at: iso,
+                    readwise_url: row.loc || '',
+                    url: row.loc || '',
+                });
+            }
+        }
+        return out;
+    }
+
+    async _dateLineToYyyymmdd(line) {
+        const segs = await this._lineSegments(line);
+        for (const seg of segs) {
+            if (seg?.type !== 'ref' || !seg.text) continue;
+            const g = typeof seg.text === 'string' ? seg.text : seg.text.guid;
+            if (!g) continue;
+            try {
+                const rec = this.data.getRecord(typeof g === 'string' ? g : g);
+                const jd = rec?.getJournalDetails?.();
+                if (jd?.date instanceof Date && !isNaN(jd.date.getTime())) {
+                    const y = jd.date.getFullYear();
+                    const m = String(jd.date.getMonth() + 1).padStart(2, '0');
+                    const day = String(jd.date.getDate()).padStart(2, '0');
+                    return `${y}${m}${day}`;
+                }
+            } catch (_) {}
+        }
+        const plain = (await this._linePlainText(line)).trim();
+        return parseReadwiseRefDateHeadingYmd(plain);
+    }
+
+    _readHighlightCountProp(record) {
+        for (const read of [
+            () => record.number?.('highlight_count'),
+            () => record.prop?.('highlight_count')?.number?.(),
+            () => record.prop?.('highlight_count')?.get?.(),
+            () => record.text?.('highlight_count'),
+        ]) {
+            let v;
+            try { v = read(); } catch (_) { continue; }
+            if (v == null || v === '') continue;
+            const n = typeof v === 'object' ? Number(v.value ?? v.number ?? NaN) : Number(v);
+            if (Number.isFinite(n)) return n;
+        }
+        return 0;
+    }
+
+    /**
+     * True when the record has no Highlights section header (and therefore no filed quotes).
+     * Used to force a body rewrite when highlight_count / API payload say content should exist.
+     */
+    async _referenceBodyMissingHighlights(refRecord) {
+        const record = refRecord?.guid ? (await this._getRecordReady(refRecord.guid)) || refRecord : refRecord;
+        if (!record) return true;
+        let items;
+        try { items = await record.getLineItems(); } catch (_) { return true; }
+        if (!items || !items.length) return true;
+        try {
+            const ordered = this._buildRecordDocumentOrder(record, items);
+            for (const line of this._childrenInDocOrder(ordered, record.guid, record.guid)) {
+                const plain = await this._linePlainText(line);
+                if (this._isHighlightsSectionHeader(plain)) return false;
+            }
+        } catch (_) {
+            return true;
+        }
+        return true;
+    }
+
+    _readerDocIdFromExtId(extId) {
+        const s = String(extId || '').trim();
+        if (!s.startsWith('readwise_')) return '';
+        const rest = s.slice('readwise_'.length);
+        /* Skip export-only / synthetic ids. */
+        if (!rest || rest.startsWith('ub_') || rest.startsWith('exp_')) return '';
+        return rest;
+    }
+
+    _exportBookEntryForExtId(exportBooks, exportByHlId, extId, hint) {
+        const books = Array.isArray(exportBooks) ? exportBooks : [];
+        const want = String(extId || '').trim();
+        if (!want && !hint) return null;
+        const readerId = this._readerDocIdFromExtId(want);
+        const hintTitle = String(hint?.title || '').trim().toLowerCase();
+        const hintUrl = String(hint?.source_url || hint?.url || '').trim().toLowerCase();
+
+        let matched = null;
+        for (const book of books) {
+            if (!book) continue;
+            const bookExt = this._exportBookStableExtId(book);
+            const bookReader = book.external_id != null ? String(book.external_id).trim() : '';
+            if (want && (bookExt === want || (readerId && bookReader === readerId))) {
+                matched = book;
+                break;
+            }
+        }
+        if (!matched && (hintTitle || hintUrl)) {
+            for (const book of books) {
+                if (!book) continue;
+                const t = String(book.title || book.readable_title || '').trim().toLowerCase();
+                const u = String(book.source_url || book.unique_url || '').trim().toLowerCase();
+                if (hintUrl && u && (u === hintUrl || u.includes(hintUrl) || hintUrl.includes(u))) {
+                    matched = book;
+                    break;
+                }
+                if (hintTitle && t && t === hintTitle) {
+                    matched = book;
+                    break;
+                }
+            }
+        }
+        if (!matched) return null;
+
+        const rawHl = [];
+        for (const hl of matched.highlights || []) {
+            if (hl?.is_deleted) continue;
+            rawHl.push(this._exportHighlightToUnifiedRow(hl, matched));
+        }
+        if (!rawHl.length) return null;
+        let hl = this._dedupeHighlightRowsByCanonicalKey(rawHl, exportByHlId);
+        hl = this._dedupeIdenticalLongQuoteRows(hl);
+        hl = this._dedupeRedundantNoteHighlightRows(hl);
+        if (!hl.length) return null;
+        return {
+            extId: want || this._exportBookStableExtId(matched),
+            doc: this._exportBookToDoc(matched),
+            docHL: hl,
+            synthFlag: 0,
+            fromExport: true,
+            orphanRepair: true,
+        };
+    }
+
+    /**
+     * Resolve highlights for one Reference from the v2 export library.
+     * `/api/v3/highlights/` is not a public Reader endpoint (404) — export is the reliable source.
+     */
+    async _resolveHighlightBundleFromExport(token, extId, hint, existingExport) {
+        let exportBooks = existingExport?.exportBooks || [];
+        let exportByHlId = existingExport?.highlightById || new Map();
+
+        let bundle = this._exportBookEntryForExtId(exportBooks, exportByHlId, extId, hint);
+        if (bundle) return { bundle, exportBooks, exportByHlId, fetchedFullExport: false };
+
+        this._syncStatusShow('Downloading Readwise export to repair body…');
+        this._log('Empty-body repair: incremental export missed ' + extId + ' — fetching full export…');
+        const enr = await this._fetchReadwiseExportPayload(token, null);
+        exportBooks = enr.exportBooks || [];
+        exportByHlId = enr.highlightById || new Map();
+        bundle = this._exportBookEntryForExtId(exportBooks, exportByHlId, extId, hint);
+        return { bundle, exportBooks, exportByHlId, fetchedFullExport: true };
+    }
+
+    async _collectEmptyBodyOrphanEntries(token, existingRef, alreadyQueued, exportBooks, exportByHlId) {
+        const queued = new Set((alreadyQueued || []).map((e) => e && e.extId).filter(Boolean));
+        const out = [];
+        const refs = Array.isArray(existingRef) ? existingRef : [];
+        const orphans = [];
+
+        for (const ref of refs) {
+            if (!ref?.guid) continue;
+            let extId = '';
+            try { extId = String(ref.text?.('external_id') || '').trim(); } catch (_) { extId = ''; }
+            if (!extId || queued.has(extId)) continue;
+            const count = this._readHighlightCountProp(ref);
+            if (!(count > 0)) continue;
+            let missing = false;
+            try { missing = await this._referenceBodyMissingHighlights(ref); } catch (_) { missing = true; }
+            if (!missing) continue;
+
+            let hint = null;
+            try {
+                hint = {
+                    title: ref.getName?.() || ref.text?.('source_title') || '',
+                    source_url: ref.text?.('source_url') || '',
+                };
+            } catch (_) { hint = null; }
+            orphans.push({ ref, extId, hint });
+        }
+
+        if (!orphans.length) return out;
+        this._syncStatusShow('Checking empty-body references (' + orphans.length + ')…');
+
+        let books = Array.isArray(exportBooks) ? exportBooks : [];
+        let byHl = exportByHlId && typeof exportByHlId.get === 'function' ? exportByHlId : new Map();
+        let fetchedFull = false;
+
+        for (let i = 0; i < orphans.length; i++) {
+            const { ref, extId, hint } = orphans[i];
+            this._syncStatusShow('Repairing empty body ' + (i + 1) + '/' + orphans.length + ': '
+                + (ref.getName?.() || extId).slice(0, 40));
+
+            let bundle = this._exportBookEntryForExtId(books, byHl, extId, hint);
+            if (!bundle && !fetchedFull) {
+                try {
+                    const resolved = await this._resolveHighlightBundleFromExport(
+                        token, extId, hint, { exportBooks: books, highlightById: byHl });
+                    books = resolved.exportBooks;
+                    byHl = resolved.exportByHlId;
+                    fetchedFull = !!resolved.fetchedFullExport;
+                    bundle = resolved.bundle;
+                } catch (e) {
+                    this._log('⚠️ Full export for orphan repair failed: ' + (e && e.message ? e.message : e));
+                }
+            } else if (!bundle && fetchedFull) {
+                bundle = this._exportBookEntryForExtId(books, byHl, extId, hint);
+            }
+
+            if (!bundle || !bundle.docHL?.length) {
+                if (this._lastSyncDiag) {
+                    this._lastSyncDiag.bodiesOrphanFetchFailed =
+                        (this._lastSyncDiag.bodiesOrphanFetchFailed || 0) + 1;
+                }
+                try {
+                    const sigMap = rwrLoadBodySigMap();
+                    if (sigMap && sigMap[extId]) {
+                        delete sigMap[extId];
+                        rwrSaveBodySigMap(sigMap);
+                    }
+                } catch (_) {}
+                this._log('⚠️ Could not find export highlights for empty-body ref ' + extId);
+                continue;
+            }
+            out.push(bundle);
+            queued.add(extId);
+        }
+        return out;
+    }
+
+    _cancelStuckSync() {
+        const was = !!this._syncing;
+        this._syncing = false;
+        try { this._syncStatusHide(); } catch (_) {}
+        this._toast(was
+            ? 'Cleared stuck sync flag. Safe to run Sync again.'
+            : 'No sync was marked running — status chip cleared anyway.');
+    }
+
+    /**
+     * Rebuild Highlights body for the open Reference from the v2 export library.
+     */
+    async _rebuildActiveReferenceBody() {
+        if (this._syncing) {
+            this._toast('A sync is marked running — use “Cancel / clear stuck sync status” first if it is hung.');
+            return;
+        }
+        const panel = this.ui.getActivePanel?.();
+        const record = panel?.getActiveRecord?.();
+        if (!record?.guid) {
+            this._toast('Open a Reference record first.');
+            return;
+        }
+        let extId = '';
+        try { extId = String(record.text?.('external_id') || '').trim(); } catch (_) { extId = ''; }
+        if (!extId) {
+            this._toast('This record has no external_id.');
+            return;
+        }
+        const token = localStorage.getItem(RWR_TOKEN_KEY);
+        if (!token) {
+            this._toast('Set your Readwise token first.');
+            return;
+        }
+
+        let hint = null;
+        try {
+            hint = {
+                title: record.getName?.() || record.text?.('source_title') || '',
+                source_url: record.text?.('source_url') || '',
+            };
+        } catch (_) { hint = null; }
+
+        this._syncing = true;
+        this._syncStatusShow('Rebuilding body: ' + (record.getName?.() || extId).slice(0, 48));
+        try {
+            /* Warm journal GUID prefix so date headings become @ref links (not plain text). */
+            try { this._ensureJournalGuidPrefix(); } catch (_) {}
+            const { bundle, exportByHlId } = await this._resolveHighlightBundleFromExport(
+                token, extId, hint, null);
+            if (!bundle?.docHL?.length) {
+                this._toast('No highlights for this document in your Readwise export. It may have been deleted upstream.');
+                return;
+            }
+            const writtenHL = await this._rebuildReferenceHighlightsBody(
+                record, bundle.doc, bundle.docHL, exportByHlId, { mergeExisting: false });
+            const rows = Array.isArray(writtenHL) ? writtenHL : bundle.docHL;
+            const stillMissing = await this._referenceBodyMissingHighlights(record);
+            if (stillMissing) {
+                this._toast('Rewrite ran but Highlights section still missing — check console.');
+                return;
+            }
+            /* Safety net if rebuild fell back to plain dates (prefix cold mid-write). */
+            try { await this._ensureDateHeadingsLinked(record); } catch (_) {}
+            try {
+                const sigMap = rwrLoadBodySigMap();
+                sigMap[extId] = this._referenceHighlightBodySig(bundle.docHL, exportByHlId);
+                rwrSaveBodySigMap(sigMap);
+            } catch (_) {}
+            try {
+                this._dayIndexReplaceGuid(record.guid, {
+                    source_title: this._resolveDocTitle(bundle.doc),
+                    source_author: String(bundle.doc.author || ''),
+                    category: this._normalizeReadwiseCategoryChoiceId(bundle.doc.category) || '',
+                }, rows, exportByHlId);
+                this._persistHighlightsDayIndex();
+            } catch (_) {}
+            this._setFields(record, {
+                highlight_count: rows.length,
+                synced_at: new Date(),
+            });
+            this._toast('Rebuilt body with ' + rows.length + ' highlight(s).');
+            this._refreshAll();
+        } catch (e) {
+            console.error('[ReadwiseRef] rebuild body', e);
+            this._toast('Rebuild failed: ' + (e?.message || e));
+        } finally {
+            this._syncing = false;
+            this._syncStatusHide();
+        }
+    }
+
+    /**
+     * Report why the open Reference shows a Highlight Count with an empty body.
+     * Compares the stored count against body lines, parsed highlight rows, and the day index.
+     */
+    async _diagnoseActiveReference() {
+        const panel = this.ui.getActivePanel?.();
+        const record = panel?.getActiveRecord?.();
+        if (!record) {
+            this._toast('Open a Reference record first.');
+            return;
+        }
+
+        const name = record.getName?.() || '(untitled)';
+        const extId = (() => {
+            try { return record.text?.('external_id') || ''; } catch (_) { return ''; }
+        })();
+        const countProp = this._readHighlightCountProp(record);
+
+        let lineCount = 0;
+        let hasHeader = false;
+        try {
+            const items = await record.getLineItems();
+            lineCount = items?.length || 0;
+            const ordered = this._buildRecordDocumentOrder(record, items || []);
+            for (const line of this._childrenInDocOrder(ordered, record.guid, record.guid)) {
+                const plain = await this._linePlainText(line);
+                if (this._isHighlightsSectionHeader(plain)) { hasHeader = true; break; }
+            }
+        } catch (e) {
+            this._log('diagnose: getLineItems failed — ' + (e?.message || e));
+        }
+
+        let bodyRows = [];
+        try { bodyRows = await this._extractBodyHighlightsAsApiRows(record); } catch (_) { bodyRows = []; }
+
+        if (!this._highlightsDayIndex) this._hydrateHighlightsDayIndexFromStorage();
+        const idxEntry = this._highlightsDayIndex?.entries?.[record.guid] || null;
+        let idxRows = 0;
+        for (const rows of Object.values(idxEntry?.d || {})) idxRows += (rows?.length || 0);
+
+        const sigMap = rwrLoadBodySigMap();
+        const hasSig = !!(extId && sigMap && sigMap[extId]);
+
+        const report = {
+            name,
+            external_id: extId || '(none)',
+            highlight_count_property: countProp,
+            body_line_items: lineCount,
+            has_highlights_header: hasHeader,
+            highlight_rows_parsed_from_body: bodyRows.length,
+            day_index_entry: !!idxEntry,
+            day_index_rows: idxRows,
+            body_signature_stored: hasSig,
+        };
+        this._log('Reference diagnosis: ' + JSON.stringify(report, null, 2));
+        console.log('[Readwise Ref] diagnosis', report, record);
+
+        const n = Number(countProp) || 0;
+        let verdict;
+        if (bodyRows.length > 0) {
+            verdict = 'Body has ' + bodyRows.length + ' highlight(s) — looks fine.';
+        } else if (n > 0 && hasHeader) {
+            verdict = 'Header present, no dated highlights: Readwise sent ' + n
+                + ' highlight(s) with no timestamp, so none could be filed under a date.';
+        } else if (n > 0 && !hasHeader) {
+            verdict = 'Body is missing the Highlights section while count is ' + n
+                + '. Next incremental sync will force a rewrite.';
+        } else {
+            verdict = 'No highlights in body and count is ' + n + '.';
+        }
+        this._log('Verdict: ' + verdict);
+        this._toast(verdict);
     }
 
     /** Highlights without a parseable local date are omitted from the body (`skippedNoDate`). */
@@ -5552,12 +6343,246 @@ class Plugin extends AppPlugin {
 
     /** Thymer journal page for a calendar day (date headings link here when available). */
     _journalGuidForLocalDate(dayDate) {
+        if (!dayDate || !(dayDate instanceof Date) || isNaN(dayDate.getTime())) return null;
+        const y = dayDate.getFullYear();
+        const m = dayDate.getMonth();
+        const d = dayDate.getDate();
+        // Noon avoids DST / UTC-midnight edge cases (SDK docs recommend date-only @ 12:00).
+        const noon = new Date(y, m, d, 12, 0, 0, 0);
+        const ymd = String(y)
+            + String(m + 1).padStart(2, '0')
+            + String(d).padStart(2, '0');
+
         try {
-            if (!this.data || typeof this.data.getJournalForDate !== 'function') return null;
-            const jr = this.data.getJournalForDate(dayDate);
-            return jr?.guid || null;
-        } catch (_) {
-            return null;
+            if (this.data && typeof this.data.getJournalForDate === 'function') {
+                const jr = this.data.getJournalForDate(noon);
+                const guid = jr?.guid || null;
+                if (guid) {
+                    this._cacheJournalGuidPrefix(guid);
+                    if (String(guid).endsWith(ymd)) return guid;
+                }
+            }
+        } catch (_) {}
+
+        const prefix = this._ensureJournalGuidPrefix();
+        if (prefix) {
+            const constructed = prefix + ymd;
+            try {
+                const rec = this.data?.getRecord?.(constructed);
+                if (rec?.guid) return rec.guid;
+            } catch (_) {}
+            // Journal pages are virtual until opened — constructed GUID is still a valid link target.
+            return constructed;
+        }
+        return null;
+    }
+
+    _cacheJournalGuidPrefix(guid) {
+        const g = String(guid || '');
+        const m = /^(.*-)(\d{8})$/.exec(g);
+        if (m) this._journalGuidPrefix = m[1];
+    }
+
+    _ensureJournalGuidPrefix() {
+        if (this._journalGuidPrefix) return this._journalGuidPrefix;
+        try {
+            const now = new Date();
+            const noon = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12, 0, 0, 0);
+            if (this.data && typeof this.data.getJournalForDate === 'function') {
+                const jr = this.data.getJournalForDate(noon);
+                if (jr?.guid) this._cacheJournalGuidPrefix(jr.guid);
+            }
+        } catch (_) {}
+        if (this._journalGuidPrefix) return this._journalGuidPrefix;
+        try {
+            const rec = this.ui?.getActivePanel?.()?.getActiveRecord?.() || null;
+            const jd = rec?.getJournalDetails?.();
+            if (jd?.date && rec?.guid) this._cacheJournalGuidPrefix(rec.guid);
+        } catch (_) {}
+        return this._journalGuidPrefix || null;
+    }
+
+    /**
+     * Upgrade plain-text date headings under ❣️ Highlights to journal `@ref` links
+     * without wiping the rest of the body (used when body rebuild is skipped).
+     */
+    async _ensureDateHeadingsLinked(refRecord) {
+        const guid = refRecord?.guid || '';
+        if (!guid) return 0;
+        const record = await this._getRecordReady(guid);
+        if (!record) return 0;
+
+        let items;
+        try { items = await record.getLineItems(); } catch (_) { return 0; }
+        if (!items || !items.length) return 0;
+
+        const ordered = this._buildRecordDocumentOrder(record, items);
+        const recId = record.guid;
+        const roots = this._childrenInDocOrder(ordered, recId, recId);
+        let sectionLine = null;
+        for (const line of roots) {
+            const plain = await this._linePlainText(line);
+            if (this._isHighlightsSectionHeader(plain)) {
+                sectionLine = line;
+                break;
+            }
+        }
+        if (!sectionLine) return 0;
+
+        const underSection = this._childrenInDocOrder(ordered, recId, sectionLine.guid);
+        let relinked = 0;
+        for (const line of underSection) {
+            if (!line || line.type === 'br') continue;
+            const plain = (await this._linePlainText(line)).trim();
+            if (!plain || plain === READWISE_REF_BETWEEN_DATE_DIVIDER_TEXT) continue;
+            if (this._isReadwiseRefSeparatorLine(plain)) continue;
+
+            const segs = await this._lineSegments(line);
+            const hasRef = segs.some((s) => s?.type === 'ref');
+            let ymd = null;
+            if (hasRef) {
+                ymd = await this._dateLineToYyyymmdd(line);
+                // Already a journal link for a known day — leave alone.
+                if (ymd) continue;
+            } else {
+                ymd = parseReadwiseRefDateHeadingYmd(plain);
+            }
+            if (!ymd || ymd.length !== 8) continue;
+
+            const y = parseInt(ymd.slice(0, 4), 10);
+            const mo = parseInt(ymd.slice(4, 6), 10) - 1;
+            const d = parseInt(ymd.slice(6, 8), 10);
+            const dayDate = new Date(y, mo, d, 12, 0, 0, 0);
+            const jGuid = this._journalGuidForLocalDate(dayDate);
+            if (!jGuid) continue;
+
+            const dateLabel = formatReadwiseRefDateHeading(dayDate) || plain;
+            if (typeof line.setSegments !== 'function') continue;
+            try {
+                await line.setSegments([{ type: 'ref', text: { guid: jGuid, title: dateLabel } }]);
+            } catch (_) {
+                try {
+                    await line.setSegments([{ type: 'ref', text: jGuid }]);
+                } catch (_) {
+                    continue;
+                }
+            }
+            relinked++;
+            if (this._lastSyncDiag) this._lastSyncDiag.dateHeadingsRelinked++;
+        }
+        return relinked;
+    }
+
+    /**
+     * Light pass: turn plain-text date headings into journal links across References.
+     * Does not call Readwise and does not wipe/rebuild highlight bodies.
+     */
+    async _relinkAllDateHeadings() {
+        if (this._syncing) {
+            this._toast('Readwise sync already running — try again when it finishes.');
+            return;
+        }
+        this._syncing = true;
+        let scanned = 0;
+        let touched = 0;
+        let relinked = 0;
+        try {
+            this._toast('Linking date headings to journals…');
+            this._syncStatusShow('Linking date headings…');
+            await this._ensureRwCollections();
+            const refsColl = this._rwRefsColl;
+            if (!refsColl) {
+                this._toast('No References collection found.');
+                return;
+            }
+            let records = [];
+            try { records = await refsColl.getAllRecords(); } catch (_) { records = []; }
+            const total = records.length;
+            for (let i = 0; i < records.length; i++) {
+                const rec = records[i];
+                scanned++;
+                try {
+                    const n = await this._ensureDateHeadingsLinked(rec);
+                    if (n > 0) {
+                        touched++;
+                        relinked += n;
+                    }
+                } catch (_) {}
+                if (i > 0 && i % 3 === 0) {
+                    this._syncStatusShow('Linking date headings ' + (i + 1) + '/' + total + '…');
+                    await this._sleep(0);
+                    await new Promise((r) => requestAnimationFrame(() => r()));
+                }
+            }
+            this._toast(`Date links: ${relinked} headings on ${touched}/${scanned} references`);
+            this._log(`Date heading relink done — scanned ${scanned}, pages touched ${touched}, headings linked ${relinked}`);
+            this._refreshAll();
+        } finally {
+            this._syncing = false;
+            this._syncStatusHide();
+        }
+    }
+
+    /**
+     * One-time local pass: read existing Reference bodies into the day index and mark it complete
+     * so Today's Highlights stops vault-scanning on every journal change. No Readwise download,
+     * no body rewrite.
+     */
+    async _rebuildDayIndexFromBodies() {
+        if (this._syncing) {
+            this._toast('Readwise sync already running — try again when it finishes.');
+            return;
+        }
+        this._syncing = true;
+        let scanned = 0;
+        let withDays = 0;
+        try {
+            this._toast('Building Today\'s Highlights index…');
+            this._syncStatusShow('Building highlights index…');
+            await this._ensureRwCollections();
+            const refsColl = this._rwRefsColl;
+            if (!refsColl) {
+                this._toast('No References collection found.');
+                return;
+            }
+            let records = [];
+            try { records = await refsColl.getAllRecords(); } catch (_) { records = []; }
+
+            this._dayIndexClear();
+            const total = records.length;
+            for (let i = 0; i < records.length; i++) {
+                const rec = records[i];
+                scanned++;
+                try {
+                    const rows = await this._extractBodyHighlightsAsApiRows(rec);
+                    if (rows.length) {
+                        this._dayIndexReplaceGuid(rec.guid, {
+                            source_title: this._sourceTitleLabel(rec),
+                            source_author: this._authorLabel(rec),
+                            category: this._readwiseSourceCategoryLabel(rec),
+                        }, rows, null);
+                        withDays++;
+                    }
+                } catch (_) {}
+                if (i > 0 && i % 2 === 0) {
+                    this._syncStatusShow('Building highlights index ' + (i + 1) + '/' + total + '…');
+                    await this._sleep(0);
+                    await new Promise((r) => requestAnimationFrame(() => r()));
+                }
+            }
+
+            if (!this._highlightsDayIndex) this._highlightsDayIndex = this._emptyHighlightsDayIndex();
+            this._highlightsDayIndex.complete = true;
+            this._highlightsDayIndexDirty = true;
+            this._persistHighlightsDayIndex();
+            try { this._thRefQueryCache?.clear(); } catch (_) {}
+
+            this._toast(`Highlights index ready (${withDays}/${scanned} references)`);
+            this._log(`Day index rebuild done — scanned ${scanned}, with day groups ${withDays}, complete=true`);
+            this._refreshAll();
+        } finally {
+            this._syncing = false;
+            this._syncStatusHide();
         }
     }
 
@@ -6473,6 +7498,8 @@ class Plugin extends AppPlugin {
             if (dateChanged || recordChanged || wasPlaceholder) {
                 state.loaded = false;
                 state.expandedSources = new Map();
+                state.highlightsDataLoaded = false;
+                state.shufflerDataLoaded = false;
             }
         }
 
@@ -6480,6 +7507,8 @@ class Plugin extends AppPlugin {
         if (rebuilt) {
             state.loading = false; // In-flight populate may target a removed root (same as Today's Notes)
             state.expandedSources = new Map();
+            state.highlightsDataLoaded = false;
+            state.shufflerDataLoaded = false;
         }
         const needPopulate = dateChanged || recordChanged || !state.loaded || rebuilt;
         if (needPopulate) {
@@ -6516,7 +7545,10 @@ class Plugin extends AppPlugin {
     _refreshAll() {
         for (const [, s] of (this._panelStates || new Map())) {
             s.loaded = false;
-            this._populate(s);
+            s.highlightsDataLoaded = false;
+            s.shufflerDataLoaded = false;
+            if (s.loading) s._pendingPopulate = true;
+            else this._populate(s);
         }
     }
 
@@ -6561,8 +7593,12 @@ class Plugin extends AppPlugin {
 
     // Returns true if the footer was (re)built — caller should re-populate and drop stale async work
     _mountFooter(state, panelEl, { suiteHi, suiteSh, container }) {
-        const wantHi = !!suiteHi || this._showHighlightsPanel();
-        const wantSh = !!suiteSh || this._showShufflerPanel();
+        /*
+         * The user's on-page toggles are authoritative. A suite slot only decides *where* a
+         * panel mounts — it must not force a panel the user switched off back on.
+         */
+        const wantHi = this._showHighlightsPanel();
+        const wantSh = this._showShufflerPanel();
         if (!wantHi && !wantSh) return false;
 
         this._shufflerDetached = this._showShufflerDetached();
@@ -6588,13 +7624,20 @@ class Plugin extends AppPlugin {
         } else if (wantHi && wantSh) {
             fast = !!(state.rootEl?.isConnected
                 && state.rootEl.parentElement === hiParent
+                && !state.rootEl.querySelector('[data-panel-section="shuffler"]')
                 && state.shufflerRootEl?.isConnected
                 && state.shufflerRootEl.parentElement === shParent
                 && state.observer);
         } else if (wantHi && !wantSh) {
+            /*
+             * A previously-combined shell holds both sections in `rootEl` with `shufflerRootEl`
+             * null, so `!state.shufflerRootEl` alone would wrongly accept it and the shuffler
+             * would survive being toggled off. Require the shuffler section to be gone too.
+             */
             fast = !!(state.rootEl?.isConnected
                 && state.rootEl.parentElement === hiParent
                 && !state.shufflerRootEl
+                && !state.rootEl.querySelector('[data-panel-section="shuffler"]')
                 && state.observer);
         } else if (!wantHi && wantSh) {
             fast = !!(!state.rootEl
@@ -6784,35 +7827,44 @@ class Plugin extends AppPlugin {
 
     _buildHighlightsPanel(state) {
         const root = document.createElement('div');
-        root.className              = 'th-footer th-footer--highlights';
+        root.className              = 'th-footer th-footer--highlights th-footer--native';
         root.dataset.panelSection   = 'highlights';
 
         const header = document.createElement('div');
-        header.className = 'th-header';
+        header.className = 'th-header th-header--native';
+
+        const headerMain = document.createElement('div');
+        headerMain.className = 'th-header-main';
 
         const toggle = document.createElement('button');
-        toggle.className   = 'th-toggle button-none button-small button-minimal-hover';
+        toggle.className   = 'th-toggle th-summary-pill button-none button-small button-minimal-hover';
         toggle.type        = 'button';
         toggle.title       = 'Collapse / expand';
-        toggle.textContent = this._collapsed ? '+' : '−';
 
         const icon = document.createElement('span');
         icon.className = 'th-title-icon';
-        this._rwrAppendSvgIcon(icon, 'books', 16);
+        this._rwrAppendSvgIcon(icon, 'books', 15);
 
         const titleEl = document.createElement('div');
         titleEl.className   = 'th-title';
-        titleEl.textContent = "Today's Highlights";
+        titleEl.textContent = 'highlights';
 
         const countEl = document.createElement('div');
         countEl.className    = 'th-count';
         countEl.dataset.role = 'count';
 
+        const caret = this._rwrBuildChevron(!this._collapsed, 'th-toggle-caret');
+
+        toggle.appendChild(icon);
+        toggle.appendChild(titleEl);
+        toggle.appendChild(countEl);
+        toggle.appendChild(caret);
+
         const actions = document.createElement('div');
-        actions.className = 'th-header-actions';
+        actions.className = 'th-header-actions th-header-controls';
         const quoteBtn = document.createElement('button');
         quoteBtn.type = 'button';
-        quoteBtn.className = 'th-action th-quote-toggle button-none button-small button-minimal-hover';
+        quoteBtn.className = 'th-action th-hover-action th-quote-toggle button-none button-small button-minimal-hover';
         quoteBtn.title = this._showShufflerPanel() ? 'Hide Quote Shuffler' : 'Show Quote Shuffler';
         quoteBtn.setAttribute('aria-label', quoteBtn.title);
         quoteBtn.classList.toggle('is-active', this._showShufflerPanel());
@@ -6823,27 +7875,122 @@ class Plugin extends AppPlugin {
         });
         actions.appendChild(quoteBtn);
 
-        header.appendChild(toggle);
-        header.appendChild(icon);
-        header.appendChild(titleEl);
-        header.appendChild(countEl);
+        const cogBtn = document.createElement('button');
+        cogBtn.type = 'button';
+        cogBtn.className = 'th-action th-hover-action th-settings-cog button-none button-small button-minimal-hover';
+        cogBtn.title = 'Highlights settings';
+        cogBtn.setAttribute('aria-label', cogBtn.title);
+        this._rwrAppendSvgIcon(cogBtn, 'cog', 15);
+        cogBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            this._openHighlightsSettingsMenu(cogBtn);
+        });
+        actions.appendChild(cogBtn);
+
+        headerMain.appendChild(toggle);
+        header.appendChild(headerMain);
         header.appendChild(actions);
 
         const body = document.createElement('div');
         body.dataset.role  = 'body';
-        body.className     = 'th-body';
+        body.className     = 'th-body th-body--native';
         body.style.display = this._collapsed ? 'none' : 'block';
 
-        toggle.addEventListener('click', () => {
-            this._collapsed    = !this._collapsed;
-            this._saveBool('th_footer_collapsed', this._collapsed);
-            toggle.textContent = this._collapsed ? '+' : '−';
+        const syncChrome = () => {
+            this._rwrSyncChevron(caret, !this._collapsed);
             body.style.display = this._collapsed ? 'none' : 'block';
+            root.classList.toggle('th-footer--collapsed', !!this._collapsed);
+        };
+        syncChrome();
+
+        toggle.addEventListener('click', () => {
+            this._collapsed = !this._collapsed;
+            this._saveBool('th_footer_collapsed', this._collapsed);
+            syncChrome();
+            if (!this._collapsed && !state.highlightsDataLoaded) {
+                void this._populate(state);
+            }
         });
 
         root.appendChild(header);
         root.appendChild(body);
         return root;
+    }
+
+    /** Small popup anchored under the highlights settings cog. */
+    _openHighlightsSettingsMenu(anchorEl) {
+        const existing = document.getElementById('th-hl-settings-menu');
+        if (existing) {
+            existing.remove();
+            if (existing.dataset.anchorOpen === '1') return;
+        }
+
+        const menu = document.createElement('div');
+        menu.id = 'th-hl-settings-menu';
+        menu.className = 'th-menu';
+        menu.dataset.anchorOpen = '1';
+
+        const close = () => {
+            try { menu.remove(); } catch (_) {}
+            document.removeEventListener('mousedown', onDocDown, true);
+            document.removeEventListener('keydown', onKey, true);
+        };
+        const onDocDown = (e) => {
+            if (menu.contains(e.target)) return;
+            if (anchorEl?.contains?.(e.target)) return;
+            close();
+        };
+        const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+
+        const addItem = (label, checked, onClick) => {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'th-menu-item button-none';
+            const mark = document.createElement('span');
+            mark.className = 'th-menu-check';
+            mark.textContent = checked === true ? '✓' : '';
+            const txt = document.createElement('span');
+            txt.className = 'th-menu-label';
+            txt.textContent = label;
+            btn.appendChild(mark);
+            btn.appendChild(txt);
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                close();
+                onClick();
+            });
+            menu.appendChild(btn);
+            return btn;
+        };
+        const addSep = () => {
+            const sep = document.createElement('div');
+            sep.className = 'th-menu-sep';
+            menu.appendChild(sep);
+        };
+
+        addItem('Quote Shuffler', this._showShufflerPanel(), () => this._toggleShowShufflerPanel());
+        addItem('Shuffler in its own glass frame', this._showShufflerDetached(), () => this._toggleShufflerDetached());
+        addSep();
+        addItem('Sync Readwise now', undefined, () => { void this._runSync(false); });
+        addItem('Rebuild highlights index', undefined, () => { void this._rebuildDayIndexFromBodies(); });
+        addSep();
+        addItem("Hide today's highlights", undefined, () => this._toggleShowHighlightsPanel());
+
+        document.body.appendChild(menu);
+        try {
+            const r = anchorEl.getBoundingClientRect();
+            const w = menu.offsetWidth || 220;
+            const left = Math.max(8, Math.min(window.innerWidth - w - 8, Math.round(r.right - w)));
+            const top = Math.round(r.bottom + 6);
+            menu.style.left = left + 'px';
+            menu.style.top = top + 'px';
+        } catch (_) {}
+
+        setTimeout(() => {
+            document.addEventListener('mousedown', onDocDown, true);
+            document.addEventListener('keydown', onKey, true);
+        }, 0);
     }
 
     /** Collapse/expand chrome + body for `.th-shuffler-shell` (Quote Shuffler). */
@@ -6930,6 +8077,9 @@ class Plugin extends AppPlugin {
             this._shufflerCollapsed = !this._shufflerCollapsed;
             this._saveBool(TH_KEY_SHUFFLER_COLLAPSED, this._shufflerCollapsed);
             this._syncShufflerShellLayout(root);
+            if (!this._shufflerCollapsed && !state.shufflerDataLoaded) {
+                void this._populate(state);
+            }
         });
         this._syncShufflerShellLayout(root);
 
@@ -6959,9 +8109,13 @@ class Plugin extends AppPlugin {
     }
 
     async _populate(state) {
-        await this._rwEnsurePathBReady();
-        if (state.loading) return;
+        if (state.loading) {
+            state._pendingPopulate = true;
+            return;
+        }
         state.loading = true;
+        /* Footers use local caches; don't block paint on Path B vault init. */
+        void this._rwEnsurePathBReady();
         if (typeof state.populateSeq !== 'number') state.populateSeq = 0;
         const seq = ++state.populateSeq;
 
@@ -6982,21 +8136,39 @@ class Plugin extends AppPlugin {
             return;
         }
 
-        if (hiBody) hiBody.innerHTML = '<div class="th-loading">Scanning highlights…</div>';
-        if (shBody) shBody.innerHTML = '<div class="th-loading">Loading quote library…</div>';
+        const wantHiLoad = !!(hiBody && !this._collapsed);
+        const wantShLoad = !!(shBody && !this._shufflerCollapsed);
+        const syncBusy = !!this._syncing;
+
+        if (hiBody && !wantHiLoad) {
+            hiBody.innerHTML = '<div class="th-empty th-empty--lazy">Expand to load highlights.</div>';
+            if (hiCount) hiCount.textContent = '';
+        } else if (hiBody && syncBusy) {
+            hiBody.innerHTML = '<div class="th-empty">Syncing Readwise…</div>';
+            if (hiCount) hiCount.textContent = '';
+        } else if (hiBody) {
+            hiBody.innerHTML = '<div class="th-loading">Loading highlights…</div>';
+        }
+        if (shBody && !wantShLoad) {
+            shBody.innerHTML = '<div class="th-empty th-empty--lazy">Expand to load quote.</div>';
+        } else if (shBody && syncBusy) {
+            /* Sticky day pick is fine during sync; pool rebuild is not. */
+        } else if (shBody) {
+            shBody.innerHTML = '<div class="th-loading">Loading quote…</div>';
+        }
 
         try {
             await this._yieldForJournalPaint();
             const jobs = [];
-            if (hiBody) {
+            if (wantHiLoad && !syncBusy) {
                 jobs.push(this._populateHighlightsSection(
                     state, hiBody, hiCount, targetJournal, targetHiRoot, targetShRoot, targetGuid, seq));
             }
-            if (shBody) {
+            if (wantShLoad) {
                 jobs.push(this._populateShufflerSection(
                     state, shBody, targetJournal, targetHiRoot, targetShRoot, targetGuid, seq));
             }
-            await Promise.all(jobs);
+            if (jobs.length) await Promise.all(jobs);
 
             if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetHiRoot, targetShRoot, targetGuid)) {
                 state.loading = false;
@@ -7034,7 +8206,7 @@ class Plugin extends AppPlugin {
 
         if (highlights.length === 0) {
             bodyEl.innerHTML = '<div class="th-empty">No highlights for this day.</div>';
-            if (countEl) countEl.textContent = '';
+            if (countEl) countEl.textContent = '0';
         } else {
             if (countEl) countEl.textContent = String(highlights.length);
 
@@ -7049,30 +8221,22 @@ class Plugin extends AppPlugin {
                 bodyEl.appendChild(this._buildGroup(sourceTitle, items, state));
             }
         }
+        state.highlightsDataLoaded = true;
     }
 
     async _populateShufflerSection(state, shBody, targetJournal, targetHiRoot, targetShRoot, targetGuid, seq) {
-        const reportPool = (msg) => {
-            if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetHiRoot, targetShRoot, targetGuid)) return;
-            const el = shBody.querySelector('.th-loading');
-            if (el) el.textContent = msg;
-        };
-        await this._warmQuotePoolCache(reportPool);
-        if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetHiRoot, targetShRoot, targetGuid)) return;
-        const pool = Array.isArray(this._quotePoolCache) ? this._quotePoolCache : [];
+        /* Prefer sticky day pick — no library scan. Pool warms only on draw/reshuffle. */
         const saved = this._loadDayShufflePick(targetJournal);
         if (saved && saved.guid && String(saved.text || '').trim()) {
-            let pick = this._pickFromStored(saved);
-            const merged = this._mergeShufflePickWithPool(pick, pool);
-            if (merged !== pick) {
-                pick = merged;
-                this._persistDayShufflePick(targetJournal, pick);
-            }
+            if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetHiRoot, targetShRoot, targetGuid)) return;
+            const pick = this._pickFromStored(saved);
             this._renderShufflerQuoteCard(state, shBody, pick, targetJournal);
-        } else {
-            this._renderShufflerIdle(state, shBody, targetJournal);
+            state.shufflerDataLoaded = true;
+            return;
         }
         if (!this._isPopulateStillCurrent(state, seq, targetJournal, targetHiRoot, targetShRoot, targetGuid)) return;
+        this._renderShufflerIdle(state, shBody, targetJournal);
+        state.shufflerDataLoaded = true;
     }
 
     _getShufflerDayMap() {
@@ -7504,10 +8668,25 @@ class Plugin extends AppPlugin {
 
     /**
      * Parse Reference record bodies: Highlights section → date heading → quote blocks (+ note/loc children).
+     * Prefers the sync-maintained day index (O(day)); falls back to full vault scan when missing.
      */
     async _getHighlightsFromReferencesForDate(yyyymmdd, onProgress) {
         const hit = this._thRefQueryCache?.get(yyyymmdd);
         if (hit) return hit;
+
+        const indexed = this._dayIndexLookup(yyyymmdd);
+        if (indexed) {
+            try { this._thRefQueryCache.set(yyyymmdd, indexed); } catch (_) {}
+            return indexed;
+        }
+
+        /* During sync, never full-scan bodies — compete with writers and freeze the UI. */
+        if (this._syncing) {
+            if (onProgress) {
+                try { onProgress('Syncing Readwise…'); } catch (_) {}
+            }
+            return [];
+        }
 
         const y = parseInt(yyyymmdd.slice(0, 4), 10);
         const m = parseInt(yyyymmdd.slice(4, 6), 10) - 1;
@@ -7554,6 +8733,41 @@ class Plugin extends AppPlugin {
 
         results.sort((a, b) => a.source_title.localeCompare(b.source_title));
         try { this._thRefQueryCache.set(yyyymmdd, results); } catch (_) {}
+
+        /* Backfill day index from this scan so the next open is instant. */
+        try {
+            if (results.length && (!this._highlightsDayIndex?.entries
+                || !Object.keys(this._highlightsDayIndex.entries).length)) {
+                /* Full index still empty — leave rebuild to next sync; only cache this day in memory. */
+            } else if (results.length) {
+                /* Merge this day's rows into existing index entries without wiping other days. */
+                const byGuid = new Map();
+                for (const r of results) {
+                    if (!byGuid.has(r.guid)) byGuid.set(r.guid, []);
+                    byGuid.get(r.guid).push(r);
+                }
+                if (!this._highlightsDayIndex) this._hydrateHighlightsDayIndexFromStorage();
+                const idx = this._highlightsDayIndex || this._emptyHighlightsDayIndex();
+                for (const [guid, rows] of byGuid) {
+                    const ent = idx.entries[guid] || {
+                        st: String(rows[0].source_title || '').slice(0, 200),
+                        sa: String(rows[0].source_author || '').slice(0, 120),
+                        cat: String(rows[0].category || '').slice(0, 80),
+                        d: Object.create(null),
+                    };
+                    ent.d[yyyymmdd] = rows.map((r) => [
+                        String(r.text || ''),
+                        String(r.note || ''),
+                        String(r.location || ''),
+                    ]);
+                    idx.entries[guid] = ent;
+                }
+                this._highlightsDayIndex = idx;
+                this._highlightsDayIndexDirty = true;
+                this._persistHighlightsDayIndex();
+            }
+        } catch (_) {}
+
         return results;
     }
 
@@ -8030,8 +9244,18 @@ class Plugin extends AppPlugin {
             });
         }
 
+        /* Fixed slot keeps every title on the same left edge, category icon or not. */
+        const iconSlot = document.createElement('span');
+        iconSlot.className = 'th-source-icon-slot';
+        const catKind = this._rwrCategoryIconKind(items.find((h) => h && h.category)?.category);
+        if (catKind) {
+            const catIcon = this._rwrAppendSvgIcon(iconSlot, catKind, 14);
+            catIcon.classList.add('th-source-icon');
+        }
+
         const titleCluster = document.createElement('div');
         titleCluster.className = 'th-source-title-cluster';
+        titleCluster.appendChild(iconSlot);
         titleCluster.appendChild(sourceEl);
         if (refGuid) titleCluster.appendChild(this._buildPanelNavActions(refGuid, state));
 
@@ -8043,7 +9267,9 @@ class Plugin extends AppPlugin {
         expandBtn.className = 'th-expand-btn button-none button-small button-minimal-hover';
         expandBtn.type      = 'button';
         expandBtn.title     = isExpanded ? 'Collapse' : 'Show highlights';
-        expandBtn.textContent = isExpanded ? '▼' : '▶';
+        expandBtn.classList.toggle('is-expanded', isExpanded);
+        const expandCaret = this._rwrBuildChevron(isExpanded, 'th-expand-caret');
+        expandBtn.appendChild(expandCaret);
 
         groupHeader.appendChild(expandBtn);
         groupHeader.appendChild(titleCluster);
@@ -8064,7 +9290,8 @@ class Plugin extends AppPlugin {
             state.expandedSources.set(sourceTitle, nowExpanded);
             group.classList.toggle('th-group--expanded', nowExpanded);
             preview.style.display = nowExpanded ? 'block' : 'none';
-            expandBtn.textContent = nowExpanded ? '▼' : '▶';
+            this._rwrSyncChevron(expandCaret, nowExpanded);
+            expandBtn.classList.toggle('is-expanded', nowExpanded);
             expandBtn.title       = nowExpanded ? 'Collapse' : 'Show highlights';
         });
 
@@ -8176,6 +9403,16 @@ class Plugin extends AppPlugin {
     _injectCSS() {
         this.ui.injectCSS(`
             /* ── Journal footer wrapper (one or two cards) ── */
+            .th-journal-footer,
+            .th-shuffler-detached-host {
+                /* Same token chain as Backreferences so both footers read identically. */
+                --th-text-default: var(--text-default, var(--text, inherit));
+                --th-text-muted: var(--text-muted, var(--text-secondary, #8a7e6a));
+                --th-text-faint: color-mix(in srgb, var(--th-text-muted) 72%, transparent);
+                --th-border-color: var(--divider-color, var(--cmdpal-border-color, var(--border-subtle, rgba(255,255,255,0.08))));
+                --th-editor-size: var(--editor-font-size, 15px);
+                font-size: 13px;
+            }
             .th-journal-footer {
                 margin-top: 16px;
                 display: flex;
@@ -8220,11 +9457,178 @@ class Plugin extends AppPlugin {
                 border-radius: 0;
             }
 
-            /* ── Outer card — Journal Footer Suite glass (JOURNAL_SUITE_GLASS_V1) ── */
+            /* ── Outer card — glass only for Quote Shuffler; Highlights is native like Backreferences ── */
             .th-footer {
                 margin-top: 16px;
                 font-size: 13px;
                 color: inherit;
+            }
+
+            .th-footer--highlights.th-footer--native {
+                margin-top: 14px;
+                padding: 0;
+                background: transparent !important;
+                border: none !important;
+                border-radius: 0 !important;
+                box-shadow: none !important;
+                -webkit-backdrop-filter: none !important;
+                backdrop-filter: none !important;
+                isolation: auto;
+                overflow: visible;
+            }
+
+            .th-footer--highlights .th-header--native {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                min-height: 28px;
+                margin-bottom: 0;
+                padding: 0;
+            }
+            .th-footer--highlights .th-header-main {
+                flex: 1 1 auto;
+                min-width: 0;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+            }
+            .th-footer--highlights .th-header-controls {
+                flex: 0 0 auto;
+                display: inline-flex;
+                align-items: center;
+                gap: 4px;
+            }
+
+            .th-summary-pill {
+                display: inline-flex !important;
+                align-items: center;
+                gap: 8px;
+                width: auto;
+                height: auto;
+                max-width: 100%;
+                padding: 4px 12px 4px 8px !important;
+                min-height: 28px;
+                border-radius: 999px !important;
+                background: var(--button-minimal-bg-color, var(--bg-secondary, rgba(127,127,127,0.14))) !important;
+                border: 1px solid var(--divider-color, var(--cmdpal-border-color, var(--border-subtle, rgba(255,255,255,0.08)))) !important;
+                color: inherit;
+            }
+            .th-summary-pill .th-title-icon {
+                opacity: 0.9;
+                flex: 0 0 auto;
+            }
+            .th-summary-pill .th-title {
+                flex: 0 1 auto;
+                font-size: 13px;
+                font-weight: 600;
+                color: var(--th-text-default);
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .th-summary-pill .th-count {
+                flex: 0 0 auto;
+                color: var(--th-text-muted);
+                font-size: 12px;
+                font-variant-numeric: tabular-nums;
+            }
+            .th-summary-pill .th-count:empty { display: none; }
+            .th-summary-pill .th-toggle-caret {
+                opacity: 0.85;
+                flex: 0 0 auto;
+            }
+
+            /* Light chevron (matches the Backreferences fold caret); rotates instead of swapping glyphs. */
+            .th-chevron {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                line-height: 0;
+                color: var(--th-text-muted);
+                transition: transform 0.12s ease;
+                transform: rotate(0deg);
+            }
+            .th-chevron--open { transform: rotate(90deg); }
+            .th-chevron svg { display: block; }
+
+            /*
+             * Header actions reveal on hover. Selectors are over-qualified on purpose so they
+             * outrank the generic .th-footer--highlights .th-action opacity rules further down.
+             */
+            .th-footer .th-header .th-hover-action {
+                opacity: 0;
+                transition: opacity 0.12s;
+            }
+            .th-footer .th-header:hover .th-hover-action,
+            .th-footer .th-header:focus-within .th-hover-action,
+            .th-footer .th-header .th-hover-action:focus-visible {
+                opacity: 1;
+            }
+            @media (hover: none), (pointer: coarse) {
+                .th-footer .th-header .th-hover-action { opacity: 0.6; }
+            }
+
+            /* Settings cog popup */
+            .th-menu {
+                position: fixed;
+                z-index: 100000;
+                min-width: 220px;
+                padding: 5px;
+                border-radius: 10px;
+                background: var(--cmdpal-bg-color, var(--panel-bg-color, #1d1915));
+                border: 1px solid var(--divider-color, var(--cmdpal-border-color, rgba(255,255,255,0.1)));
+                box-shadow: var(--cmdpal-box-shadow, 0 8px 32px rgba(0,0,0,0.45));
+                display: flex;
+                flex-direction: column;
+                gap: 1px;
+            }
+            .th-menu-item {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                width: 100%;
+                padding: 6px 8px;
+                border-radius: 6px;
+                background: transparent;
+                border: none;
+                color: var(--th-text-default);
+                font-size: 13px;
+                text-align: left;
+                cursor: pointer;
+            }
+            .th-menu-item:hover {
+                background: var(--button-normal-hover-color, rgba(255,255,255,0.07));
+            }
+            .th-menu-check {
+                flex: 0 0 auto;
+                width: 12px;
+                color: var(--th-text-muted);
+                font-size: 12px;
+            }
+            .th-menu-label { flex: 1 1 auto; }
+            .th-menu-sep {
+                height: 1px;
+                margin: 4px 6px;
+                background: var(--divider-color, rgba(255,255,255,0.08));
+            }
+
+            .th-footer--highlights .th-body--native {
+                background: transparent !important;
+                border: none;
+                border-left: 1px solid var(--divider-color, var(--cmdpal-border-color, var(--border-subtle, rgba(255,255,255,0.08))));
+                box-shadow: none !important;
+                margin-left: 10px;
+                padding: 6px 0 4px 14px;
+            }
+            .th-footer--highlights.th-footer--collapsed .th-body--native {
+                display: none !important;
+            }
+
+            .th-shuffler-detached-host {
+                margin-top: 22px;
+            }
+            .th-footer.th-footer--shuffler,
+            .th-shuffler-detached-shell {
                 isolation: isolate;
                 border-radius: 10px;
                 overflow: hidden;
@@ -8238,25 +9642,8 @@ class Plugin extends AppPlugin {
                 -webkit-backdrop-filter: blur(22px) saturate(1.45);
                 backdrop-filter: blur(22px) saturate(1.45);
             }
-
-            .th-shuffler-detached-host {
-                margin-top: 12px;
-            }
             .th-shuffler-detached-shell {
                 padding: 10px 12px;
-                font-size: 13px;
-                color: inherit;
-                isolation: isolate;
-                border-radius: 10px;
-                overflow: hidden;
-                background: rgba(22, 22, 28, 0.38);
-                background: color-mix(in srgb, var(--panel-bg-color, rgb(24, 23, 28)) 38%, transparent);
-                border: 1px solid rgba(255, 255, 255, 0.055);
-                box-shadow:
-                  inset 0 1px 0 rgba(255, 255, 255, 0.05),
-                  0 4px 28px rgba(0, 0, 0, 0.16);
-                -webkit-backdrop-filter: blur(22px) saturate(1.45);
-                backdrop-filter: blur(22px) saturate(1.45);
             }
             .th-journal-footer[data-rw-detached-mount="shuffler"] {
                 margin-top: 0;
@@ -8280,11 +9667,18 @@ class Plugin extends AppPlugin {
                 min-height: 30px;
                 margin-bottom: 6px;
             }
+            .th-footer--highlights .th-header--native {
+                margin-bottom: 0;
+                min-height: 28px;
+            }
             .th-header-actions {
                 margin-left: auto;
                 display: inline-flex;
                 align-items: center;
                 gap: 4px;
+            }
+            .th-footer--highlights .th-header-controls {
+                margin-left: 0;
             }
             .th-action {
                 opacity: 0;
@@ -8299,18 +9693,30 @@ class Plugin extends AppPlugin {
             }
             .th-footer:hover .th-action { opacity: 1; }
             .th-action:hover { color: inherit; }
-            .th-action.is-active { color: inherit; opacity: 1; }
+            .th-action.is-active { color: inherit; }
+            /* .th-hover-action (highlights header) governs its own visibility above. */
+            .th-footer--highlights .th-action:not(.th-hover-action) {
+                opacity: 0.72;
+            }
+            .th-footer--highlights:hover .th-action:not(.th-hover-action) {
+                opacity: 1;
+            }
             .th-toggle {
                 font-size: 13px;
                 line-height: 1;
-                color: #8a7e6a;
+                color: var(--th-text-muted);
                 cursor: pointer;
                 padding: 0 4px;
                 min-width: 18px;
                 flex-shrink: 0;
             }
+            .th-toggle.th-summary-pill {
+                color: inherit;
+                padding: 4px 12px 4px 8px !important;
+                min-width: 0;
+            }
             .th-title-icon {
-                color: #8a7e6a;
+                color: var(--th-text-muted);
                 font-size: 14px;
                 flex-shrink: 0;
                 display: inline-flex;
@@ -8334,7 +9740,7 @@ class Plugin extends AppPlugin {
                 white-space: nowrap;
             }
             .th-count {
-                color: #8a7e6a;
+                color: var(--th-text-muted);
                 font-size: 12px;
                 white-space: nowrap;
                 font-variant-numeric: tabular-nums;
@@ -8345,7 +9751,7 @@ class Plugin extends AppPlugin {
 
             .th-loading, .th-empty {
                 font-size: 12px;
-                color: #8a7e6a;
+                color: var(--th-text-muted);
                 padding: 4px 0 6px;
                 font-style: italic;
             }
@@ -8388,7 +9794,7 @@ class Plugin extends AppPlugin {
                 height: 22px;
                 padding: 0;
                 border-radius: 5px;
-                color: #8a7e6a;
+                color: var(--th-text-muted);
                 line-height: 1;
             }
             .th-panel-nav-icon {
@@ -8404,7 +9810,7 @@ class Plugin extends AppPlugin {
                 height: 14px;
             }
             .th-panel-nav-btn:hover {
-                color: #e8e0d0;
+                color: var(--th-text-default);
                 background: rgba(255,255,255,0.06);
             }
             .th-source-title-cluster {
@@ -8414,10 +9820,22 @@ class Plugin extends AppPlugin {
                 flex: 1 1 auto;
                 min-width: 0;
             }
+            /* Fixed slot keeps every title on the same left edge, icon or not. */
+            .th-source-icon-slot {
+                flex: 0 0 auto;
+                width: 20px;
+                display: inline-flex;
+                align-items: center;
+                justify-content: flex-start;
+                color: var(--th-text-muted);
+                opacity: 0.7;
+            }
             .th-source-title {
                 font-weight: 600;
-                font-size: 13px;
-                color: #e8e0d0;
+                /* Same scale as the Backreferences row titles. */
+                font-size: var(--th-editor-size, var(--editor-font-size, 15px));
+                line-height: 1.7;
+                color: var(--th-text-default);
                 flex: 1 1 auto;
                 min-width: 0;
                 white-space: nowrap;
@@ -8428,12 +9846,13 @@ class Plugin extends AppPlugin {
                 cursor: pointer;
             }
             .th-source-title--link:hover {
-                color: #f5efe4;
+                color: var(--th-text-default);
                 text-decoration: underline;
             }
             .th-group-count {
-                font-size: 11px;
-                color: #8a7e6a;
+                font-size: 13px;
+                color: var(--th-text-muted);
+                font-weight: 500;
                 white-space: nowrap;
                 flex-shrink: 0;
             }
@@ -8441,22 +9860,36 @@ class Plugin extends AppPlugin {
                 display: inline-flex;
                 align-items: center;
                 justify-content: center;
-                font-size: 12px;
-                color: #8a7e6a;
+                color: var(--th-text-muted);
                 cursor: pointer;
                 padding: 0;
                 margin: 0;
                 background: none;
                 border: none;
-                font-weight: 600;
                 line-height: 1;
                 flex-shrink: 0;
-                transition: color 0.1s;
-                min-width: 14px;
+                transition: color 0.1s, opacity 0.12s;
+                width: 16px;
                 height: 16px;
+                /* Hover-reveal like the Backreferences row caret. */
+                opacity: 0;
+            }
+            .th-group-header:hover .th-expand-btn,
+            .th-expand-btn:focus-visible,
+            .th-expand-btn.is-expanded {
+                opacity: 1;
+            }
+            @media (hover: none), (pointer: coarse) {
+                .th-expand-btn { opacity: 0.65; }
             }
             .th-expand-btn:hover {
-                color: #e8e0d0;
+                color: var(--th-text-default);
+            }
+            .th-group-header {
+                border-radius: 8px;
+            }
+            .th-group-header:hover {
+                background: var(--button-normal-hover-color, var(--bg-hover, rgba(255,255,255,0.05)));
             }
 
             /* ── Expandable highlight list ── */
@@ -8497,20 +9930,21 @@ class Plugin extends AppPlugin {
                 background: rgba(255,255,255,0.05);
             }
             .th-highlight-text {
-                font-size: 13px;
-                color: #c8bfaf;
+                /* Matches the Backreferences linked-line snippets. */
+                font-size: 13.5px;
+                color: var(--th-text-default);
                 line-height: 1.5;
                 /* subtle left bar to signal "quote" */
             }
             .th-highlight-note {
                 font-size: 12px;
-                color: #8a7e6a;
+                color: var(--th-text-muted);
                 margin-top: 3px;
                 font-style: italic;
             }
             .th-highlight-meta {
                 font-size: 11px;
-                color: #6a5f52;
+                color: var(--th-text-faint);
                 margin-top: 2px;
             }
 
@@ -8631,7 +10065,7 @@ class Plugin extends AppPlugin {
                 opacity: 0;
                 pointer-events: none;
                 transition: opacity 0.12s ease;
-                color: #8a7e6a;
+                color: var(--th-text-muted);
                 cursor: pointer;
                 border: none;
                 background: transparent;
@@ -8654,7 +10088,7 @@ class Plugin extends AppPlugin {
                 pointer-events: auto;
             }
             .th-shuffler-collapse-mini:hover {
-                color: #e8e0d0;
+                color: var(--th-text-default);
             }
             .th-shuffler-quote-mark-row {
                 margin-bottom: 12px;
