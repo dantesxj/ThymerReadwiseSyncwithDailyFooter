@@ -869,10 +869,11 @@ const RWR_RECORD_CREATED_DEBOUNCE_MOBILE_MS = 4200;
 const RWR_RECORD_CREATED_COLD_START_GRACE_MS = 18000;
 
 /**
- * How many source documents to process concurrently during full sync.
- * Body rebuild is sync-line heavy on the main thread; parallel >1 makes Thymer feel frozen for long runs.
+ * How many source documents to process concurrently during sync.
+ * Metadata/property updates are light; body rebuilds still serialize inside each worker.
+ * Override: `localStorage.setItem('readwise_references_sync_concurrency','1')` to restore serial.
  */
-const RWR_SYNC_CONCURRENCY = 1;
+const RWR_SYNC_CONCURRENCY = 3;
 
 /** 0 = no yields inside the per-highlight body loop (fastest body rebuild). */
 const RWR_BODY_YIELD_EVERY_HIGHLIGHTS = 0;
@@ -880,6 +881,7 @@ const RWR_BODY_YIELD_EVERY_HIGHLIGHTS = 0;
 /**
  * Reader `/api/v3/list/` — official Reader API default is **20 requests/minute/token** (~3000 ms between requests).
  * Override: `readwise_references_list_delay_ms` (set lower at your own 429 risk).
+ * Default sync is export-first and skips this endpoint unless opted in (see rwrFetchListFromStorage).
  */
 const RWR_LIST_PAGE_DELAY_MS_DEFAULT = 3000;
 /**
@@ -887,6 +889,38 @@ const RWR_LIST_PAGE_DELAY_MS_DEFAULT = 3000;
  * (Highlight LIST / Book LIST are 20/min — export paging is not those.) Override: `readwise_references_export_delay_ms`.
  */
 const RWR_EXPORT_PAGE_DELAY_MS_DEFAULT = 250;
+
+/**
+ * Default OFF — sync uses v2 /export/ only (Readwise’s recommended path).
+ * Opt in to also pull Reader `/api/v3/list/` (slow; 20/min): `localStorage.setItem('readwise_references_fetch_list','1')`.
+ * List is still fetched automatically when export fails or returns zero books.
+ */
+function rwrFetchListFromStorage() {
+    try {
+        const o = localStorage.getItem('readwise_references_fetch_list');
+        return o === '1' || o === 'true' || o === 'on';
+    } catch (_) {
+        return false;
+    }
+}
+
+/** Default OFF — set `readwise_references_markdown_bodies=1` to try bulk insertFromMarkdown (falls back to lines). */
+function rwrPreferMarkdownBodiesFromStorage() {
+    try {
+        const o = localStorage.getItem('readwise_references_markdown_bodies');
+        return o === '1' || o === 'true' || o === 'on';
+    } catch (_) {
+        return false;
+    }
+}
+
+function rwrSyncConcurrencyFromStorage() {
+    try {
+        const v = parseInt(localStorage.getItem('readwise_references_sync_concurrency'), 10);
+        if (Number.isFinite(v) && v >= 1 && v <= 8) return v;
+    } catch (_) {}
+    return RWR_SYNC_CONCURRENCY;
+}
 
 /** RSS-category sources sync by default. Opt out: `localStorage.setItem('readwise_references_include_rss','0')`. */
 function rwrIncludeRssFromStorage() {
@@ -1269,7 +1303,6 @@ class DawnReadwiseSyncEngine {
         this._highlightsDayIndex = null;
         this._highlightsDayIndexDirty = false;
         this._hydrateHighlightsDayIndexFromStorage();
-        this._hydrateQuotePoolCacheFromStorage();
         this._scheduleReferencesBootstrapDeferred();
     }
 
@@ -1620,7 +1653,7 @@ class DawnReadwiseSyncEngine {
                 const text = this._highlightBody(h);
                 if (!String(text || '').trim()) continue;
                 const ex = exMap
-                    ? (exMap.get(String(h.id)) || exMap.get(String(h.external_id ?? '')))
+                    ? (exMap.get(String(h.id)) || exMap.get(String(h.external_id != null ? h.external_id : '')))
                     : null;
                 rows.push([
                     String(text),
@@ -2138,6 +2171,105 @@ class DawnReadwiseSyncEngine {
         return 'readwise_exp_' + slug.replace(/\s+/g, '_');
     }
 
+    _normalizeReadwiseAliasText(s) {
+        return String(s || '')
+            .normalize('NFKD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .replace(/[“”‘’]/g, "'")
+            .replace(/&/g, ' and ')
+            .replace(/\([^)]*\)/g, ' ')
+            .replace(/[^a-z0-9]+/gi, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+    }
+
+    _referenceWorkKeyForDoc(doc) {
+        const d = doc || {};
+        const cat = this._normalizeReadwiseCategoryChoiceId(d.category || '');
+        if (cat !== 'books') return '';
+        const title = this._normalizeReadwiseAliasText(this._resolveDocTitle(d));
+        const author = this._normalizeReadwiseAliasText(d.author || '');
+        if (!title || !author) return '';
+        return cat + '|' + author + '|' + title;
+    }
+
+    _referenceWorkKeyForRecord(record) {
+        if (!record) return '';
+        const cat = this._normalizeReadwiseCategoryChoiceId(this._readwiseSourceCategoryLabel(record));
+        if (cat !== 'books') return '';
+        const title = this._normalizeReadwiseAliasText(this._sourceTitleLabel(record) || record.getName?.() || '');
+        const author = this._normalizeReadwiseAliasText(this._authorLabel(record));
+        if (!title || !author) return '';
+        return cat + '|' + author + '|' + title;
+    }
+
+    _referenceExtIdRank(extId) {
+        const s = String(extId || '').trim();
+        if (!s) return 0;
+        if (/^readwise_(?!ub_|exp_)/.test(s)) return 3;
+        if (s.startsWith('readwise_ub_')) return 2;
+        if (s.startsWith('readwise_exp_')) return 1;
+        return 0;
+    }
+
+    _preferCanonicalReferenceExtId(a, b) {
+        const ax = String(a || '').trim();
+        const bx = String(b || '').trim();
+        if (!ax) return bx;
+        if (!bx) return ax;
+        const ar = this._referenceExtIdRank(ax);
+        const br = this._referenceExtIdRank(bx);
+        if (br > ar) return bx;
+        if (ar > br) return ax;
+        return bx.length >= ax.length ? bx : ax;
+    }
+
+    _mergeReferenceEntriesByWorkKey(entries, exportByHlId) {
+        const list = Array.isArray(entries) ? entries : [];
+        if (list.length < 2) return list;
+        const byWorkKey = new Map();
+        const passThrough = [];
+        let mergedAliases = 0;
+        for (const entry of list) {
+            if (!entry) continue;
+            const workKey = this._referenceWorkKeyForDoc(entry.doc);
+            if (!workKey) {
+                passThrough.push(entry);
+                continue;
+            }
+            const prev = byWorkKey.get(workKey);
+            if (!prev) {
+                byWorkKey.set(workKey, { ...entry });
+                continue;
+            }
+            mergedAliases++;
+            const extId = this._preferCanonicalReferenceExtId(prev.extId, entry.extId);
+            const doc = extId === entry.extId
+                ? this._preferRicherDoc(entry.doc, prev.doc)
+                : this._preferRicherDoc(prev.doc, entry.doc);
+            let docHL = this._mergeHighlightRowArrays(prev.docHL, entry.docHL);
+            docHL = this._dedupeHighlightRowsByCanonicalKey(docHL, exportByHlId);
+            docHL = this._dedupeIdenticalLongQuoteRows(docHL);
+            docHL = this._dedupeRedundantNoteHighlightRows(docHL);
+            byWorkKey.set(workKey, {
+                ...prev,
+                ...entry,
+                extId,
+                doc,
+                docHL,
+                synthFlag: (prev.synthFlag || 0) + (entry.synthFlag || 0),
+                fromExport: !!(prev.fromExport || entry.fromExport),
+                workKeyMerged: true,
+            });
+        }
+        if (mergedAliases > 0 && this._lastSyncDiag) {
+            this._lastSyncDiag.sameWorkAliasSourcesMerged =
+                (this._lastSyncDiag.sameWorkAliasSourcesMerged || 0) + mergedAliases;
+        }
+        return passThrough.concat(Array.from(byWorkKey.values()));
+    }
+
     /**
      * Reader list + export can both contain the *same* highlight with different `id` / `external_id`.
      * `_mergeHighlightRowArrays` only merges identical ids — merge duplicates by Readwise open URL + fallbacks.
@@ -2371,7 +2503,7 @@ class DawnReadwiseSyncEngine {
         }
 
         const exMap = exportByHlId && typeof exportByHlId.get === 'function' ? exportByHlId : null;
-        const entries = Array.from(merged.values())
+        let entries = Array.from(merged.values())
             .map((e) => {
                 if (!e || !e.docHL) return e;
                 let hl = this._dedupeHighlightRowsByCanonicalKey(e.docHL, exMap);
@@ -2380,6 +2512,7 @@ class DawnReadwiseSyncEngine {
                 return Object.assign({}, e, { docHL: hl });
             })
             .filter((e) => e && e.docHL && e.docHL.length > 0);
+        entries = this._mergeReferenceEntriesByWorkKey(entries, exMap);
         return { entries, groupedMeta: grouped, pageDocsLen: pageDocs.length, pageHLsLen: pageHLs.length, syntheticParentCount };
     }
 
@@ -2613,6 +2746,7 @@ class DawnReadwiseSyncEngine {
             noteRowsDeduped: 0,
             duplicateHighlightRowsMerged: 0,
             duplicateQuoteBodyMerged: 0,
+            sameWorkAliasSourcesMerged: 0,
             mergedSources: 0,
             bodiesRebuilt: 0,
             bodiesSkippedUnchanged: 0,
@@ -2620,6 +2754,11 @@ class DawnReadwiseSyncEngine {
             bodiesOrphanRepaired: 0,
             bodiesOrphanFetchFailed: 0,
             bodiesMergedIncremental: 0,
+            bodiesViaMarkdown: 0,
+            bodiesViaLines: 0,
+            listFetchSkipped: false,
+            listFetchForced: false,
+            pendingPeopleLinked: 0,
             dayIndexUpdated: 0,
             dateHeadingsLinked: 0,
             dateHeadingsPlainFallback: 0,
@@ -2649,47 +2788,34 @@ class DawnReadwiseSyncEngine {
         const peopleByKey = await this._buildPeopleByKeyIndex(peopleColl);
 
         const existingRef = await refsColl.getAllRecords();
-        const refByExtId = new Map(existingRef.map(r => [r.text('external_id'), r]));
+        const refByExtId = new Map();
+        const refByWorkKey = new Map();
+        for (const r of existingRef) {
+            let ext = '';
+            try { ext = String(r.text('external_id') || '').trim(); } catch (_) { ext = ''; }
+            if (ext) refByExtId.set(ext, r);
+            const workKey = this._referenceWorkKeyForRecord(r);
+            if (!workKey) continue;
+            const prev = refByWorkKey.get(workKey);
+            if (!prev) {
+                refByWorkKey.set(workKey, r);
+                continue;
+            }
+            let prevExt = '';
+            try { prevExt = String(prev.text('external_id') || '').trim(); } catch (_) { prevExt = ''; }
+            const keep = this._preferCanonicalReferenceExtId(prevExt, ext);
+            if (keep === ext) refByWorkKey.set(workKey, r);
+        }
 
         let createdRef = 0, updatedRef = 0;
 
-        this._syncStatusShow(since ? 'Downloading Reader list (incremental)…' : 'Downloading Reader list (full)…');
-        const allResults = await this._fetchReadwiseListAll(token, since);
-        this._lastSyncDiag.listRows = allResults.length;
-        this._log('List download complete: ' + allResults.length + ' rows.');
-        try {
-            const listDocsApi = (allResults || []).filter((i) => {
-                const p = i.parent_id ?? i.parent_document_id;
-                return p == null || p === '';
-            });
-            const listHlApi = (allResults || []).filter((i) => {
-                const p = i.parent_id ?? i.parent_document_id;
-                return p != null && String(p).length > 0;
-            });
-            const hListCat = this._readwiseHistogramStrings(allResults, (r) => r && r.category);
-            const hListSrc = this._readwiseHistogramStrings(allResults, (r) => r && r.source);
-            const hDocCat = this._readwiseHistogramStrings(listDocsApi, (r) => r && r.category);
-            const hHlCat = this._readwiseHistogramStrings(listHlApi, (r) => r && r.category);
-            if (this._lastSyncDiag) {
-                this._lastSyncDiag.readwiseListApiCategoryHistogram = hListCat;
-                this._lastSyncDiag.readwiseListApiSourceHistogram = hListSrc;
-                this._lastSyncDiag.readwiseListDocCategoryHistogram = hDocCat;
-                this._lastSyncDiag.readwiseListHighlightCategoryHistogram = hHlCat;
-            }
-            this._log('Reader API list — category (all rows): ' + JSON.stringify(hListCat));
-            this._log('Reader API list — source (all rows; epub/kindle often here): ' + JSON.stringify(hListSrc));
-            this._log('Reader API list — category (document rows only): ' + JSON.stringify(hDocCat));
-            this._log('Reader API list — category (highlight rows only): ' + JSON.stringify(hHlCat));
-        } catch (e) {
-            this._log('⚠️ List API histograms: ' + (e && e.message ? e.message : e));
-        }
-        this._toast('Readwise list done. Fetching export + saving references…');
-
+        /* Export-first (Readwise recommended). Reader list is 20 req/min and was a multi-minute
+         * sleep tax on large libraries — opt in via readwise_references_fetch_list=1. */
         let exportByHlId = new Map();
         let exportCoverByDocId = new Map();
         let exportBooks = [];
         try {
-            this._syncStatusShow('Fetching Readwise export (v2, full library)…');
+            this._syncStatusShow(since ? 'Fetching Readwise export (incremental)…' : 'Fetching Readwise export (v2)…');
             const enr = await this._fetchReadwiseExportPayload(token, since);
             exportByHlId = enr.highlightById;
             exportCoverByDocId = enr.coverByDocId;
@@ -2714,14 +2840,63 @@ class DawnReadwiseSyncEngine {
             this._log('⚠️ Export skipped: ' + e.message);
         }
 
-        this._log('Merging Reader list + export sources…');
+        const wantList = rwrFetchListFromStorage();
+        const exportEmpty = !exportBooks.length;
+        const forceList = wantList || exportEmpty || !!this._lastSyncDiag.exportError;
+        let allResults = [];
+        if (forceList) {
+            if (!wantList && exportEmpty) {
+                this._log('Export empty/failed — falling back to Reader /api/v3/list/…');
+                if (this._lastSyncDiag) this._lastSyncDiag.listFetchForced = true;
+            } else if (wantList) {
+                this._log('Reader list opted in (readwise_references_fetch_list=1)…');
+            }
+            this._syncStatusShow(since ? 'Downloading Reader list (incremental)…' : 'Downloading Reader list…');
+            allResults = await this._fetchReadwiseListAll(token, since);
+            this._lastSyncDiag.listRows = allResults.length;
+            this._log('List download complete: ' + allResults.length + ' rows.');
+            try {
+                const listDocsApi = (allResults || []).filter((i) => {
+                    const p = i.parent_id ?? i.parent_document_id;
+                    return p == null || p === '';
+                });
+                const listHlApi = (allResults || []).filter((i) => {
+                    const p = i.parent_id ?? i.parent_document_id;
+                    return p != null && String(p).length > 0;
+                });
+                const hListCat = this._readwiseHistogramStrings(allResults, (r) => r && r.category);
+                const hListSrc = this._readwiseHistogramStrings(allResults, (r) => r && r.source);
+                const hDocCat = this._readwiseHistogramStrings(listDocsApi, (r) => r && r.category);
+                const hHlCat = this._readwiseHistogramStrings(listHlApi, (r) => r && r.category);
+                if (this._lastSyncDiag) {
+                    this._lastSyncDiag.readwiseListApiCategoryHistogram = hListCat;
+                    this._lastSyncDiag.readwiseListApiSourceHistogram = hListSrc;
+                    this._lastSyncDiag.readwiseListDocCategoryHistogram = hDocCat;
+                    this._lastSyncDiag.readwiseListHighlightCategoryHistogram = hHlCat;
+                }
+                this._log('Reader API list — category (all rows): ' + JSON.stringify(hListCat));
+                this._log('Reader API list — source (all rows; epub/kindle often here): ' + JSON.stringify(hListSrc));
+                this._log('Reader API list — category (document rows only): ' + JSON.stringify(hDocCat));
+                this._log('Reader API list — category (highlight rows only): ' + JSON.stringify(hHlCat));
+            } catch (e) {
+                this._log('⚠️ List API histograms: ' + (e && e.message ? e.message : e));
+            }
+        } else {
+            if (this._lastSyncDiag) this._lastSyncDiag.listFetchSkipped = true;
+            this._log('Skipped Reader list (export-first). Opt in: localStorage readwise_references_fetch_list=1');
+        }
+        this._toast(forceList
+            ? 'Readwise download done. Saving references…'
+            : 'Export done. Saving references…');
+
+        this._log('Merging ' + (forceList ? 'Reader list + ' : '') + 'export sources…');
 
         const mergedPack = this._buildMergedReferenceEntries(allResults, exportBooks, exportByHlId);
         try {
             const rawHist = {};
             const mappedHist = {};
             for (const ent of mergedPack.entries || []) {
-                const rawKey = String(ent?.doc?.category ?? '').trim() || '(empty)';
+                const rawKey = String((ent && ent.doc && ent.doc.category != null) ? ent.doc.category : '').trim() || '(empty)';
                 rawHist[rawKey] = (rawHist[rawKey] || 0) + 1;
                 const mid = this._normalizeReadwiseCategoryChoiceId(ent?.doc?.category);
                 mappedHist[mid] = (mappedHist[mid] || 0) + 1;
@@ -2776,12 +2951,14 @@ class DawnReadwiseSyncEngine {
         const bodySigMap = rwrSkipUnchangedBodiesFromStorage() ? rwrLoadBodySigMap() : Object.create(null);
         let bodySigsDirty = false;
         const incremental = !!since;
+        const syncConcurrency = rwrSyncConcurrencyFromStorage();
+        const pendingPeopleLinks = [];
         if (!incremental) this._dayIndexClear();
         if (docTotal > 0) {
             this._syncStatusShow('Saving references 0/' + docTotal + '…');
         }
-        for (let bi = 0; bi < docEntries.length; bi += RWR_SYNC_CONCURRENCY) {
-            const batch = docEntries.slice(bi, bi + RWR_SYNC_CONCURRENCY);
+        for (let bi = 0; bi < docEntries.length; bi += syncConcurrency) {
+            const batch = docEntries.slice(bi, bi + syncConcurrency);
             const batchOut = await Promise.all(batch.map(async (entry) => {
                 const doc = entry.doc;
                 let docHL = entry.docHL;
@@ -2809,15 +2986,32 @@ class DawnReadwiseSyncEngine {
                     || '';
                 const authorRaw = doc.author != null ? String(doc.author).trim() : '';
                 let personForRef = null;
+                /* Hot path: only link authors that already exist in the People index.
+                 * New People stubs are created after the References write loop. */
                 if (peopleColl && authorRaw) {
-                    personForRef = await this._ensurePeopleRecord(peopleColl, authorRaw, peopleByKey);
+                    const pKey = this._normalizePeopleKey(authorRaw);
+                    if (pKey) {
+                        const hit = peopleByKey.get(pKey);
+                        if (hit && this._peopleRecordIsAuthorLinkTarget(hit)) {
+                            personForRef = this._resolveLiveRecord(hit) || hit;
+                        }
+                    }
                 }
 
                 const catLabel = String(doc.category || '').trim();
                 const srcLabel = String(doc.source || '').trim();
 
+                const workKey = this._referenceWorkKeyForDoc(doc);
+                let refRecord = refByExtId.get(extId) || null;
+                if (!refRecord && workKey) refRecord = refByWorkKey.get(workKey) || null;
+                let existingExtId = '';
+                if (refRecord) {
+                    try { existingExtId = String(refRecord.text('external_id') || '').trim(); } catch (_) { existingExtId = ''; }
+                }
+                const canonicalExtId = this._preferCanonicalReferenceExtId(existingExtId, extId) || extId;
+
                 const fields = {
-                    external_id: extId,
+                    external_id: canonicalExtId,
                     source_title: docTitle,
                     source_url: doc.source_url || '',
                     highlight_count: docHL.length,
@@ -2834,26 +3028,31 @@ class DawnReadwiseSyncEngine {
                 if (refBanner) fields.banner = refBanner;
                 if (captureDate) fields.captured_at = captureDate;
 
-                let refRecord = null;
                 let created = 0;
                 let updated = 0;
-                const existing = refByExtId.get(extId);
-                if (existing) {
-                    this._setFields(existing, fields);
-                    refByExtId.set(extId, existing);
+                if (refRecord) {
+                    this._setFields(refRecord, fields);
+                    refByExtId.set(extId, refRecord);
+                    if (canonicalExtId) refByExtId.set(canonicalExtId, refRecord);
+                    if (workKey) refByWorkKey.set(workKey, refRecord);
                     updated = 1;
-                    refRecord = existing;
                 } else {
                     const r = await this._createRecord(refsColl, docTitle);
                     if (r) {
                         this._setFields(r, fields);
                         refByExtId.set(extId, r);
+                        if (canonicalExtId) refByExtId.set(canonicalExtId, r);
+                        if (workKey) refByWorkKey.set(workKey, r);
                         created = 1;
                         refRecord = r;
                     } else {
                         this._log('⚠️ Failed to create Reference: ' + extId);
                         if (this._lastSyncDiag) this._lastSyncDiag.skippedFailedCreate++;
                     }
+                }
+
+                if (refRecord && peopleColl && authorRaw && !personForRef) {
+                    pendingPeopleLinks.push({ refRecord, authorRaw });
                 }
 
                 let written = 0;
@@ -2955,6 +3154,23 @@ class DawnReadwiseSyncEngine {
             await this._sleep(0);
         }
 
+        if (peopleColl && pendingPeopleLinks.length) {
+            this._syncStatusShow('Linking authors ' + pendingPeopleLinks.length + '…');
+            for (const item of pendingPeopleLinks) {
+                try {
+                    const person = await this._ensurePeopleRecord(peopleColl, item.authorRaw, peopleByKey);
+                    if (person && item.refRecord) {
+                        this._setFields(item.refRecord, {
+                            source_author: this._resolveLiveRecord(person) || person,
+                        });
+                        if (this._lastSyncDiag) this._lastSyncDiag.pendingPeopleLinked++;
+                    }
+                } catch (e) {
+                    this._log('⚠️ Deferred People link: ' + (e && e.message ? e.message : e));
+                }
+            }
+        }
+
         if (bodySigsDirty) rwrSaveBodySigMap(bodySigMap);
         if (!incremental && this._highlightsDayIndex) {
             this._highlightsDayIndex.complete = true;
@@ -3045,70 +3261,65 @@ class DawnReadwiseSyncEngine {
 
         await this._deleteAllLinesDeep(record);
 
-        const sectionLine = await this._createLine(record, null, null, 'text');
-        if (!sectionLine) return writeHL;
-        try {
-            await sectionLine.setSegments([{ type: 'text', text: READWISE_REF_HIGHLIGHTS_HEADER }]);
-        } catch (_) {
-            await sectionLine.setSegments([{ type: 'text', text: READWISE_REF_HIGHLIGHTS_HEADER }]);
-        }
-        await this._applyLineHeading(sectionLine, 2);
-
         const { byDay, skippedNoDate } = this._groupHighlightsByLocalDay(writeHL);
         if (this._lastSyncDiag && skippedNoDate > 0) {
             this._lastSyncDiag.datelessHighlightsInBodies = (this._lastSyncDiag.datelessHighlightsInBodies || 0) + skippedNoDate;
         }
+
+        /* Fast path: one insertFromMarkdown for the whole Highlights tree when nesting looks right.
+         * Falls back to per-line creates (with segments in one call) on any failure. */
+        if (rwrPreferMarkdownBodiesFromStorage()
+            && typeof record.insertFromMarkdown === 'function') {
+            try {
+                const md = this._buildHighlightsMarkdown(byDay, exportByHlId);
+                const ok = await record.insertFromMarkdown(md, null, null);
+                if (ok && await this._verifyHighlightsBodyStructure(record)) {
+                    if (this._lastSyncDiag) this._lastSyncDiag.bodiesViaMarkdown++;
+                    return writeHL;
+                }
+                this._log('Markdown body path failed verification — falling back to line creates.');
+                await this._deleteAllLinesDeep(record);
+            } catch (e) {
+                this._log('⚠️ Markdown body path: ' + (e && e.message ? e.message : e));
+                try { await this._deleteAllLinesDeep(record); } catch (_) {}
+            }
+        }
+
+        if (this._lastSyncDiag) this._lastSyncDiag.bodiesViaLines++;
+
+        const sectionLine = await this._createLine(
+            record, null, null, 'text',
+            [{ type: 'text', text: READWISE_REF_HIGHLIGHTS_HEADER }]
+        );
+        if (!sectionLine) return writeHL;
+        await this._applyLineHeading(sectionLine, 2);
+
         const dayKeys = Array.from(byDay.keys()).sort();
 
         let prevUnderSection = null;
         let dayIndex = 0;
         for (const dk of dayKeys) {
             if (dayIndex++ > 0) {
-                const gapBefore = await this._createLine(record, sectionLine, prevUnderSection, 'text');
-                if (gapBefore) {
-                    try {
-                        await gapBefore.setSegments([{ type: 'text', text: '' }]);
-                    } catch (_) {}
-                    prevUnderSection = gapBefore;
-                }
-                const divLine = await this._createLine(record, sectionLine, prevUnderSection, 'text');
-                if (divLine) {
-                    try {
-                        await divLine.setSegments([{ type: 'text', text: READWISE_REF_BETWEEN_DATE_DIVIDER_TEXT }]);
-                    } catch (_) {}
-                    prevUnderSection = divLine;
-                }
-                const gapAfter = await this._createLine(record, sectionLine, prevUnderSection, 'text');
-                if (gapAfter) {
-                    try {
-                        await gapAfter.setSegments([{ type: 'text', text: '' }]);
-                    } catch (_) {}
-                    prevUnderSection = gapAfter;
-                }
+                /* Skip empty spacer lines — divider alone is enough between date groups. */
+                const divLine = await this._createLine(
+                    record, sectionLine, prevUnderSection, 'text',
+                    [{ type: 'text', text: READWISE_REF_BETWEEN_DATE_DIVIDER_TEXT }]
+                );
+                if (divLine) prevUnderSection = divLine;
             }
             const { dayDate, highlights } = byDay.get(dk);
             const dateLabel = formatReadwiseRefDateHeading(dayDate);
-            const dateLine = await this._createLine(record, sectionLine, prevUnderSection, 'text');
-            if (!dateLine) continue;
-            try {
-                const jGuid = this._journalGuidForLocalDate(dayDate);
-                if (jGuid) {
-                    try {
-                        await dateLine.setSegments([{ type: 'ref', text: { guid: jGuid, title: dateLabel } }]);
-                    } catch (_) {
-                        await dateLine.setSegments([{ type: 'ref', text: jGuid }]);
-                    }
-                    if (this._lastSyncDiag) this._lastSyncDiag.dateHeadingsLinked++;
-                } else {
-                    await dateLine.setSegments([{ type: 'text', text: dateLabel }]);
-                    if (this._lastSyncDiag) this._lastSyncDiag.dateHeadingsPlainFallback++;
-                }
-            } catch (_) {
-                try {
-                    await dateLine.setSegments([{ type: 'text', text: dateLabel }]);
-                    if (this._lastSyncDiag) this._lastSyncDiag.dateHeadingsPlainFallback++;
-                } catch (_) {}
+            const jGuid = this._journalGuidForLocalDate(dayDate);
+            let dateSegs;
+            if (jGuid) {
+                dateSegs = [{ type: 'ref', text: { guid: jGuid, title: dateLabel } }];
+                if (this._lastSyncDiag) this._lastSyncDiag.dateHeadingsLinked++;
+            } else {
+                dateSegs = [{ type: 'text', text: dateLabel }];
+                if (this._lastSyncDiag) this._lastSyncDiag.dateHeadingsPlainFallback++;
             }
+            const dateLine = await this._createLine(record, sectionLine, prevUnderSection, 'text', dateSegs);
+            if (!dateLine) continue;
             await this._applyLineHeading(dateLine, 3);
             prevUnderSection = dateLine;
 
@@ -3121,60 +3332,136 @@ class DawnReadwiseSyncEngine {
                 }
                 const h = highlights[hi];
                 const body = this._highlightBody(h);
-                const ex = exportByHlId.get(String(h.id)) || exportByHlId.get(String(h.external_id ?? ''));
+                const ex = exportByHlId.get(String(h.id)) || exportByHlId.get(String(h.external_id != null ? h.external_id : ''));
                 let noteStr = this._highlightNote(h);
                 if (ex && ex.note != null && String(ex.note).trim() !== '') noteStr = String(ex.note);
                 const locUrl = this._readwiseHighlightOpenLink(h, ex);
 
-                const quoteLine = await this._createLine(record, dateLine, prevUnderDate, 'text');
+                const quoteLine = await this._createLine(
+                    record, dateLine, prevUnderDate, 'text',
+                    [{ type: 'text', text: body || '' }]
+                );
                 if (!quoteLine) continue;
-                try {
-                    await quoteLine.setSegments([{ type: 'text', text: body }]);
-                } catch (_) {}
                 prevUnderDate = quoteLine;
 
                 let lastChild = null;
                 if (noteStr && String(noteStr).trim()) {
                     const nt = String(noteStr).trim();
-                    const noteLine = await this._createLine(record, quoteLine, lastChild, 'text');
-                    if (noteLine) {
-                        lastChild = noteLine;
-                        try {
-                            await noteLine.setSegments([
-                                { type: 'bold', text: '📝 Note: ' },
-                                { type: 'text', text: nt },
-                            ]);
-                        } catch (_) {
-                            await noteLine.setSegments([{ type: 'text', text: '📝 Note: ' + nt }]);
-                        }
-                    }
+                    const noteLine = await this._createLine(
+                        record, quoteLine, lastChild, 'text',
+                        [
+                            { type: 'bold', text: '📝 Note: ' },
+                            { type: 'text', text: nt },
+                        ]
+                    );
+                    if (noteLine) lastChild = noteLine;
                 }
                 if (locUrl) {
-                    const locLine = await this._createLine(record, quoteLine, lastChild, 'text');
-                    if (locLine) {
-                        try {
-                            await locLine.setSegments([
-                                { type: 'bold', text: '🌎 Loc: ' },
-                                { type: 'text', text: locUrl },
-                            ]);
-                        } catch (_) {
-                            await locLine.setSegments([{ type: 'text', text: '🌎 Loc: ' + locUrl }]);
-                        }
-                    }
+                    const locLine = await this._createLine(
+                        record, quoteLine, lastChild, 'text',
+                        [
+                            { type: 'bold', text: '🌎 Loc: ' },
+                            { type: 'link', text: locUrl },
+                        ]
+                    );
+                    if (locLine) lastChild = locLine;
                 }
 
                 if (hi < highlights.length - 1) {
-                    const sep = await this._createLine(record, dateLine, quoteLine, 'text');
-                    if (sep) {
-                        try {
-                            await sep.setSegments([{ type: 'text', text: READWISE_REF_QUOTE_SEPARATOR_TEXT }]);
-                        } catch (_) {}
-                        prevUnderDate = sep;
-                    }
+                    const sep = await this._createLine(
+                        record, dateLine, quoteLine, 'text',
+                        [{ type: 'text', text: READWISE_REF_QUOTE_SEPARATOR_TEXT }]
+                    );
+                    if (sep) prevUnderDate = sep;
                 }
             }
         }
         return writeHL;
+    }
+
+    /**
+     * Build a Markdown Highlights body. Date headings use plain labels; journal @ref upgrade
+     * happens via _ensureDateHeadingsLinked after write.
+     */
+    _buildHighlightsMarkdown(byDay, exportByHlId) {
+        const escapeMd = (s) => String(s || '')
+            .replace(/\\/g, '\\\\')
+            .replace(/\*/g, '\\*')
+            .replace(/_/g, '\\_')
+            .replace(/#/g, '\\#')
+            .replace(/\[/g, '\\[')
+            .replace(/\]/g, '\\]');
+        const parts = ['## ' + READWISE_REF_HIGHLIGHTS_HEADER, ''];
+        const dayKeys = Array.from(byDay.keys()).sort();
+        for (let di = 0; di < dayKeys.length; di++) {
+            if (di > 0) {
+                parts.push(READWISE_REF_BETWEEN_DATE_DIVIDER_TEXT);
+                parts.push('');
+            }
+            const { dayDate, highlights } = byDay.get(dayKeys[di]);
+            const dateLabel = formatReadwiseRefDateHeading(dayDate);
+            parts.push('### ' + dateLabel);
+            parts.push('');
+            const sorted = highlights.slice().sort((a, b) => String(a.id).localeCompare(String(b.id)));
+            for (let hi = 0; hi < sorted.length; hi++) {
+                const h = sorted[hi];
+                const body = this._highlightBody(h);
+                const ex = exportByHlId && typeof exportByHlId.get === 'function'
+                    ? (exportByHlId.get(String(h.id)) || exportByHlId.get(String(h.external_id != null ? h.external_id : '')))
+                    : null;
+                let noteStr = this._highlightNote(h);
+                if (ex && ex.note != null && String(ex.note).trim() !== '') noteStr = String(ex.note);
+                const locUrl = this._readwiseHighlightOpenLink(h, ex);
+                parts.push(escapeMd(body));
+                parts.push('');
+                if (noteStr && String(noteStr).trim()) {
+                    parts.push('**📝 Note:** ' + escapeMd(String(noteStr).trim()));
+                    parts.push('');
+                }
+                if (locUrl) {
+                    parts.push('**🌎 Loc:** ' + locUrl);
+                    parts.push('');
+                }
+                if (hi < sorted.length - 1) {
+                    parts.push(READWISE_REF_QUOTE_SEPARATOR_TEXT);
+                    parts.push('');
+                }
+            }
+        }
+        return parts.join('\n');
+    }
+
+    /**
+     * Confirm markdown insert produced the nested shape footer/day-index parsers expect:
+     * Highlights header → date child → at least one quote child (when we expected highlights).
+     */
+    async _verifyHighlightsBodyStructure(record) {
+        let items;
+        try { items = await record.getLineItems(); } catch (_) { return false; }
+        if (!items || !items.length) return false;
+        const ordered = this._buildRecordDocumentOrder(record, items);
+        const recId = record.guid;
+        let sectionLine = null;
+        for (const line of this._childrenInDocOrder(ordered, recId, recId)) {
+            const plain = await this._linePlainText(line);
+            if (this._isHighlightsSectionHeader(plain)) {
+                sectionLine = line;
+                break;
+            }
+        }
+        if (!sectionLine) return false;
+        const underSection = this._childrenInDocOrder(ordered, recId, sectionLine.guid)
+            .filter((l) => l && l.type !== 'br');
+        if (!underSection.length) return false;
+        /* Prefer a date-like child that itself has children (nested quotes). */
+        for (const dateLine of underSection) {
+            const plain = (await this._linePlainText(dateLine)).trim();
+            if (!plain || plain === READWISE_REF_BETWEEN_DATE_DIVIDER_TEXT) continue;
+            if (this._isReadwiseRefSeparatorLine(plain)) continue;
+            const kids = this._childrenInDocOrder(ordered, recId, dateLine.guid);
+            if (kids.length > 0) return true;
+        }
+        return false;
     }
 
     /**
@@ -3709,16 +3996,28 @@ class DawnReadwiseSyncEngine {
         return ordered;
     }
 
-    async _createLine(record, parent, afterSibling, type) {
-        try {
-            return await record.createLineItem(parent, afterSibling, type);
-        } catch (e) {
+    async _createLine(record, parent, afterSibling, type, segments) {
+        const segs = Array.isArray(segments) ? segments : null;
+        const tryCreate = async (after) => {
+            if (segs) {
+                try {
+                    const line = await record.createLineItem(parent, after, type, segs, null);
+                    if (line) return line;
+                } catch (_) {}
+            }
             try {
-                return await record.createLineItem(parent, null, type);
-            } catch (e2) {
+                const line = await record.createLineItem(parent, after, type);
+                if (line && segs) {
+                    try { await line.setSegments(segs); } catch (_) {}
+                }
+                return line;
+            } catch (_) {
                 return null;
             }
-        }
+        };
+        let line = await tryCreate(afterSibling);
+        if (!line && afterSibling) line = await tryCreate(null);
+        return line;
     }
 
     /** Map 2 → H2, 3 → H3 when the host supports `setHeadingSize` on line items. */
@@ -3734,8 +4033,8 @@ class DawnReadwiseSyncEngine {
     }
 
     async _getRecordReady(guid) {
-        const attempts = this._syncing ? 35 : 90;
-        const gapMs = 120;
+        const attempts = this._syncing ? 25 : 90;
+        const gapMs = this._syncing ? 50 : 120;
         for (let i = 0; i < attempts; i++) {
             const r = this.data?.getRecord?.(guid);
             if (r && typeof r.getLineItems === 'function' && typeof r.createLineItem === 'function') return r;
@@ -4128,7 +4427,7 @@ class DawnReadwiseSyncEngine {
         const chunks = [];
         for (const h of docHL || []) {
             const ex = exMap
-                ? (exMap.get(String(h.id)) || exMap.get(String(h.external_id ?? '')))
+                ? (exMap.get(String(h.id)) || exMap.get(String(h.external_id != null ? h.external_id : '')))
                 : null;
             let noteStr = this._highlightNote(h);
             if (ex && ex.note != null && String(ex.note).trim() !== '') noteStr = String(ex.note);
@@ -4330,7 +4629,7 @@ class DawnReadwiseSyncEngine {
             } catch (_) {
                 v = '';
             }
-            const k = String(v ?? '').trim() || '(empty)';
+            const k = String(v != null ? v : '').trim() || '(empty)';
             h[k] = (h[k] || 0) + 1;
         }
         return h;
@@ -4672,14 +4971,19 @@ class DawnReadwiseSyncEngine {
             this._log('⚠️ createRecord null: ' + this._trunc(title, 40));
             return null;
         }
-        for (let i = 0; i < 30; i++) {
-            await this._sleep(i < 5 ? 120 : 200);
+        /* Prefer data.getRecord — avoid N× getAllRecords polls (was a major sync stall). */
+        for (let i = 0; i < 40; i++) {
             try {
-                const all = await coll.getAllRecords();
-                const record = all.find(r => r.guid === guid);
-                if (record) return record;
+                const r = this.data?.getRecord?.(guid);
+                if (r && r.guid) return r;
             } catch (_) {}
+            await this._sleep(i < 10 ? 40 : 100);
         }
+        try {
+            const all = await coll.getAllRecords();
+            const record = all.find((r) => r.guid === guid);
+            if (record) return record;
+        } catch (_) {}
         return null;
     }
 
