@@ -95,12 +95,15 @@
    * Bump when REFERENCES_SHAPE changes. Without this, `if (ThymerReadwiseReferencesColl) return` kept an
    * old embedded runtime on globalThis after in-app plugin saves (new plugin.js never re-ran the IIFE).
    */
-  const THYMER_READWISE_REFS_COLL_SCHEMA_VER = 6;
+  const THYMER_READWISE_REFS_COLL_SCHEMA_VER = 7;
   if (g.ThymerReadwiseReferencesColl && g.ThymerReadwiseReferencesColl.SCHEMA_VER === THYMER_READWISE_REFS_COLL_SCHEMA_VER) {
     return;
   }
 
   const COL_NAME = 'References';
+  /** Durable pin + create-once guard (Path B–mirrored when host lists these keys). */
+  const PIN_LS_KEY = 'dawn_readwise_refs_coll_guid_v1';
+  const CREATE_GUARD_LS_KEY = 'dawn_readwise_refs_create_guard_v1';
   const MANAGED_UNLOCK = { fields: false, views: false, sidebar: false };
 
   const DEBUG_COLLECTIONS = (() => {
@@ -409,6 +412,48 @@
     return s;
   }
 
+  function collectionGuid(c) {
+    if (!c) return '';
+    try {
+      return String(c.getGuid?.() || '').trim();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function readPinnedGuid() {
+    try {
+      return String(localStorage.getItem(PIN_LS_KEY) || '').trim();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function writePinnedGuid(guid) {
+    const g0 = String(guid || '').trim();
+    if (!g0) return;
+    try {
+      localStorage.setItem(PIN_LS_KEY, g0);
+    } catch (_) {}
+  }
+
+  function readCreateGuard() {
+    try {
+      const raw = localStorage.getItem(CREATE_GUARD_LS_KEY);
+      if (!raw) return null;
+      const p = JSON.parse(raw);
+      return p && typeof p === 'object' ? p : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function writeCreateGuard(row) {
+    try {
+      localStorage.setItem(CREATE_GUARD_LS_KEY, JSON.stringify(row && typeof row === 'object' ? row : {}));
+    } catch (_) {}
+  }
+
   /** When Thymer omits names on list entries, match the Readwise References schema. */
   function refsHeuristicScore(c) {
     if (!c) return 0;
@@ -444,37 +489,74 @@
     }
     if (!cands.length) return null;
     const named = cands.find((c) => collectionDisplayName(c) === COL_NAME);
-    return named || cands[0];
+    return named || stablePickByGuid(cands);
+  }
+
+  function stablePickByGuid(cands) {
+    const arr = (Array.isArray(cands) ? cands : []).slice();
+    if (!arr.length) return null;
+    arr.sort((a, b) => collectionGuid(a).localeCompare(collectionGuid(b)));
+    return arr[0] || null;
+  }
+
+  function listNamedReferences(list) {
+    const out = [];
+    for (const c of Array.isArray(list) ? list : []) {
+      if (collectionDisplayName(c) === COL_NAME) out.push(c);
+    }
+    return out;
+  }
+
+  function listHasAnyDisplayName(list) {
+    for (const c of Array.isArray(list) ? list : []) {
+      if (collectionDisplayName(c)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Canonical pick: pinned GUID if present → named References (stable guid) → schema heuristic.
+   * Never creates; when several exist, picks one and caller should pin it.
+   */
+  function pickCanonicalReferences(list, pinnedGuid) {
+    const arr = Array.isArray(list) ? list : [];
+    const pin = String(pinnedGuid || '').trim();
+    if (pin) {
+      const hit = arr.find((c) => collectionGuid(c) === pin);
+      if (hit) return hit;
+    }
+    const named = listNamedReferences(arr);
+    if (named.length) return stablePickByGuid(named);
+    return pickRefsHeuristic(arr);
   }
 
   /** Same “has References” rule as `snapshotReferencesState`, on an existing list (no I/O). */
   function hasReferencesOnWorkspaceSyncList(list) {
     const arr = Array.isArray(list) ? list : [];
     if (arr.length === 0) return false;
-    for (const c of arr) {
-      if (collectionDisplayName(c) === COL_NAME) return true;
-    }
-    return !!pickRefsHeuristic(arr);
+    return !!pickCanonicalReferences(arr, readPinnedGuid());
   }
 
   /** One `getAllCollections` — replaces paired `findReferencesColl` + `hasReferencesOnWorkspace` (was 2× per check). */
   async function snapshotReferencesState(data) {
-    if (!data || typeof data.getAllCollections !== 'function') return { coll: null, has: false, len: 0 };
+    if (!data || typeof data.getAllCollections !== 'function') {
+      return { coll: null, has: false, len: 0, namedCount: 0, listTrusted: false };
+    }
     try {
       const all = await data.getAllCollections();
       const list = Array.isArray(all) ? all : [];
-      const coll = list.find((c) => collectionDisplayName(c) === COL_NAME) || pickRefsHeuristic(list) || null;
-      let has = false;
-      for (const c of list) {
-        if (collectionDisplayName(c) === COL_NAME) {
-          has = true;
-          break;
-        }
+      const pin = readPinnedGuid();
+      const coll = pickCanonicalReferences(list, pin);
+      const namedCount = listNamedReferences(list).length;
+      const has = !!coll;
+      const listTrusted = list.length > 0 && listHasAnyDisplayName(list);
+      if (coll) {
+        const g0 = collectionGuid(coll);
+        if (g0 && g0 !== pin) writePinnedGuid(g0);
       }
-      if (!has) has = !!pickRefsHeuristic(list);
-      return { coll, has, len: list.length };
+      return { coll, has, len: list.length, namedCount, listTrusted, list };
     } catch (_) {
-      return { coll: null, has: false, len: 0 };
+      return { coll: null, has: false, len: 0, namedCount: 0, listTrusted: false };
     }
   }
 
@@ -627,7 +709,7 @@
 
   async function runReferencesEnsureBody(data) {
     if (DEBUG_COLLECTIONS) {
-      dlogRef('ensureBody_start', { path: refsPathWindowSnapshot() });
+      dlogRef('ensureBody_start', { path: refsPathWindowSnapshot(), pin: readPinnedGuid() || null });
       try {
         if (data && data.getAllCollections) {
           const a = await data.getAllCollections();
@@ -641,31 +723,49 @@
     }
     try {
       await yieldMainForPaint();
+      let lastSnap = null;
       for (let attempt = 0; attempt < 4; attempt++) {
-        const snap = await snapshotReferencesState(data);
-        if (snap.coll) return;
-        if (snap.has) return;
+        lastSnap = await snapshotReferencesState(data);
+        if (lastSnap.coll) return;
+        if (lastSnap.has) return;
         if (attempt < 3) await new Promise((r) => setTimeout(r, 50 + attempt * 50));
       }
-      let post = await snapshotReferencesState(data);
+      let post = lastSnap || (await snapshotReferencesState(data));
       if (post.coll) return;
       if (post.has) return;
       await new Promise((r) => setTimeout(r, 120));
       post = await snapshotReferencesState(data);
       if (post.coll) return;
       if (post.has) return;
-      let preCreateLen = 0;
+
+      const pin = readPinnedGuid();
+      const guard = readCreateGuard();
+      // Dangling pin or prior create attempt: never create another shell.
+      if (pin) {
+        if (DEBUG_COLLECTIONS) dlogRef('refuse_create_pinned_missing', { pin, len: post.len, namedCount: post.namedCount });
+        try {
+          console.warn('[ThymerReadwiseReferencesColl] pinned References GUID not in workspace list — refusing create', pin);
+        } catch (_) {}
+        return;
+      }
+      if (guard && (guard.guid || guard.attemptedAt)) {
+        if (DEBUG_COLLECTIONS) dlogRef('refuse_create_guard', { guard, len: post.len });
+        try {
+          console.warn('[ThymerReadwiseReferencesColl] create-once guard set — refusing another References create', guard);
+        } catch (_) {}
+        return;
+      }
+
+      let preCreateLen = Number(post.len) || 0;
+      let listTrusted = !!post.listTrusted;
       try {
         if (data && data.getAllCollections) {
           const all0 = await data.getAllCollections();
           const list0 = Array.isArray(all0) ? all0 : [];
           preCreateLen = list0.length;
           if (preCreateLen > 0) touchGetAllSanityFromCount(preCreateLen);
-          if (preCreateLen > 0) {
-            const c0 = list0.find((c) => collectionDisplayName(c) === COL_NAME) || pickRefsHeuristic(list0) || null;
-            if (c0) return;
-            if (hasReferencesOnWorkspaceSyncList(list0)) return;
-          }
+          listTrusted = preCreateLen > 0 && listHasAnyDisplayName(list0);
+          if (hasReferencesOnWorkspaceSyncList(list0)) return;
         }
         if (preCreateLen === 0) {
           await new Promise((r) => setTimeout(r, 150));
@@ -674,11 +774,8 @@
             const list1 = Array.isArray(all1) ? all1 : [];
             preCreateLen = list1.length;
             if (preCreateLen > 0) touchGetAllSanityFromCount(preCreateLen);
-            if (preCreateLen > 0) {
-              const c1 = list1.find((c) => collectionDisplayName(c) === COL_NAME) || pickRefsHeuristic(list1) || null;
-              if (c1) return;
-              if (hasReferencesOnWorkspaceSyncList(list1)) return;
-            }
+            listTrusted = preCreateLen > 0 && listHasAnyDisplayName(list1);
+            if (hasReferencesOnWorkspaceSyncList(list1)) return;
           }
         }
         if (isSuspiciousEmptyAfterRecentNonEmptyList(preCreateLen) && preCreateLen === 0) {
@@ -692,13 +789,36 @@
           }
           return;
         }
+        // Non-empty list with no readable names (or no trusted names) → uncertain; do not create.
+        if (preCreateLen > 0 && !listTrusted) {
+          if (DEBUG_COLLECTIONS) dlogRef('refuse_create_untrusted_list', { preCreateLen, listTrusted });
+          try {
+            console.warn('[ThymerReadwiseReferencesColl] collection list untrusted (unnamed/partial) — refusing References create');
+          } catch (_) {}
+          return;
+        }
       } catch (_) {
         void 0;
       }
+
+      // Create only when we can confirm absence on a trusted list (or a stable empty workspace).
+      const mayCreate =
+        (listTrusted && preCreateLen > 0) ||
+        (preCreateLen === 0 && !isSuspiciousEmptyAfterRecentNonEmptyList(0));
+      if (!mayCreate) {
+        if (DEBUG_COLLECTIONS) dlogRef('refuse_create_uncertain', { preCreateLen, listTrusted });
+        try {
+          console.warn('[ThymerReadwiseReferencesColl] uncertain References state — refusing create');
+        } catch (_) {}
+        return;
+      }
+
       await yieldMainForPaint();
+      writeCreateGuard({ attemptedAt: Date.now(), phase: 'pre-create' });
       if (DEBUG_COLLECTIONS) dlogRef('ensureBody_about_to_create', { path: refsPathWindowSnapshot() });
       const coll = await queueDataCreateOnSharedWindow(() => data.createCollection());
       if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') {
+        writeCreateGuard({ attemptedAt: Date.now(), phase: 'create-returned-null' });
         return;
       }
       const conf = cloneShape();
@@ -706,6 +826,9 @@
       if (base && typeof base.ver === 'number') conf.ver = base.ver;
       const ok = await coll.saveConfiguration(withUnlockedManaged(conf));
       if (ok === false) console.warn('[ThymerReadwiseReferencesColl] initial saveConfiguration returned false');
+      const newGuid = collectionGuid(coll);
+      if (newGuid) writePinnedGuid(newGuid);
+      writeCreateGuard({ attemptedAt: Date.now(), phase: 'created', guid: newGuid || null, saveOk: ok !== false });
       await new Promise((r) => setTimeout(r, 250));
     } catch (e) {
       console.error('[ThymerReadwiseReferencesColl] ensure collection', e);
@@ -762,12 +885,21 @@
   g.ThymerReadwiseReferencesColl = {
     SCHEMA_VER: THYMER_READWISE_REFS_COLL_SCHEMA_VER,
     COL_NAME,
+    PIN_LS_KEY,
+    CREATE_GUARD_LS_KEY,
     findColl: findReferencesColl,
+    getPinnedGuid: readPinnedGuid,
+    setPinnedGuid: writePinnedGuid,
     ensureReferencesCollection,
     upgradeSchema: (data, coll) => upgradeReferencesSchema(data, coll),
     async ensure(data) {
       await ensureReferencesCollection(data);
-      await upgradeReferencesSchema(data, null);
+      const coll = await findReferencesColl(data);
+      if (coll) {
+        await upgradeReferencesSchema(data, coll);
+        const g0 = collectionGuid(coll);
+        if (g0) writePinnedGuid(g0);
+      }
       return findReferencesColl(data);
     },
   };
@@ -1216,8 +1348,26 @@ class DawnReadwiseSyncEngine {
         this._rwDupDiagLog('references_bootstrap_start', {});
         this._rwRefsBootstrapPromise = (async () => {
             try {
-                await api.ensure(this.data);
-                this._rwRefsBootstrapComplete = true;
+                const coll = await api.ensure(this.data);
+                if (coll) {
+                    this._rwRefsBootstrapComplete = true;
+                    try {
+                        const g0 = typeof coll.getGuid === 'function' ? coll.getGuid() : null;
+                        if (g0 && typeof api.setPinnedGuid === 'function') api.setPinnedGuid(g0);
+                    } catch (_) {}
+                } else {
+                    // No coll: stop retrying this session if pin/guard says we must not create again.
+                    let pin = null;
+                    let guard = null;
+                    try { pin = typeof api.getPinnedGuid === 'function' ? api.getPinnedGuid() : null; } catch (_) {}
+                    try {
+                        guard = localStorage.getItem(
+                            api.CREATE_GUARD_LS_KEY || 'dawn_readwise_refs_create_guard_v1'
+                        );
+                    } catch (_) {}
+                    this._rwRefsBootstrapComplete = !!(pin || guard);
+                    this._rwDupDiagLog('references_bootstrap_no_coll', { pin, hasGuard: !!guard });
+                }
             } catch (e) {
                 console.warn('[Readwise Ref] References collection setup failed', e);
             } finally {
@@ -1376,6 +1526,12 @@ class DawnReadwiseSyncEngine {
 
     /** Keys mirrored to Plugin Settings when storage mode is synced. */
     _pathBMirrorKeys() {
+        const pinKey =
+            (globalThis.ThymerReadwiseReferencesColl && globalThis.ThymerReadwiseReferencesColl.PIN_LS_KEY) ||
+            'dawn_readwise_refs_coll_guid_v1';
+        const guardKey =
+            (globalThis.ThymerReadwiseReferencesColl && globalThis.ThymerReadwiseReferencesColl.CREATE_GUARD_LS_KEY) ||
+            'dawn_readwise_refs_create_guard_v1';
         return [
             RWR_TOKEN_KEY,
             RWR_LAST_RUN_KEY,
@@ -1386,6 +1542,8 @@ class DawnReadwiseSyncEngine {
             TH_KEY_SHUFFLER_DETACHED,
             TH_KEY_SHUFFLER_QUOTES_BY_DAY,
             TH_KEY_HIGHLIGHTS_BY_DAY,
+            pinKey,
+            guardKey,
         ];
     }
 
@@ -8436,7 +8594,13 @@ class Plugin extends AppPlugin {
   _mountShell() {}
 
   _prefsMirrorKeys() {
-    return [RW_LS_CFG, RW_LS_TOKEN_PROD, RW_LS_LAST_RUN_PROD, RW_LS_DAY_IDX_PROD];
+    const pinKey =
+      (globalThis.ThymerReadwiseReferencesColl && globalThis.ThymerReadwiseReferencesColl.PIN_LS_KEY) ||
+      'dawn_readwise_refs_coll_guid_v1';
+    const guardKey =
+      (globalThis.ThymerReadwiseReferencesColl && globalThis.ThymerReadwiseReferencesColl.CREATE_GUARD_LS_KEY) ||
+      'dawn_readwise_refs_create_guard_v1';
+    return [RW_LS_CFG, RW_LS_TOKEN_PROD, RW_LS_LAST_RUN_PROD, RW_LS_DAY_IDX_PROD, pinKey, guardKey];
   }
 
   _initPathBPrefs() {
